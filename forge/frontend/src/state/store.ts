@@ -24,6 +24,7 @@ export interface ForgeState {
   thinking: boolean;
   orbSpeaking: boolean;
   youTalking: boolean;
+  listeningActive: boolean;
   health: Health;
   pill: BackendPill;
   ccOn: boolean;
@@ -39,6 +40,15 @@ export interface ForgeState {
   /** connected human peer (P2P call), if any */
   remoteName: string | null;
   remoteStream: MediaStream | null;
+  /** thinking / tool trace lines shown in SidePanel */
+  thinkingTrace: string[];
+  /** code panel state */
+  codePanelOpen: boolean;
+  codePanelFile: string | null;
+  codePanelLines: string[];
+  codePanelStartLine: number;
+  codePanelHighlight: { start: number; end: number } | null;
+  codePanelGithubUrl: string | null;
 }
 
 export const useStore = create<ForgeState>()(() => ({
@@ -51,6 +61,7 @@ export const useStore = create<ForgeState>()(() => ({
   thinking: false,
   orbSpeaking: false,
   youTalking: false,
+  listeningActive: false,
   health: { ok: false, tts: false, llm: "?", repo: { name: "your repo" } },
   pill: { cls: "", title: "backend status" },
   ccOn: true,
@@ -63,4 +74,11 @@ export const useStore = create<ForgeState>()(() => ({
   myName: "",
   remoteName: null,
   remoteStream: null,
+  thinkingTrace: [],
+  codePanelOpen: false,
+  codePanelFile: null,
+  codePanelLines: [],
+  codePanelStartLine: 1,
+  codePanelHighlight: null,
+  codePanelGithubUrl: null,
 }));

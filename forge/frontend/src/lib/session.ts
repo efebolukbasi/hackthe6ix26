@@ -1,8 +1,8 @@
 // ForgeSession: all imperative call logic, framework-free. Owns the media
 // stream, speech recognition, AudioContext (chime + mic meter), TTS playback
-// (ElevenLabs fetch → Audio, browser speechSynthesis fallback), the /api/agent
-// NDJSON reader loop with sequential step playback, and the passive listen
-// buffer + raise-hand logic. UI state is pushed into the zustand store.
+// (ElevenLabs streaming → MediaSource, browser speechSynthesis fallback), the
+// /api/agent NDJSON reader loop with deferred step playback, and the passive
+// listen buffer + raise-hand logic. UI state is pushed into the zustand store.
 
 import { Whiteboard } from "./whiteboard";
 import { RoomLink, type CastEvent } from "./rtc";
@@ -34,9 +34,10 @@ function stripAddress(text: string): string {
   return text.replace(ADDRESS_START, "").replace(ADDRESS_END, "").trim();
 }
 
-const INVITE = /\b(go ahead|go for it|take it away|what do you think|your thoughts|tell us|share it|yes forge|sure forge|floor is yours)\b/i;
+const INVITE = /\b(go ahead|go for it|take it away|what do you think|your thoughts|tell us|share it|yes forge|sure forge|floor is yours|let's hear it)\b/i;
 const STOP = /\b(stop presenting|back to (the )?grid|that'?s enough|stop talking|be quiet|thanks,? forge|thank you,? forge)\b/i;
 const CLEAR = /\b((clear|wipe) the board|start over|clean slate)\b/i;
+const CODE_COMMAND = /\b(improve|fix|refactor|add|build|create|update|delete|remove|implement|write|generate)\b.*\b(the\s+)?(frontend|backend|component|function|test|api|code|feature|endpoint|hook|class|style|css|route)/i;
 
 export const CHIPS = [
   "Forge, how does this project itself work?",
@@ -59,6 +60,7 @@ export class ForgeSession {
   private audioCtx: AudioContext | null = null;
 
   private currentAudio: HTMLAudioElement | null = null;
+  private currentTtsAbort: AbortController | null = null;
   private agentAbort: AbortController | null = null;
 
   private health: Health = { ok: false, tts: false, llm: "?", repo: { name: "your repo" } };
@@ -78,6 +80,13 @@ export class ForgeSession {
   private remoteAgentActive = false;
   private remoteChain: Promise<void> = Promise.resolve();
   private myName = "You";
+
+  // Speaker-role: the peer with the lower room id plays TTS audio. Others
+  // only update captions and board state. Defaults to true (alone in room).
+  private isSpeaker = true;
+
+  // Deferred answer flow: steps are collected silently, then presented when invited.
+  private pendingSteps: AgentStep[] = [];
 
   constructor() {
     // Demo/debug hook: feed an utterance as if it were heard through the mic
@@ -110,6 +119,14 @@ export class ForgeSession {
     useStore.setState({ agentStatus: t });
   }
 
+  /** Transition Forge to the "listening" state and play a soft listening chime. */
+  private setListening(): void {
+    this.setStatus("listening");
+    const wasActive = useStore.getState().listeningActive;
+    useStore.setState({ listeningActive: true });
+    if (!wasActive) this.listeningChime();
+  }
+
   // ---------- voice output: ElevenLabs first, browser TTS fallback ----------
   private pickVoice(): SpeechSynthesisVoice | null {
     if (this.cachedVoice) return this.cachedVoice;
@@ -139,34 +156,73 @@ export class ForgeSession {
   }
 
   private async elevenSpeak(text: string): Promise<void> {
-    const res = await fetch(`${API}/api/tts`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text }),
-    });
-    if (!res.ok) throw new Error(`tts ${res.status}`);
-    const url = URL.createObjectURL(await res.blob());
-    await new Promise<void>((resolve, reject) => {
-      const a = new Audio(url);
-      this.currentAudio = a;
-      a.onended = () => resolve();
-      a.onerror = reject;
-      a.play().catch(reject);
+    if (!("MediaSource" in window)) { return this.browserSpeak(text); }
+    const ms = new MediaSource();
+    const url = URL.createObjectURL(ms);
+    const a = new Audio(url);
+    this.currentAudio = a;
+    const abortCtrl = new AbortController();
+    this.currentTtsAbort = abortCtrl;
+    return new Promise<void>((resolve, reject) => {
+      ms.addEventListener("sourceopen", async () => {
+        let sb: SourceBuffer;
+        try { sb = ms.addSourceBuffer("audio/mpeg"); } catch { resolve(); return; }
+        const queue: ArrayBuffer[] = [];
+        let appending = false;
+        const drain = () => {
+          if (appending || !queue.length) return;
+          if (sb.updating) { sb.addEventListener("updateend", drain, { once: true }); return; }
+          appending = true;
+          sb.appendBuffer(queue.shift()!);
+        };
+        sb.addEventListener("updateend", () => { appending = false; drain(); });
+        try {
+          const res = await fetch(`${API}/api/tts/stream`, {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ text }), signal: abortCtrl.signal,
+          });
+          if (!res.ok) throw new Error(`tts/stream ${res.status}`);
+          const reader = res.body!.getReader();
+          a.play().catch(() => {});
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            queue.push(value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength));
+            drain();
+          }
+          // Wait for buffer to drain then end stream
+          await new Promise<void>(r => {
+            const check = () => { if (!sb.updating && !queue.length) r(); else setTimeout(check, 50); };
+            check();
+          });
+          if (ms.readyState === "open") ms.endOfStream();
+        } catch (err) {
+          if (!abortCtrl.signal.aborted) reject(err);
+          else resolve();
+          return;
+        }
+        a.addEventListener("ended", () => resolve(), { once: true });
+        a.addEventListener("error", () => resolve(), { once: true });
+      });
+      a.addEventListener("error", () => resolve(), { once: true });
     }).finally(() => {
       URL.revokeObjectURL(url);
       this.currentAudio = null;
+      this.currentTtsAbort = null;
     });
   }
 
   private async speak(text: string): Promise<void> {
     this.ttsSpeaking = true;
     this.stopRecog(); // don't transcribe our own voice
-    useStore.setState({ orbSpeaking: true });
-    try {
-      if (!this.health.tts || this.cancelled) throw new Error("tts off");
-      await this.elevenSpeak(text);
-    } catch {
-      if (!this.cancelled) await this.browserSpeak(text);
+    useStore.setState({ orbSpeaking: true, listeningActive: false });
+    if (this.isSpeaker) {
+      try {
+        if (!this.health.tts || this.cancelled) throw new Error("tts off");
+        await this.elevenSpeak(text);
+      } catch {
+        if (!this.cancelled) await this.browserSpeak(text);
+      }
     }
     this.ttsSpeaking = false;
     useStore.setState({ orbSpeaking: false });
@@ -175,7 +231,12 @@ export class ForgeSession {
 
   private cancelSpeech(): void {
     speechSynthesis.cancel();
+    this.currentTtsAbort?.abort();
     if (this.currentAudio) { try { this.currentAudio.pause(); } catch { /* noop */ } this.currentAudio = null; }
+  }
+
+  setIsSpeaker(val: boolean): void {
+    this.isSpeaker = val;
   }
 
   // ---------- speech recognition ----------
@@ -228,7 +289,7 @@ export class ForgeSession {
     if (this.handRaised) this.room?.cast({ k: "hand", raised: false, reason: "" });
     this.handReason = "";
     useStore.setState({ handRaised: false });
-    if (!this.agentBusy) this.setStatus("listening");
+    if (!this.agentBusy) this.setListening();
   }
 
   private scheduleListenCheck(): void {
@@ -262,11 +323,29 @@ export class ForgeSession {
     this.lowerHand();
     this.room?.cast({ k: "agent-start" });
     this.setStatus("thinking…");
-    useStore.setState({ thinking: true });
+    useStore.setState({ thinking: true, listeningActive: false });
     this.agentAbort = new AbortController();
 
-    let sawStep = false;
+    let handedOff = false;
     try {
+      // If invited and we have prepared steps, play them without fetching again.
+      if (invited && this.pendingSteps.length > 0) {
+        const steps = this.pendingSteps;
+        this.pendingSteps = [];
+        useStore.setState({ thinking: false, thinkingTrace: [] });
+        for (const step of steps) {
+          if (this.cancelled) break;
+          await this.playStep(step, true);
+        }
+        return;
+      }
+
+      // Fire-and-forget ack so the user knows we heard them, then think silently.
+      const ackMsg = "Let me look into that — I'll raise my hand when I have something.";
+      this.caption("Forge", ackMsg, true);
+      this.transcript("Forge", ackMsg);
+      void this.speak(ackMsg);
+
       const res = await fetch(`${API}/api/agent`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -285,6 +364,7 @@ export class ForgeSession {
       const reader = res.body.getReader();
       const dec = new TextDecoder();
       let buf = "";
+      const preparedSteps: AgentStep[] = [];
       outer: for (;;) {
         const { done, value } = await reader.read();
         if (done) break;
@@ -295,13 +375,32 @@ export class ForgeSession {
           if (!line.trim()) continue;
           let msg: StreamMsg;
           try { msg = JSON.parse(line) as StreamMsg; } catch { continue; }
-          if (msg.type !== "step") continue;
-          if (!sawStep) { sawStep = true; useStore.setState({ thinking: false }); }
-          await this.playStep(msg, true);
+          if (msg.type === "tool") {
+            const t = msg as { type: "tool"; name: string; input: string };
+            useStore.setState((s) => ({ thinkingTrace: [...s.thinkingTrace, `\uD83D\uDD0D ${t.name}: ${t.input.slice(0, 60)}`] }));
+          } else if (msg.type === "step") {
+            useStore.setState({ thinking: false });
+            preparedSteps.push(msg);
+          } else if (msg.type === "done") {
+            if (preparedSteps.length > 0) {
+              // Defer presentation: store steps and raise hand for invite.
+              handedOff = true;
+              this.pendingSteps = preparedSteps;
+              this.room?.cast({ k: "agent-end" });
+              useStore.setState({ thinking: false, thinkingTrace: [] });
+              this.agentBusy = false;
+              this.raiseHand("ready-to-present");
+              return;
+            }
+            break outer;
+          } else if (msg.type === "error") {
+            throw new Error((msg as { type: "error"; message: string }).message);
+          }
           if (this.cancelled) { try { void reader.cancel(); } catch { /* noop */ } break outer; }
         }
       }
-      if (!sawStep && !this.cancelled) {
+
+      if (preparedSteps.length === 0 && !this.cancelled) {
         const line = "Hmm, I came up empty on that one — mind rephrasing?";
         this.caption("Forge", line, true);
         this.transcript("Forge", line);
@@ -315,16 +414,75 @@ export class ForgeSession {
         await this.speak(line);
       }
     } finally {
+      if (!handedOff) {
+        this.room?.cast({ k: "agent-end" });
+        useStore.setState({ thinking: false, thinkingTrace: [] });
+        this.hideCaption();
+        this.setListening();
+        this.agentBusy = false;
+        this.agentAbort = null;
+        this.buffer = [];
+        const next = this.pendingInterrupt;
+        this.pendingInterrupt = null;
+        if (next) setTimeout(() => void this.runAgent({ question: next, interrupted: true }), 250);
+      } else {
+        // Already cleaned up in the try block before returning.
+        this.agentAbort = null;
+        this.buffer = [];
+      }
+    }
+  }
+
+  async runCodeAgent(task: string): Promise<void> {
+    if (this.agentBusy) return;
+    this.agentBusy = true;
+    this.cancelled = false;
+    this.lowerHand();
+    this.room?.cast({ k: "agent-start" });
+    this.setStatus("coding\u2026");
+    useStore.setState({ thinking: true, thinkingTrace: [], listeningActive: false });
+    const ack = "On it \u2014 I'll make those changes and report back.";
+    this.caption("Forge", ack, true); this.transcript("Forge", ack);
+    void this.speak(ack); // fire-and-forget
+    try {
+      const res = await fetch(`${API}/api/agent/code`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ task }),
+      });
+      const reader = res.body!.getReader(); const dec = new TextDecoder();
+      let buf = "";
+      for (;;) {
+        const { done, value } = await reader.read(); if (done) break;
+        buf += dec.decode(value, { stream: true });
+        const lines = buf.split("\n"); buf = lines.pop() ?? "";
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try {
+            const msg = JSON.parse(line) as { type: string; name?: string; input?: string; text?: string; summary?: string; message?: string };
+            if (msg.type === "tool") useStore.setState((s) => ({ thinkingTrace: [...s.thinkingTrace, `\uD83D\uDD27 ${msg.name ?? ""}: ${String(msg.input ?? "").slice(0, 60)}`] }));
+            if (msg.type === "progress") useStore.setState((s) => ({ thinkingTrace: [...s.thinkingTrace, String(msg.text ?? "").slice(0, 80)] }));
+            if (msg.type === "done") {
+              const summary = msg.summary || "Done.";
+              this.caption("Forge", summary, true); this.transcript("Forge", summary);
+              this.room?.cast({ k: "step", say: summary, ops: [] });
+              await this.speak(summary);
+            }
+            if (msg.type === "error") throw new Error(msg.message);
+          } catch { /* ignore parse errors */ }
+        }
+      }
+    } catch (err) {
+      if (!this.cancelled) {
+        const line = err instanceof Error && err.message.includes("claude")
+          ? "I need Claude Code CLI installed and no API key to use coding mode."
+          : "Something went wrong with that coding task.";
+        this.caption("Forge", line, true); this.transcript("Forge", line); await this.speak(line);
+      }
+    } finally {
       this.room?.cast({ k: "agent-end" });
-      useStore.setState({ thinking: false });
-      this.hideCaption();
-      this.setStatus("listening");
+      useStore.setState({ thinking: false, thinkingTrace: [] });
+      this.hideCaption(); this.setListening();
       this.agentBusy = false;
-      this.agentAbort = null;
-      this.buffer = [];
-      const next = this.pendingInterrupt;
-      this.pendingInterrupt = null;
-      if (next) setTimeout(() => void this.runAgent({ question: next, interrupted: true }), 250);
     }
   }
 
@@ -372,7 +530,8 @@ export class ForgeSession {
     this.cancelSpeech();
     this.wb?.finishNow();
     this.exitPresenting();
-    this.setStatus("listening");
+    this.setListening();
+    useStore.setState({ thinkingTrace: [] });
   }
 
   // ---------- utterance routing ----------
@@ -393,23 +552,37 @@ export class ForgeSession {
       void this.speak("Board's clean.");
       return;
     }
+
+    // Check INVITE *before* direct address — "Forge, go ahead" invites rather than re-asks.
+    if (this.handRaised && INVITE.test(text)) {
+      void this.runAgent({ invited: true, reason: this.handReason });
+      return;
+    }
+
     if (source === "typed" || isAddressed(text)) {
       const question = source === "typed" ? text : stripAddress(text) || text;
       if (this.agentBusy) { this.interrupt(question); return; }
       if (this.remoteAgentActive) {
-        // Stop the mirrored run on both ends, then take over with the new ask.
+        // 1f: Stop mirrored run immediately and take over with the new ask.
         this.room?.cast({ k: "cancel" });
-        this.onCast({ k: "cancel" });
-        setTimeout(() => void this.runAgent({ question, interrupted: true }), 300);
+        this.remoteAgentActive = false;
+        this.cancelled = true;
+        this.cancelSpeech();
+        this.wb?.finishNow();
+        this.exitPresenting();
+        this.setListening();
+        void this.runAgent({ question, interrupted: true });
+        return;
+      }
+      // Check for imperative coding command (Phase 5).
+      if (CODE_COMMAND.test(question)) {
+        void this.runCodeAgent(question);
         return;
       }
       void this.runAgent({ question });
       return;
     }
-    if (this.handRaised && INVITE.test(text)) {
-      void this.runAgent({ invited: true, reason: this.handReason });
-      return;
-    }
+
     // Not addressed to Forge: listen passively, maybe raise hand.
     this.buffer.push({ who: this.myName, text });
     if (this.buffer.length > 14) this.buffer.shift();
@@ -431,8 +604,8 @@ export class ForgeSession {
       case "agent-start":
         this.remoteAgentActive = true;
         this.cancelled = false;
-        useStore.setState({ handRaised: false, thinking: true });
-        this.setStatus("thinking…");
+        useStore.setState({ handRaised: false, thinking: true, listeningActive: false });
+        this.setStatus("thinking\u2026");
         break;
       case "step":
         useStore.setState({ thinking: false });
@@ -442,7 +615,7 @@ export class ForgeSession {
         this.remoteChain = this.remoteChain.then(() => {
           this.remoteAgentActive = false;
           this.hideCaption();
-          this.setStatus("listening");
+          this.setListening();
         });
         break;
       case "cancel":
@@ -452,7 +625,8 @@ export class ForgeSession {
         this.cancelSpeech();
         this.wb?.finishNow();
         this.exitPresenting();
-        this.setStatus("listening");
+        this.setListening();
+        useStore.setState({ thinkingTrace: [] });
         break;
       case "board-clear":
         this.wb?.clear();
@@ -460,8 +634,21 @@ export class ForgeSession {
       case "hand":
         this.handReason = ev.reason;
         useStore.setState({ handRaised: ev.raised });
-        if (ev.raised) this.setStatus("✋ has a thought");
-        else if (!this.agentBusy && !this.remoteAgentActive) this.setStatus("listening");
+        if (ev.raised) this.setStatus("\u270B has a thought");
+        else if (!this.agentBusy && !this.remoteAgentActive) this.setListening();
+        break;
+      case "speaker-role":
+        // Remote says whether THEY are speaker; we are speaker if they are not.
+        this.isSpeaker = !ev.isSpeaker;
+        break;
+      case "board-edit":
+        this.cancelAgent();
+        break;
+      case "focus":
+        useStore.setState({ codePanelHighlight: { start: ev.startLine, end: ev.endLine } });
+        break;
+      case "code-panel-open":
+        useStore.setState({ codePanelOpen: true, codePanelFile: ev.file, codePanelGithubUrl: ev.githubUrl ?? null });
         break;
     }
   }
@@ -473,7 +660,7 @@ export class ForgeSession {
 
   private exitPresenting(): void {
     useStore.setState({ presenting: false });
-    if (!this.agentBusy) this.setStatus("listening");
+    if (!this.agentBusy) this.setListening();
   }
 
   private chime(gain = 1): void {
@@ -492,6 +679,23 @@ export class ForgeSession {
       o.start(t0 + i * 0.12);
       o.stop(t0 + i * 0.12 + 0.55);
     });
+  }
+
+  /** Soft single-note ping when Forge becomes ready to listen again. */
+  private listeningChime(): void {
+    const ac = this.audioCtx;
+    if (!ac) return;
+    const t0 = ac.currentTime;
+    const o = ac.createOscillator();
+    const g = ac.createGain();
+    o.type = "sine";
+    o.frequency.value = 880;
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(0.04, t0 + 0.01);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.15);
+    o.connect(g).connect(ac.destination);
+    o.start(t0);
+    o.stop(t0 + 0.2);
   }
 
   // ---------- mic level → talking ring ----------
@@ -595,6 +799,7 @@ export class ForgeSession {
     this.caption("Forge", greeting, true);
     this.transcript("Forge", greeting);
     void this.speak(greeting);
+    useStore.setState({ listeningActive: true });
   }
 
   // ---------- controls (invoked by components) ----------
@@ -640,6 +845,75 @@ export class ForgeSession {
 
   ask(text: string): void {
     this.handleUtterance(text, "typed");
+  }
+
+  // ---------- board edit + code panel (Phase 6c) ----------
+  onBoardEdit(): void {
+    this.cancelAgent();
+    this.room?.cast({ k: "board-edit" });
+  }
+
+  openCodePanel(attr: { file: string; startLine?: number; endLine?: number }): void {
+    const params = new URLSearchParams({ path: attr.file });
+    if (attr.startLine != null) params.set("start", String(attr.startLine));
+    if (attr.endLine != null) params.set("end", String(attr.endLine));
+    fetch(`${API}/api/repo/file?${params}`)
+      .then((r) => r.json())
+      .then((data: { path: string; startLine: number; lines: string[]; githubUrl?: string }) => {
+        useStore.setState({
+          codePanelOpen: true,
+          codePanelFile: data.path,
+          codePanelLines: data.lines,
+          codePanelStartLine: data.startLine,
+          codePanelGithubUrl: data.githubUrl ?? null,
+          codePanelHighlight: attr.startLine != null
+            ? { start: attr.startLine, end: attr.endLine ?? attr.startLine }
+            : null,
+        });
+        this.room?.cast({ k: "code-panel-open", file: data.path, githubUrl: data.githubUrl });
+      })
+      .catch(() => { /* silently ignore missing file endpoint */ });
+  }
+
+  async runWalkthrough(nodeLabel: string, attr: { file: string; startLine?: number; endLine?: number }): Promise<void> {
+    const board = this.wb ? this.wb.summary() : { title: null, nodes: [], arrows: [] };
+    try {
+      const res = await fetch(`${API}/api/agent/walkthrough`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          nodeId: nodeLabel,
+          nodeLabel,
+          attr,
+          transcript: useStore.getState().transcript.slice(-8),
+          board,
+        }),
+      });
+      if (!res.ok || !res.body) return;
+      const reader = res.body.getReader();
+      const dec = new TextDecoder();
+      let buf = "";
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        const lines = buf.split("\n");
+        buf = lines.pop() ?? "";
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try {
+            const msg = JSON.parse(line) as { type: string; say?: string; ops?: AgentStep["ops"]; file?: string; startLine?: number; endLine?: number };
+            if (msg.type === "step") {
+              await this.playStep({ type: "step", say: msg.say ?? "", ops: msg.ops }, true);
+            } else if (msg.type === "focus") {
+              const hl = { start: msg.startLine ?? 1, end: msg.endLine ?? 1 };
+              useStore.setState({ codePanelHighlight: hl });
+              this.room?.cast({ k: "focus", file: msg.file ?? "", startLine: hl.start, endLine: hl.end });
+            }
+          } catch { /* ignore parse errors */ }
+        }
+      }
+    } catch { /* silently fail — walkthrough is best-effort */ }
   }
 
   end(): void {

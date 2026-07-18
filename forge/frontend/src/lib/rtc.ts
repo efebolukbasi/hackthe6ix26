@@ -13,7 +13,11 @@ export type CastEvent =
   | { k: "agent-end" }
   | { k: "cancel" }
   | { k: "board-clear" }
-  | { k: "hand"; raised: boolean; reason: string };
+  | { k: "hand"; raised: boolean; reason: string }
+  | { k: "board-edit" }
+  | { k: "focus"; file: string; startLine: number; endLine: number }
+  | { k: "code-panel-open"; file: string; githubUrl?: string }
+  | { k: "speaker-role"; isSpeaker: boolean };
 
 interface ServerMsg {
   t: "welcome" | "peer-joined" | "peer-left" | "signal" | "cast" | "full";
@@ -53,6 +57,11 @@ export class RoomLink {
   /** The driver (lowest id) runs passive listen checks so only one side auto-raises the hand. */
   get isDriver(): boolean {
     return this.peerId === null || this.myId < this.peerId;
+  }
+
+  /** Peer with the lower room ID is the designated TTS speaker. When alone, always speaker. */
+  get isSpeaker(): boolean {
+    return this.myId > 0 && this.myId <= (this.peerId ?? Infinity);
   }
 
   get hasPeer(): boolean {
@@ -114,6 +123,8 @@ export class RoomLink {
     this.peerName = name;
     useStore.setState({ remoteName: name });
     this.cb.onPeerJoined(name);
+    // Let peer know who is the TTS speaker
+    this.cast({ k: "speaker-role", isSpeaker: this.isSpeaker });
   }
 
   private async setupPeer(initiator: boolean): Promise<void> {

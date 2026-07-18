@@ -46,7 +46,7 @@ type Stroke = PathStroke | TextStroke;
 
 interface NodeMeta { x: number; y: number; w: number; h: number; color: string; dead: boolean }
 
-interface BoardItem {
+export interface BoardItem {
   type: DrawableOp["op"];
   id?: string;
   op: DrawableOp;
@@ -54,6 +54,7 @@ interface BoardItem {
   faded: boolean;
   meta?: NodeMeta;
   target?: string;
+  offset?: { dx: number; dy: number };
 }
 
 interface CurrentDraw { item: BoardItem; si: number; prog: number }
@@ -161,6 +162,46 @@ export class Whiteboard {
 
   get busy(): boolean {
     return this.queue.length > 0 || !!this.current;
+  }
+
+  get allItems(): BoardItem[] {
+    return this.items;
+  }
+
+  /** Map canvas pixel coords to virtual 1200×720 space. */
+  canvasToVirtual(cx: number, cy: number): { x: number; y: number } {
+    const { s, ox, oy } = this.getScale();
+    return { x: (cx - ox) / s, y: (cy - oy) / s };
+  }
+
+  /** Return the scale/offset used by render(). */
+  getScale(): { s: number; ox: number; oy: number } {
+    const cw = this.canvas.clientWidth, ch = this.canvas.clientHeight;
+    const s = Math.min(cw / VW, ch / VH);
+    return { s, ox: (cw - VW * s) / 2, oy: (ch - VH * s) / 2 };
+  }
+
+  /** Hit-test items in reverse paint order (topmost first); returns first item whose meta bbox contains (vx, vy). */
+  hitTest(vx: number, vy: number): BoardItem | null {
+    for (let i = this.items.length - 1; i >= 0; i--) {
+      const item = this.items[i];
+      const m = item.meta;
+      if (!m) continue;
+      const odx = item.offset?.dx ?? 0;
+      const ody = item.offset?.dy ?? 0;
+      const ax = m.x + odx, ay = m.y + ody;
+      if (vx >= ax - m.w / 2 && vx <= ax + m.w / 2 && vy >= ay - m.h / 2 && vy <= ay + m.h / 2) return item;
+    }
+    return null;
+  }
+
+  /** Move an item by (dx, dy) in virtual space. Strokes stay baked; uses canvas transform offset. */
+  moveItem(id: string, dx: number, dy: number): void {
+    const item = this.byId[id];
+    if (!item || !item.meta) return;
+    if (!item.offset) item.offset = { dx: 0, dy: 0 };
+    item.offset.dx += dx;
+    item.offset.dy += dy;
   }
 
   // Compact board state for the agent prompt (what's currently drawn).
@@ -408,6 +449,7 @@ export class Whiteboard {
 
   private _drawItem(ctx: CanvasRenderingContext2D, item: BoardItem, partialSi = Infinity, partialProg = 0): Pt | null {
     ctx.save();
+    if (item.offset) ctx.translate(item.offset.dx, item.offset.dy);
     if (item.faded) ctx.globalAlpha = 0.26;
     const dead = item.type === "node" && item.meta?.dead;
     // fill for completed, alive nodes
