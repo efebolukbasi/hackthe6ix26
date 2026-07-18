@@ -13,7 +13,7 @@ forge/
     src/server.ts       routes + static hosting of ../frontend/dist
     src/lib/repo.ts     repo indexer → digest injected into the system prompt
     src/lib/prompt.ts   persona + whiteboard-op schema prompts
-    src/lib/llm.ts      Claude access: ANTHROPIC_API_KEY (API) or `claude` CLI login
+    src/lib/llm.ts      Claude access through the Anthropic API
     src/lib/agent.ts    /api/agent — streams NDJSON steps {say, ops[]}; /api/listen
     src/lib/tts.ts      /api/tts — ElevenLabs proxy + disk cache (503 → browser TTS)
     src/lib/types.ts    shared types (WhiteboardOp union, AgentStep, …)
@@ -39,14 +39,13 @@ Development (hot reload): `npm run dev:backend` + `npm run dev:frontend`
 
 Open http://localhost:5180 in **Chrome**, allow mic/cam, Join.
 
-- **Brain**: uses `ANTHROPIC_API_KEY` if set; otherwise shells out to your local
-  `claude` CLI login. No key needed on a machine with Claude Code.
+- **Brain**: uses the Anthropic API through `ANTHROPIC_API_KEY`.
 - **Voice**: with `ELEVENLABS_API_KEY` Forge speaks via ElevenLabs (flash model,
   cheap; identical lines are disk-cached so repeated demos cost ~0 credits).
   Without it, browser TTS.
 - **Repo intelligence**: on boot the backend indexes a repo and folds a digest
-  into the prompt — and in CLI mode Forge also gets **live read-only tools**
-  (Grep/Read/Glob) inside that repo, so "where do we handle X?" is verified
+  into the prompt — and the Anthropic API agent also gets **live read-only tools**
+  (read/grep/list) inside that repo, so "where do we handle X?" is verified
   against the actual code and answered with a `file:line` **code card** drawn
   on the board. The 📁 picker at the top of the side panel lists repositories
   available to the backend's `GITHUB_TOKEN`; click one and Forge re-reads it
@@ -118,9 +117,9 @@ access to the repository's contents and issues, then use the 📁 picker to brow
 repositories or speak a meeting request to create an issue. The token stays on
 the backend and is never sent to browsers.
 
-The hosting tier is free, but Anthropic API usage is billed by Anthropic. Without
-an API key, Forge cannot use the local Claude CLI fallback on Render. ElevenLabs
-is optional because browser TTS is used when its key is absent. Render free
+The hosting tier is free, but Anthropic API usage is billed by Anthropic. An
+`ANTHROPIC_API_KEY` is required for Forge's brain. ElevenLabs is optional because
+browser TTS is used when its key is absent. Render free
 instances sleep after idle periods, so the first visit after a pause can take
 about a minute.
 

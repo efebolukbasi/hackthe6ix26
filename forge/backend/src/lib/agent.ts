@@ -10,8 +10,7 @@ let REPO_CWD: string | undefined;
 export function setRepoContext(digest: string, repoPath?: string): void {
   REPO_CWD = repoPath;
   REPO_DIGEST = digest;
-  // Both brain paths have live repo tools now (CLI: Read/Grep/Glob; API:
-  // read_file/grep/list_files executed locally by llm.ts).
+  // The API path has live read-only repo tools executed locally by llm.ts.
   SYSTEM = buildSystem(digest, !!repoPath);
 }
 export function getRepoCwd(): string | undefined {
@@ -163,7 +162,7 @@ export async function respond(
     send({ type: "error", message });
     send({
       type: "step",
-      say: "I hit a snag reaching my brain. Check that the backend can reach Claude — either an API key or a Claude Code login.",
+      say: "I hit a snag reaching my brain. Check that the backend has a valid Anthropic API key.",
       ops: [],
     });
     send({ type: "done" });

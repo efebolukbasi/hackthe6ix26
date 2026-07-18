@@ -1,7 +1,5 @@
-// Read-only repository tools for the API-mode agent loop. The CLI path gets
-// Read/Grep/Glob from Claude Code for free; this module gives the direct-API
-// path the same power: llm.ts executes these locally against the loaded repo
-// and feeds the results back into the conversation.
+// Read-only repository tools for the direct Anthropic API path. llm.ts
+// executes these locally against the loaded repo and feeds results back.
 import { existsSync, readFileSync } from "node:fs";
 import { extname, resolve } from "node:path";
 import { walkFiles, TEXT_EXT } from "./repo.ts";

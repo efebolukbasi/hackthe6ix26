@@ -73,7 +73,7 @@ export interface WalkthroughRequestBody {
   board: unknown;
 }
 
-/** Emitted when Claude Code uses a tool (CLI mode only). */
+/** Emitted when the Anthropic agent uses a repository tool. */
 export interface ToolEvent {
   type: 'tool';
   name: string;
