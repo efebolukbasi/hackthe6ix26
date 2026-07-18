@@ -100,6 +100,20 @@ app.post("/api/github/device/poll", async (req: Request, res: Response) => {
   res.json(await github.devicePoll(device_code));
 });
 
+app.post("/api/github/issues", async (req: Request, res: Response) => {
+  const body = req.body as { title?: string; body?: string } | undefined;
+  const cwd = getRepoCwd();
+  if (!cwd) return res.status(400).json({ error: "no repo loaded" });
+  const title = String(body?.title || "Meeting follow-up").trim();
+  const issueBody = String(body?.body || "Created from a Forge meeting.").trim();
+  try {
+    res.json(await github.createIssue(cwd, title, issueBody));
+  } catch (err) {
+    const e = err as { status?: number; message?: string };
+    res.status(e.status || 502).json({ error: e.message || String(err) });
+  }
+});
+
 // Point Forge at a different repo mid-meeting: local path or GitHub URL.
 app.post("/api/repo/load", async (req: Request, res: Response) => {
   const source = String((req.body as { url?: string } | undefined)?.url || "").trim();

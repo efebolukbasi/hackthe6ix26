@@ -38,7 +38,7 @@ function stripAddress(text: string): string {
 const INVITE = /\b(go ahead|go for it|take it away|what do you think|your thoughts|tell us|share it|yes forge|sure forge|floor is yours|let's hear it)\b/i;
 const STOP = /\b(stop presenting|back to (the )?grid|that'?s enough|stop talking|be quiet|thanks,? forge|thank you,? forge)\b/i;
 const CLEAR = /\b((clear|wipe) the board|start over|clean slate)\b/i;
-const CODE_COMMAND = /\b(improve|fix|refactor|add|build|create|update|delete|remove|implement|write|generate)\b.*\b(the\s+)?(frontend|backend|component|function|test|api|code|feature|endpoint|hook|class|style|css|route)/i;
+const CREATE_ISSUE = /\b(?:create|open|file)\s+(?:a\s+)?github\s+issue\b/i;
 
 export const CHIPS = [
   "Forge, how does this project itself work?",
@@ -512,6 +512,34 @@ export class ForgeSession {
     useStore.setState({ thinkingTrace: [] });
   }
 
+  private async createGitHubIssue(command: string): Promise<void> {
+    const context = useStore.getState().transcript
+      .filter((line) => line.who !== "Forge" && line.text !== command)
+      .slice(-12);
+    const subject = context[context.length - 1]?.text || "Meeting follow-up";
+    const title = `Meeting follow-up: ${subject}`.slice(0, 180);
+    const body = [
+      "Created from a Forge meeting.",
+      "",
+      "## Recent discussion",
+      ...context.map((line) => `- **${line.who}:** ${line.text}`),
+    ].join("\n");
+
+    try {
+      const res = await apiFetch(`${API}/api/github/issues`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title, body }),
+      });
+      const out = (await res.json()) as { html_url?: string; number?: number; error?: string };
+      if (!res.ok || !out.html_url) throw new Error(out.error || "issue creation failed");
+      await this.playStep({ type: "step", say: `Created GitHub issue number ${out.number}.`, ops: [] }, true);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "issue creation failed";
+      await this.playStep({ type: "step", say: `I couldn't create that GitHub issue: ${message}.`, ops: [] }, true);
+    }
+  }
+
   // ---------- utterance routing ----------
   handleUtterance(text: string, source: UtteranceSource): void {
     this.transcript(this.myName, text);
@@ -530,6 +558,10 @@ export class ForgeSession {
       this.room?.cast({ k: "board-clear" });
       this.caption("Forge", "Board's clean.");
       void this.speak("Board's clean.");
+      return;
+    }
+    if (CREATE_ISSUE.test(text)) {
+      void this.createGitHubIssue(text);
       return;
     }
 
@@ -552,11 +584,6 @@ export class ForgeSession {
         this.exitPresenting();
         this.setListening();
         void this.runAgent({ question, interrupted: true });
-        return;
-      }
-      // Check for imperative coding command (Phase 5).
-      if (CODE_COMMAND.test(question)) {
-        void this.runCodeAgent(question);
         return;
       }
       void this.runAgent({ question });
