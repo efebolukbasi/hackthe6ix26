@@ -112,10 +112,17 @@ WebSocket requests. Do not share the bare deployment URL.
 
 ### GitHub access
 
-Configure one GitHub personal access token in Render as `GITHUB_TOKEN`. Grant it
-access to the repository's contents and issues, then use the 📁 picker to browse
-repositories or speak a meeting request to create an issue. The token stays on
-the backend and is never sent to browsers.
+Configure one fine-grained GitHub personal access token in Render as
+`GITHUB_TOKEN`. Set its resource owner and repository access to include the
+target repository, then grant **Contents: Read-only** and **Issues: Read and
+write**. Use the 📁 picker to browse repositories or speak a meeting request to
+create an issue. The token stays on the backend and is never sent to browsers.
+
+After changing the variable, choose **Save and deploy** (or **Save, rebuild,
+and deploy**) in Render; **Save only** does not update the running service. On
+Render, Forge also uses Render's repository slug if the checkout has no Git
+remote, so issue creation targets the deployed repository before a different
+repository is selected in the picker.
 
 The hosting tier is free, but Anthropic API usage is billed by Anthropic. An
 `ANTHROPIC_API_KEY` is required for Forge's brain. ElevenLabs is optional because

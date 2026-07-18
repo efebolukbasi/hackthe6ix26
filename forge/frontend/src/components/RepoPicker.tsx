@@ -11,6 +11,7 @@ interface Repo {
 interface GhStatus {
   connected: boolean;
   user?: string;
+  error?: string;
 }
 
 export default function RepoPicker() {
@@ -63,7 +64,7 @@ export default function RepoPicker() {
       </button>
       {open && (
         <div className="repo-drop">
-          {!gh?.connected && <div className="repo-hint">Set GITHUB_TOKEN in the backend environment to browse repositories.</div>}
+          {!gh?.connected && <div className="repo-hint">{gh?.error || "Set GITHUB_TOKEN in the backend environment to browse repositories."}</div>}
           {gh?.connected && (
             <>
               <input placeholder="Search your repos…" value={q} onChange={(e) => setQ(e.target.value)} />

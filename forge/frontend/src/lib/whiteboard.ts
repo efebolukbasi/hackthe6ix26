@@ -22,6 +22,7 @@ const INK = "#28323f";
 const NODE_W = 180, NODE_H = 70;
 const CODE_W = 380;
 const CARD_GAP = 28;
+const NOTE_LINE_H = 27;
 const PEN_SPEED = 1050;  // virtual px per second
 const CHAR_SPEED = 26;   // characters per second for type-on text
 const POP_DUR = 0.55;    // settle pulse after an item completes
@@ -299,17 +300,84 @@ export class Whiteboard {
     for (const op of ops) this.queue.push(op);
   }
 
-  /** True when a card would touch an already-rendered node or code card.
-   * The breathing room keeps borders, labels, and hand-drawn jitter apart. */
-  private collidesWithCard(x: number, y: number, w: number, h: number): boolean {
-    return Object.values(this.nodes).some((item) => {
-      const meta = item.meta;
-      if (!meta) return false;
-      const otherX = meta.x + (item.offset?.dx ?? 0);
-      const otherY = meta.y + (item.offset?.dy ?? 0);
-      return Math.abs(x - otherX) < (w + meta.w) / 2 + CARD_GAP
-        && Math.abs(y - otherY) < (h + meta.h) / 2 + CARD_GAP;
+  /** True when a proposed layout box would touch a completed card or note.
+   * Notes are included because an annotation printed through a card is just as
+   * unreadable as two cards occupying the same space. */
+  private collidesWithPlacedItem(x: number, y: number, w: number, h: number): boolean {
+    return this.items.some((item) => {
+      let other: Bounds | undefined;
+      if (item.type === "node" || item.type === "code") {
+        const meta = item.meta;
+        if (!meta) return false;
+        const dx = item.offset?.dx ?? 0, dy = item.offset?.dy ?? 0;
+        other = {
+          minX: meta.x + dx - meta.w / 2,
+          minY: meta.y + dy - meta.h / 2,
+          maxX: meta.x + dx + meta.w / 2,
+          maxY: meta.y + dy + meta.h / 2,
+        };
+      } else if (item.type === "note") {
+        const dx = item.offset?.dx ?? 0, dy = item.offset?.dy ?? 0;
+        if (!item.bbox) return false;
+        other = {
+          minX: item.bbox.minX + dx,
+          minY: item.bbox.minY + dy,
+          maxX: item.bbox.maxX + dx,
+          maxY: item.bbox.maxY + dy,
+        };
+      } else {
+        return false;
+      }
+      const otherX = (other.minX + other.maxX) / 2;
+      const otherY = (other.minY + other.maxY) / 2;
+      const otherW = other.maxX - other.minX;
+      const otherH = other.maxY - other.minY;
+      return Math.abs(x - otherX) < (w + otherW) / 2 + CARD_GAP
+        && Math.abs(y - otherY) < (h + otherH) / 2 + CARD_GAP;
     });
+  }
+
+  /** Resolve a proposed rectangular footprint to a nearby unoccupied spot.
+   * Cards favour their original row; annotations favour their original column
+   * so labels remain close to the part of the diagram they describe. */
+  private findOpenPlacement(x: number, y: number, w: number, h: number, preferColumn = false): { x: number; y: number } {
+    if (!this.collidesWithPlacedItem(x, y, w, h)) return { x, y };
+
+    const stepX = Math.max(230, w + CARD_GAP);
+    const stepY = Math.max(140, h + CARD_GAP);
+    for (let ring = 1; ring <= 8; ring++) {
+      const candidates: Array<{ col: number; row: number }> = [];
+      for (let col = -ring; col <= ring; col++) {
+        for (let row = -ring; row <= ring; row++) {
+          if (Math.max(Math.abs(col), Math.abs(row)) === ring) candidates.push({ col, row });
+        }
+      }
+      candidates.sort((a, b) => {
+        const score = ({ col, row }: { col: number; row: number }) =>
+          preferColumn
+            ? Math.abs(col) * stepX * 3 + Math.abs(row) * stepY
+            : Math.abs(col) * stepX + Math.abs(row) * stepY * 3;
+        const aScore = score(a), bScore = score(b);
+        if (aScore !== bScore) return aScore - bScore;
+        // Prefer moving back toward the home canvas centre when tied.
+        const home = ({ col, row }: { col: number; row: number }) =>
+          Math.abs(x + col * stepX - VW / 2) + Math.abs(y + row * stepY - VH / 2);
+        return home(a) - home(b);
+      });
+      for (const candidate of candidates) {
+        const candidateX = x + candidate.col * stepX;
+        const candidateY = y + candidate.row * stepY;
+        if (!this.collidesWithPlacedItem(candidateX, candidateY, w, h)) return { x: candidateX, y: candidateY };
+      }
+    }
+
+    // A crowded home region can grow downward; the camera/minimap already
+    // auto-frame the infinite canvas, so clarity wins over forced overlap.
+    const bottom = this.items.reduce(
+      (max, item) => Math.max(max, (item.bbox?.maxY ?? 0) + (item.offset?.dy ?? 0)),
+      VH
+    );
+    return { x, y: bottom + h / 2 + CARD_GAP };
   }
 
   /** Find the closest open spot for a node or code card. The model normally
@@ -321,48 +389,24 @@ export class Whiteboard {
     const h = op.op === "node"
       ? op.h || NODE_H
       : 44 + (op.text || "").split("\n").slice(0, 4).length * 20;
-    if (!this.collidesWithCard(op.x, op.y, w, h)) return op;
+    const placement = this.findOpenPlacement(op.x, op.y, w, h);
+    return placement.x === op.x && placement.y === op.y ? op : { ...op, ...placement } as T;
+  }
 
-    // Scale the search to the incoming card. Horizontal candidates come first
-    // so a layered diagram tends to stay in its original row.
-    const stepX = Math.max(230, w + CARD_GAP);
-    const stepY = Math.max(140, h + CARD_GAP);
-    for (let ring = 1; ring <= 8; ring++) {
-      const candidates: Array<{ col: number; row: number }> = [];
-      for (let col = -ring; col <= ring; col++) {
-        for (let row = -ring; row <= ring; row++) {
-          if (Math.max(Math.abs(col), Math.abs(row)) !== ring) continue;
-          candidates.push({ col, row });
-        }
-      }
-      candidates.sort((a, b) => {
-        const score = ({ col, row }: { col: number; row: number }) =>
-          Math.abs(col) * stepX + Math.abs(row) * stepY * 3;
-        const aScore = score(a), bScore = score(b);
-        if (aScore !== bScore) return aScore - bScore;
-        // Prefer moving back toward the home canvas centre when tied.
-        const home = ({ col, row }: { col: number; row: number }) =>
-          Math.abs(op.x + col * stepX - VW / 2) + Math.abs(op.y + row * stepY - VH / 2);
-        return home(a) - home(b);
-      });
-      for (const candidate of candidates) {
-        const x = op.x + candidate.col * stepX;
-        const y = op.y + candidate.row * stepY;
-        if (!this.collidesWithCard(x, y, w, h)) return { ...op, x, y } as T;
-      }
-    }
-
-    // A crowded home region can grow downward; the camera/minimap already
-    // auto-frame the infinite canvas, so clarity wins over forced overlap.
-    const bottom = Object.values(this.nodes).reduce(
-      (max, item) => Math.max(max, (item.meta?.y ?? 0) + (item.offset?.dy ?? 0) + (item.meta?.h ?? 0) / 2),
-      VH
-    );
-    return { ...op, x: op.x, y: bottom + h / 2 + CARD_GAP } as T;
+  private resolveNotePlacement(op: Extract<DrawableOp, { op: "note" }>): DrawableOp {
+    const lines = op.text.split("\n");
+    this.ctx.font = '19px "Patrick Hand"';
+    const w = Math.max(...lines.map((line) => this.ctx.measureText(line).width), 1);
+    const h = NOTE_LINE_H * lines.length;
+    const centerY = op.y + (lines.length - 1) * NOTE_LINE_H / 2;
+    const placement = this.findOpenPlacement(op.x, centerY, w, h, true);
+    if (placement.x === op.x && placement.y === centerY) return op;
+    return { ...op, x: placement.x, y: op.y + placement.y - centerY };
   }
 
   private resolvePlacement(op: DrawableOp): DrawableOp {
     if (op.op === "node" || op.op === "code") return this.resolveCardPlacement(op);
+    if (op.op === "note") return this.resolveNotePlacement(op);
     return op;
   }
 

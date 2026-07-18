@@ -8,7 +8,8 @@ const execFileP = promisify(execFile);
 let ghCliToken: { token: string | null; at: number } | null = null;
 
 export async function githubToken(): Promise<string | null> {
-  if (process.env.GITHUB_TOKEN) return process.env.GITHUB_TOKEN;
+  const configured = process.env.GITHUB_TOKEN?.trim();
+  if (configured) return configured;
   // Local-dev fallback: an authenticated `gh` CLI login means repo browsing
   // and issue creation work with zero .env configuration.
   if (ghCliToken && Date.now() - ghCliToken.at < 300_000) return ghCliToken.token;
@@ -44,6 +45,8 @@ export interface GithubStatus {
   connected: boolean;
   user?: string;
   via?: "env" | "gh";
+  /** Safe diagnostic for the repo picker. Never includes a token. */
+  error?: string;
 }
 
 export async function status(): Promise<GithubStatus> {
@@ -51,10 +54,33 @@ export async function status(): Promise<GithubStatus> {
   if (!token) return { connected: false };
   try {
     const user = await api<{ login: string }>("/user", token);
-    return { connected: true, user: user.login, via: process.env.GITHUB_TOKEN ? "env" : "gh" };
-  } catch {
-    return { connected: false };
+    return { connected: true, user: user.login, via: configuredGithubToken() ? "env" : "gh" };
+  } catch (err) {
+    return { connected: false, error: githubErrorMessage(err) };
   }
+}
+
+/** The owner/repository for the deployment itself, when one is known. */
+export function configuredRepoSlug(): string | null {
+  const explicit = process.env.GITHUB_REPO?.trim();
+  if (explicit) {
+    const urlMatch = explicit.match(/github\.com[:/]([\w.-]+\/[\w.-]+?)(?:\.git)?\/?$/);
+    if (urlMatch) return urlMatch[1];
+    if (/^[\w.-]+\/[\w.-]+$/.test(explicit)) return explicit;
+  }
+  // Render sets this for Git-based services, including deployments where the
+  // checked-out source has no usable .git directory at runtime.
+  const renderSlug = process.env.RENDER_GIT_REPO_SLUG?.trim();
+  return renderSlug && /^[\w.-]+\/[\w.-]+$/.test(renderSlug) ? renderSlug : null;
+}
+
+function configuredGithubToken(): string | null {
+  return process.env.GITHUB_TOKEN?.trim() || null;
+}
+
+function githubErrorMessage(err: unknown): string {
+  const message = err instanceof Error ? err.message : String(err);
+  return message.slice(0, 240);
 }
 
 export interface RepoInfo {
@@ -95,8 +121,7 @@ export async function createIssue(repoPath: string, title: string, body: string,
     );
   }
 
-  const envSlug = (process.env.GITHUB_REPO || "").match(/github\.com[:/]([\w.-]+\/[\w.-]+?)(?:\.git)?\/?$/)?.[1];
-  const slug = slugHint || (await repoSlugFor(repoPath)) || envSlug;
+  const slug = slugHint || (await repoSlugFor(repoPath)) || configuredRepoSlug();
   if (!slug) {
     throw Object.assign(
       new Error("Couldn't determine the GitHub repository — pick one from the repo picker, or add a GitHub 'origin' remote to the active repo"),
@@ -109,6 +134,7 @@ export async function createIssue(repoPath: string, title: string, body: string,
     headers: {
       Authorization: `Bearer ${token}`,
       Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
       "Content-Type": "application/json",
     },
     body: JSON.stringify({ title: title.slice(0, 180), body: body.slice(0, 6000) }),

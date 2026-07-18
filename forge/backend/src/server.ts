@@ -76,7 +76,7 @@ let repoSlug: string | null = null;
 async function loadRepo(source: string): Promise<RepoMeta> {
   const path = await ensureRepo(source);
   const m = source.match(GITHUB_URL_RE);
-  repoSlug = m ? `${m[1]}/${m[2]}` : await github.repoSlugFor(path);
+  repoSlug = m ? `${m[1]}/${m[2]}` : (await github.repoSlugFor(path)) || github.configuredRepoSlug();
   const { digest, meta } = await buildDigest(path);
   setRepoContext(digest, path);
   repoMeta = meta;
