@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gesture + Voice POC — MediaPipe Hands</title>
+<style>
+  * { margin: 0; box-sizing: border-box; }
+  html, body { height: 100%; overflow: hidden; background: #0b0d12; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  #stage { position: fixed; inset: 0; width: 100vw; height: 100vh; }
+  #cam {
+    position: fixed; right: 16px; bottom: 16px; width: 190px;
+    border-radius: 10px; transform: scaleX(-1); opacity: 0.8;
+    border: 1px solid #263041; z-index: 2;
+  }
+  #hud {
+    position: fixed; top: 14px; left: 16px; z-index: 3; pointer-events: none;
+    color: #e2e8f0; font-size: 13px; line-height: 1.7; max-width: 560px;
+  }
+  #hud .hint { color: #64748b; font-size: 12px; }
+  #status { color: #94a3b8; }
+  #status.error { color: #f87171; }
+  #fps { position: fixed; top: 14px; right: 16px; z-index: 3; color: #475569; font-size: 12px; }
+  #voice {
+    position: fixed; bottom: 16px; left: 16px; z-index: 3; max-width: 46vw;
+    background: rgba(15, 17, 21, 0.75); backdrop-filter: blur(8px);
+    border: 1px solid #263041; border-radius: 12px; padding: 10px 14px;
+    color: #cbd5e1; font-size: 13px; line-height: 1.6;
+  }
+  #micdot {
+    display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+    background: #475569; margin-right: 8px; vertical-align: middle;
+  }
+  #micdot.live { background: #ef4444; animation: pulse 1.4s ease-in-out infinite; }
+  @keyframes pulse { 50% { opacity: 0.35; } }
+  #transcript { color: #94a3b8; font-style: italic; }
+  #cmd { margin-top: 2px; min-height: 1.2em; }
+  #cmd.ok { color: #34d399; }
+  #cmd.err { color: #fbbf24; }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<video id="cam" playsinline muted></video>
+<div id="hud">
+  <div><strong>gesture + voice POC</strong> — pinch 👌 to grab a box, release to drop.</div>
+  <div class="hint">say: “attach redis to worker a” · “connect client and gateway” · “disconnect gateway from redis”</div>
+  <div id="status">Starting camera…</div>
+</div>
+<div id="fps"></div>
+<div id="voice">
+  <div><span id="micdot"></span><span id="transcript">voice: waiting for mic…</span></div>
+  <div id="cmd"></div>
+</div>
+
+<script type="module">
+import { FilesetResolver, HandLandmarker } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+const video = document.getElementById("cam");
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+const statusEl = document.getElementById("status");
+const fpsEl = document.getElementById("fps");
+const micdot = document.getElementById("micdot");
+const transcriptEl = document.getElementById("transcript");
+const cmdEl = document.getElementById("cmd");
+
+let W = 0, H = 0, dotPattern = null;
+function resize() {
+  const d = devicePixelRatio || 1;
+  W = innerWidth; H = innerHeight;
+  canvas.width = W * d; canvas.height = H * d;
+  ctx.setTransform(d, 0, 0, d, 0, 0);
+  const tile = document.createElement("canvas");
+  tile.width = tile.height = 28 * d;
+  const tc = tile.getContext("2d");
+  tc.scale(d, d);
+  tc.fillStyle = "rgba(148, 163, 184, 0.09)";
+  tc.fillRect(13, 13, 2, 2);
+  dotPattern = ctx.createPattern(tile, "repeat");
+  if (dotPattern?.setTransform) dotPattern.setTransform(new DOMMatrix().scale(1 / d));
+}
+addEventListener("resize", resize);
+resize();
+
+// --- graph model ---
+// x,y = displayed position (eased each frame); tx,ty = target position
+const NODE_W = 156, NODE_H = 58;
+const nodes = [
+  { id: "client",  label: "Client",   sub: "browser",  color: "#38bdf8", fx: 0.50, fy: 0.13 },
+  { id: "gateway", label: "Gateway",  sub: "api",      color: "#a78bfa", fx: 0.50, fy: 0.33 },
+  { id: "redis",   label: "Redis",    sub: "pub/sub",  color: "#f87171", fx: 0.50, fy: 0.55 },
+  { id: "w1",      label: "Worker A", sub: "consumer", color: "#34d399", fx: 0.30, fy: 0.80 },
+  { id: "w2",      label: "Worker B", sub: "consumer", color: "#34d399", fx: 0.70, fy: 0.80 },
+];
+nodes.forEach(n => { n.x = n.tx = n.fx * W; n.y = n.ty = n.fy * H; });
+const byId = id => nodes.find(n => n.id === id);
+const edges = [["client","gateway"],["gateway","redis"],["redis","w1"]]
+  .map(([a, b]) => ({ a: byId(a), b: byId(b), birth: -1e9, pulse: -1e9 }));
+
+// Alias lists absorb common speech-to-text mishearings of each node name.
+const ALIASES = {
+  client:  ["client", "clients"],
+  gateway: ["gateway", "gate way", "gateways"],
+  redis:   ["redis", "reddis", "red is", "radius"],
+  w1:      ["worker a", "worker ay", "worker hey", "worker one", "worker 1", "worker 8"],
+  w2:      ["worker b", "worker bee", "worker be", "worker two", "worker 2"],
+};
+
+function findMentions(text) {
+  const hits = [];
+  for (const n of nodes) {
+    let best = -1;
+    for (const alias of ALIASES[n.id]) {
+      const m = text.match(new RegExp(`\\b${alias}\\b`));
+      if (m && (best === -1 || m.index < best)) best = m.index;
+    }
+    if (best !== -1) hits.push({ node: n, idx: best });
+  }
+  return hits.sort((p, q) => p.idx - q.idx).map(h => h.node);
+}
+
+function setCmd(ok, msg) {
+  cmdEl.textContent = (ok ? "✓ " : "✗ ") + msg;
+  cmdEl.className = ok ? "ok" : "err";
+}
+
+function addEdge(a, b) {
+  if (a === b) return setCmd(false, "same node twice");
+  const existing = edges.find(e => (e.a === a && e.b === b) || (e.a === b && e.b === a));
+  const now = performance.now();
+  if (existing) { existing.pulse = now; return setCmd(true, `${a.label} → ${b.label} already connected`); }
+  edges.push({ a, b, birth: now, pulse: now });
+  setCmd(true, `attached ${a.label} → ${b.label}`);
+}
+
+function removeEdge(a, b) {
+  const i = edges.findIndex(e => (e.a === a && e.b === b) || (e.a === b && e.b === a));
+  if (i === -1) return setCmd(false, `${a.label} and ${b.label} aren't connected`);
+  edges.splice(i, 1);
+  setCmd(true, `detached ${a.label} ✂ ${b.label}`);
+}
+
+function parseCommand(raw) {
+  const text = raw.toLowerCase();
+  // check detach verbs first: \battach\b won't match inside "detach", but order still
+  // guards phrasings like "remove the attachment"
+  const removing = /\b(detach|disconnect|unlink|remove|delete|cut)\b/.test(text);
+  const adding = /\b(attach|connect|link|wire|add)\b/.test(text);
+  if (!removing && !adding) return;
+  const m = findMentions(text);
+  if (m.length < 2) return setCmd(false, `heard “${raw.trim()}” — need two node names`);
+  removing ? removeEdge(m[0], m[1]) : addEdge(m[0], m[1]);
+}
+
+// --- speech ---
+function startSpeech() {
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR) { transcriptEl.textContent = "voice: Web Speech API unavailable — use Chrome"; return; }
+  const rec = new SR();
+  rec.continuous = true;
+  rec.interimResults = true;
+  rec.lang = "en-US";
+  rec.onstart = () => { micdot.classList.add("live"); transcriptEl.textContent = "voice: listening…"; };
+  rec.onresult = e => {
+    let interim = "";
+    for (let i = e.resultIndex; i < e.results.length; i++) {
+      const r = e.results[i];
+      if (r.isFinal) { transcriptEl.textContent = `“${r[0].transcript.trim()}”`; parseCommand(r[0].transcript); }
+      else interim = r[0].transcript;
+    }
+    if (interim) transcriptEl.textContent = interim;
+  };
+  rec.onerror = e => {
+    if (e.error === "not-allowed") {
+      micdot.classList.remove("live");
+      transcriptEl.textContent = "voice: mic blocked — allow it in the address bar and reload";
+    }
+  };
+  rec.onend = () => setTimeout(() => { try { rec.start(); } catch {} }, 250); // Chrome stops on silence
+  try { rec.start(); } catch {}
+}
+
+// --- hands ---
+const CONNECTIONS = [
+  [0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],
+  [11,12],[9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]
+];
+// Pinch ratio = thumb-tip↔index-tip / wrist↔middle-knuckle, so thresholds hold at any
+// distance from the camera. Grab/release differ (hysteresis) to stop boundary flicker.
+const GRAB_RATIO = 0.32, RELEASE_RATIO = 0.48;
+
+const handState = {};
+let landmarker = null, lastVideoTime = -1, frames = 0;
+
+const dist2d = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+const toScreen = lm => ({ x: (1 - lm.x) * W, y: lm.y * H }); // mirror x to match preview
+const nodeAt = p => [...nodes].reverse().find(n =>
+  Math.abs(p.x - n.x) < NODE_W / 2 && Math.abs(p.y - n.y) < NODE_H / 2);
+
+function updateHands(res) {
+  const seen = new Set();
+  res.landmarks.forEach((lm, i) => {
+    const name = res.handedness?.[i]?.[0]?.categoryName ?? String(i);
+    seen.add(name);
+    const st = handState[name] ??= { pinching: false, grab: null };
+    const thumb = toScreen(lm[4]), index = toScreen(lm[8]);
+    const raw = { x: (thumb.x + index.x) / 2, y: (thumb.y + index.y) / 2 };
+    st.cursor = st.cursor
+      ? { x: st.cursor.x + (raw.x - st.cursor.x) * 0.5, y: st.cursor.y + (raw.y - st.cursor.y) * 0.5 }
+      : raw;
+    const ratio = dist2d(lm[4], lm[8]) / dist2d(lm[0], lm[9]);
+
+    if (!st.pinching && ratio < GRAB_RATIO) {
+      st.pinching = true;
+      const n = nodeAt(st.cursor);
+      if (n) st.grab = { node: n, dx: st.cursor.x - n.x, dy: st.cursor.y - n.y };
+    } else if (st.pinching && ratio > RELEASE_RATIO) {
+      st.pinching = false;
+      st.grab = null;
+    }
+    if (st.grab) {
+      st.grab.node.tx = st.cursor.x - st.grab.dx;
+      st.grab.node.ty = st.cursor.y - st.grab.dy;
+    }
+    st.lm = lm;
+  });
+  for (const k of Object.keys(handState)) if (!seen.has(k)) delete handState[k];
+}
+
+// --- drawing ---
+function rectEdgePoint(from, n) {
+  const dx = n.x - from.x || 1e-6, dy = n.y - from.y || 1e-6;
+  const s = Math.min((NODE_W / 2 + 7) / Math.abs(dx), (NODE_H / 2 + 7) / Math.abs(dy));
+  return { x: n.x - dx * s, y: n.y - dy * s };
+}
+
+function drawEdge(e, now) {
+  const { a, b } = e;
+  const dx = b.x - a.x, dy = b.y - a.y;
+  const len = Math.hypot(dx, dy) || 1;
+  const c = {
+    x: (a.x + b.x) / 2 + (-dy / len) * Math.min(30, len * 0.12),
+    y: (a.y + b.y) / 2 + (dx / len) * Math.min(30, len * 0.12),
+  };
+  const p1 = rectEdgePoint(c, a), p2 = rectEdgePoint(c, b);
+  const grow = Math.min(1, (now - e.birth) / 350);
+  const pulse = Math.max(0, 1 - (now - e.pulse) / 900);
+
+  const path = () => {
+    ctx.beginPath();
+    ctx.moveTo(p1.x, p1.y);
+    ctx.quadraticCurveTo(c.x, c.y, p2.x, p2.y);
+  };
+
+  if (pulse > 0) {
+    ctx.save();
+    ctx.strokeStyle = e.a.color;
+    ctx.globalAlpha = pulse * 0.55;
+    ctx.lineWidth = 6;
+    ctx.shadowColor = e.a.color; ctx.shadowBlur = 18;
+    path(); ctx.stroke();
+    ctx.restore();
+  }
+
+  ctx.strokeStyle = "#3b4a5f";
+  ctx.lineWidth = 2;
+  if (grow < 1) ctx.setLineDash([len * 1.1 * grow, len * 1.1]);
+  path(); ctx.stroke();
+  ctx.setLineDash([]);
+
+  if (grow >= 1) {
+    ctx.strokeStyle = "rgba(56, 189, 248, 0.45)"; // flow direction a → b
+    ctx.lineWidth = 2;
+    ctx.setLineDash([3, 9]);
+    ctx.lineDashOffset = -((now / 28) % 12);
+    path(); ctx.stroke();
+    ctx.setLineDash([]);
+
+    const tx = p2.x - c.x, ty = p2.y - c.y;
+    const tl = Math.hypot(tx, ty) || 1;
+    const ux = tx / tl, uy = ty / tl;
+    ctx.fillStyle = "#64748b";
+    ctx.beginPath();
+    ctx.moveTo(p2.x, p2.y);
+    ctx.lineTo(p2.x - ux * 10 - uy * 4.5, p2.y - uy * 10 + ux * 4.5);
+    ctx.lineTo(p2.x - ux * 10 + uy * 4.5, p2.y - uy * 10 - ux * 4.5);
+    ctx.fill();
+  }
+}
+
+function drawNode(n, hands) {
+  const grabbed = hands.some(h => h.grab?.node === n);
+  const hovered = !grabbed && hands.some(h => !h.pinching && h.cursor && nodeAt(h.cursor) === n);
+  const x = n.x - NODE_W / 2, y = n.y - NODE_H / 2;
+  ctx.save();
+  ctx.shadowColor = grabbed ? "#f59e0b" : "rgba(0, 0, 0, 0.5)";
+  ctx.shadowBlur = grabbed ? 26 : 14;
+  ctx.shadowOffsetY = grabbed ? 0 : 4;
+  const g = ctx.createLinearGradient(0, y, 0, y + NODE_H);
+  g.addColorStop(0, "#1d2736");
+  g.addColorStop(1, "#151d29");
+  ctx.fillStyle = g;
+  ctx.strokeStyle = grabbed ? "#f59e0b" : hovered ? "#38bdf8" : "rgba(100, 116, 139, 0.55)";
+  ctx.lineWidth = grabbed || hovered ? 2.5 : 1.5;
+  ctx.beginPath();
+  ctx.roundRect(x, y, NODE_W, NODE_H, 12);
+  ctx.fill(); ctx.stroke();
+  ctx.restore();
+
+  ctx.fillStyle = n.color;
+  ctx.beginPath(); ctx.arc(x + 18, n.y, 4, 0, Math.PI * 2); ctx.fill();
+  ctx.textAlign = "left";
+  ctx.fillStyle = "#f1f5f9";
+  ctx.font = "600 14px ui-monospace, Menlo, monospace";
+  ctx.textBaseline = "alphabetic";
+  ctx.fillText(n.label, x + 32, n.y - 1);
+  ctx.fillStyle = "#5b6b80";
+  ctx.font = "10px ui-monospace, Menlo, monospace";
+  ctx.fillText(n.sub, x + 32, n.y + 13);
+}
+
+function drawHand(h) {
+  if (!h.lm) return;
+  ctx.strokeStyle = "rgba(56, 189, 248, 0.4)";
+  ctx.lineWidth = 2;
+  for (const [a, b] of CONNECTIONS) {
+    const p = toScreen(h.lm[a]), q = toScreen(h.lm[b]);
+    ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(q.x, q.y); ctx.stroke();
+  }
+  ctx.fillStyle = "rgba(56, 189, 248, 0.7)";
+  for (const lm of h.lm) {
+    const p = toScreen(lm);
+    ctx.beginPath(); ctx.arc(p.x, p.y, 2.5, 0, Math.PI * 2); ctx.fill();
+  }
+  if (h.cursor) {
+    ctx.beginPath();
+    ctx.arc(h.cursor.x, h.cursor.y, 13, 0, Math.PI * 2);
+    if (h.pinching) { ctx.fillStyle = "rgba(245, 158, 11, 0.85)"; ctx.fill(); }
+    ctx.strokeStyle = h.pinching ? "#f59e0b" : "#e2e8f0";
+    ctx.lineWidth = 2.5;
+    ctx.stroke();
+  }
+}
+
+function draw(now) {
+  ctx.clearRect(0, 0, W, H);
+  if (dotPattern) { ctx.fillStyle = dotPattern; ctx.fillRect(0, 0, W, H); }
+  const hands = Object.values(handState);
+  for (const n of nodes) {
+    const k = hands.some(h => h.grab?.node === n) ? 0.5 : 0.18;
+    n.x += (n.tx - n.x) * k;
+    n.y += (n.ty - n.y) * k;
+  }
+  for (const e of edges) drawEdge(e, now);
+  for (const n of nodes) drawNode(n, hands);
+  for (const h of hands) drawHand(h);
+}
+
+function loop() {
+  requestAnimationFrame(loop);
+  if (landmarker && video.readyState >= 2 && video.currentTime !== lastVideoTime) {
+    lastVideoTime = video.currentTime;
+    updateHands(landmarker.detectForVideo(video, performance.now()));
+    frames++;
+  }
+  draw(performance.now());
+}
+
+function fail(msg) {
+  statusEl.textContent = msg;
+  statusEl.classList.add("error");
+}
+
+// --- boot ---
+try {
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: { width: 1280, height: 720, facingMode: "user" }
+  });
+  video.srcObject = stream;
+  await video.play();
+} catch (e) {
+  fail(`Camera blocked (${e.name}). Allow camera access and reload — must be on localhost, not file://`);
+  throw e;
+}
+
+statusEl.textContent = "Camera on. Loading hand-tracking model (~10 MB, first load only)…";
+try {
+  const files = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+  );
+  landmarker = await HandLandmarker.createFromOptions(files, {
+    baseOptions: {
+      modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+      delegate: "GPU"
+    },
+    runningMode: "VIDEO",
+    numHands: 2
+  });
+} catch (e) {
+  fail(`Model failed to load (${e.message}). Check internet connection and reload.`);
+  throw e;
+}
+
+statusEl.textContent = "Tracking. Show a hand · pinch to grab · speak to rewire.";
+setInterval(() => { fpsEl.textContent = frames + " fps"; frames = 0; }, 1000);
+startSpeech();
+loop();
+</script>
+</body>
+</html>

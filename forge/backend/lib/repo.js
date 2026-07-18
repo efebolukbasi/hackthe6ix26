@@ -1,0 +1,92 @@
+// Repo intelligence: builds a compact digest of a codebase that fits in the
+// agent's system prompt. Tree + prioritized file contents + git history.
+import { readdirSync, readFileSync, statSync } from "node:fs";
+import { execFile } from "node:child_process";
+import { basename, extname, join, relative } from "node:path";
+import { promisify } from "node:util";
+
+const execFileP = promisify(execFile);
+
+const SKIP_DIRS = new Set(["node_modules", ".git", "dist", "build", ".next", ".tts-cache", "coverage", ".vercel"]);
+const TEXT_EXT = new Set([".js", ".mjs", ".ts", ".tsx", ".jsx", ".py", ".html", ".css", ".md", ".json", ".yml", ".yaml", ".toml", ".sh", ".txt"]);
+
+const TOTAL_BUDGET = 90_000;   // chars of file content in the digest
+const PER_FILE_CAP = 9_000;
+
+function walk(root) {
+  const files = [];
+  const visit = (dir) => {
+    let entries;
+    try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      if (e.name.startsWith(".") && e.name !== ".env.example") continue;
+      const full = join(dir, e.name);
+      if (e.isDirectory()) {
+        if (!SKIP_DIRS.has(e.name)) visit(full);
+      } else {
+        let size = 0;
+        try { size = statSync(full).size; } catch { continue; }
+        files.push({ path: relative(root, full), full, size });
+      }
+    }
+  };
+  visit(root);
+  return files;
+}
+
+// Lower score = higher priority for inclusion.
+function priority(p) {
+  const name = basename(p).toLowerCase();
+  if (name.startsWith("readme")) return 0;
+  if (name === "package.json") return 1;
+  if (p.includes("server") || name.includes("agent") || name.includes("brain")) return 2;
+  if (extname(p) === ".md") return 3;
+  if ([".js", ".mjs", ".ts", ".tsx", ".jsx", ".py"].includes(extname(p))) return 4;
+  if ([".html", ".css"].includes(extname(p))) return 6;
+  return 8;
+}
+
+async function git(repoPath, args) {
+  try {
+    const { stdout } = await execFileP("git", ["-C", repoPath, ...args], { timeout: 8000 });
+    return stdout.trim();
+  } catch {
+    return "";
+  }
+}
+
+export async function buildDigest(repoPath) {
+  const files = walk(repoPath);
+  const tree = files.map((f) => `${f.path} (${f.size}b)`).join("\n");
+
+  const candidates = files
+    .filter((f) => TEXT_EXT.has(extname(f.path)) || basename(f.path).toLowerCase().startsWith("readme"))
+    .sort((a, b) => priority(a.path) - priority(b.path) || a.size - b.size);
+
+  let used = 0;
+  const chunks = [];
+  for (const f of candidates) {
+    if (used >= TOTAL_BUDGET) break;
+    let content;
+    try { content = readFileSync(f.full, "utf8"); } catch { continue; }
+    if (content.length > PER_FILE_CAP) content = content.slice(0, PER_FILE_CAP) + "\n…(truncated)";
+    if (used + content.length > TOTAL_BUDGET) continue;
+    used += content.length;
+    chunks.push(`----- FILE: ${f.path} -----\n${content}`);
+  }
+
+  const log = await git(repoPath, ["log", "--oneline", "--no-decorate", "-n", "15"]);
+  const branch = await git(repoPath, ["rev-parse", "--abbrev-ref", "HEAD"]);
+
+  const digest = [
+    `Repository root: ${basename(repoPath)}${branch ? ` (branch ${branch})` : ""}`,
+    `\n== FILE TREE ==\n${tree}`,
+    log ? `\n== RECENT COMMITS ==\n${log}` : "",
+    `\n== FILE CONTENTS (prioritized, may be truncated) ==\n${chunks.join("\n\n")}`,
+  ].join("\n");
+
+  return {
+    digest,
+    meta: { name: basename(repoPath), fileCount: files.length, includedFiles: chunks.length, chars: digest.length },
+  };
+}

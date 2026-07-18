@@ -1,0 +1,17 @@
+{
+  "name": "forge-backend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Forge backend — LLM brain, ElevenLabs TTS proxy, repo intelligence",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2"
+  }
+}
