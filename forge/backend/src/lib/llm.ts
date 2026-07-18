@@ -20,6 +20,8 @@ interface StreamTextOptions {
   model?: string;
   maxTokens?: number;
   onDelta?: (chunk: string) => void;
+  /** CLI mode only: called when a tool_use block starts (name, serialised input). */
+  onTool?: (name: string, input: string) => void;
   signal?: AbortSignal;
   /** CLI mode only: allow read-only repo tools (Read/Grep/Glob) run from `cwd`. */
   tools?: boolean;
@@ -33,6 +35,7 @@ export async function streamText({
   model = "sonnet",
   maxTokens = 4000,
   onDelta = () => {},
+  onTool,
   signal,
   tools = false,
   cwd,
@@ -42,11 +45,11 @@ export async function streamText({
     return apiStream({ system, prompt, model, maxTokens, onDelta, signal });
   }
   try {
-    return await cliStream({ system, prompt, model, onDelta, signal, streamJson: true, tools, cwd });
+    return await cliStream({ system, prompt, model, onDelta, onTool, signal, streamJson: true, tools, cwd });
   } catch (err) {
     if (signal?.aborted) throw err;
     // Older CLI without --include-partial-messages, or stream parse trouble.
-    return cliStream({ system, prompt, model, onDelta, signal, streamJson: false, tools, cwd });
+    return cliStream({ system, prompt, model, onDelta, onTool, signal, streamJson: false, tools, cwd });
   }
 }
 
@@ -111,13 +114,14 @@ interface CliStreamOptions {
   prompt: string;
   model: string;
   onDelta: (chunk: string) => void;
+  onTool?: (name: string, input: string) => void;
   signal?: AbortSignal;
   streamJson: boolean;
   tools?: boolean;
   cwd?: string;
 }
 
-function cliStream({ system, prompt, model, onDelta, signal, streamJson, tools, cwd }: CliStreamOptions): Promise<string> {
+function cliStream({ system, prompt, model, onDelta, onTool, signal, streamJson, tools, cwd }: CliStreamOptions): Promise<string> {
   return new Promise((resolve, reject) => {
     const args = ["-p", "--model", model];
     // With tools on, Claude can grep/read the target repo live before answering.
@@ -164,6 +168,15 @@ function cliStream({ system, prompt, model, onDelta, signal, streamJson, tools, 
               sawDelta = true;
               full += ev.delta.text;
               onDelta(ev.delta.text);
+            } else if (
+              onTool &&
+              ev?.type === "content_block_start" &&
+              ev.content_block?.type === "tool_use"
+            ) {
+              onTool(
+                String(ev.content_block.name || ""),
+                JSON.stringify(ev.content_block.input || {})
+              );
             }
           } else if (msg.type === "result" && typeof msg.result === "string" && !sawDelta) {
             full = msg.result;
