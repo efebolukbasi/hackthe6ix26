@@ -27,11 +27,12 @@ forge/
 ## Run it
 
 ```bash
-# from the repo root
-npm --prefix forge/backend install
-npm --prefix forge/frontend install
-npm start        # builds the frontend, starts the backend → http://localhost:5180
+cd forge/backend && npm install && cd ../frontend && npm install && cd ../..
+npm start        # from repo root: builds the frontend, starts the backend → http://localhost:5180
 ```
+
+(Or equivalently from the repo root: `npm --prefix forge/backend install` etc. —
+the `--prefix` paths are relative to wherever you run them.)
 
 Development (hot reload): `npm run dev:backend` + `npm run dev:frontend`
 (Vite on :5173 proxies /api → :5180). Optional voice: `cp forge/backend/.env.example forge/backend/.env` and paste `ELEVENLABS_API_KEY`.
