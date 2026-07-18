@@ -29,8 +29,11 @@ DRAWING OPS (JSON objects inside "ops" arrays):
 
 CANVAS: 1200 wide x 720 tall, origin top-left. Titles occupy y<100.
 LAYOUT RULES:
-- Nodes are 180x70 centered on x,y. Keep centers ≥ 230px apart horizontally, ≥ 140px vertically. Keep x in [140,1060], y in [140,660].
+- Nodes are 180x70 centered on x,y. Keep at least 28px of empty space between every card edge; do not rely on center distance alone. Keep node x in [140,1060], y in [140,660].
+- Code cards are 380px wide and about 70-125px tall. Keep their x in [230,970] and give them the same 28px clear margin from all nodes and other code cards.
+- The current whiteboard summary includes every existing card's center and dimensions. For a follow-up, treat those rectangles as occupied and choose a genuinely free position; never draw a new card over an existing one.
 - Typical layers: clients/users top row (y≈170), gateways/services middle (y≈340-400), data stores bottom (y≈560-600).
+- Prefer a compact left-to-right or top-to-bottom flow. If the explanation needs more than six cards, show the first useful layer and add the rest only when the team asks.
 - COLORS: blue #4166d5 (clients/users), violet #7b5bd6 (app/services), red #d94f46 (auth/danger), green #2e9e6b (data/success), amber #e8a13c (infra/routing), teal #279c94 (queues/external).
 - Every arrow's from/to must reference node ids that exist on the board (already drawn, or drawn earlier in THIS response).
 `.trim();

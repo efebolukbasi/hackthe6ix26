@@ -11,6 +11,7 @@ import type {
   BoardArrowSummary,
   BoardNodeSummary,
   BoardSummary,
+  CodeOp,
   DrawableOp,
   NodeOp,
   WhiteboardOp,
@@ -19,6 +20,8 @@ import type {
 const VW = 1200, VH = 720;
 const INK = "#28323f";
 const NODE_W = 180, NODE_H = 70;
+const CODE_W = 380;
+const CARD_GAP = 28;
 const PEN_SPEED = 1050;  // virtual px per second
 const CHAR_SPEED = 26;   // characters per second for type-on text
 const POP_DUR = 0.55;    // settle pulse after an item completes
@@ -266,7 +269,15 @@ export class Whiteboard {
     const title = (titleItem && titleItem.op.op === "title" ? titleItem.op.text : null) || null;
     const nodes = Object.values(this.nodes).map((n) => {
       const op = n.op as NodeOp & { file?: string };
-      const o: BoardNodeSummary = { id: n.id as string, label: op.label ?? (op.file ? `code card: ${op.file}` : "") };
+      const meta = n.meta!;
+      const o: BoardNodeSummary = {
+        id: n.id as string,
+        label: op.label ?? (op.file ? `code card: ${op.file}` : ""),
+        x: meta.x + (n.offset?.dx ?? 0),
+        y: meta.y + (n.offset?.dy ?? 0),
+        w: meta.w,
+        h: meta.h,
+      };
       if (op.sub) o.sub = op.sub;
       if (n.meta?.dead) o.dead = true;
       return o;
@@ -286,6 +297,73 @@ export class Whiteboard {
 
   enqueue(ops: WhiteboardOp[]): void {
     for (const op of ops) this.queue.push(op);
+  }
+
+  /** True when a card would touch an already-rendered node or code card.
+   * The breathing room keeps borders, labels, and hand-drawn jitter apart. */
+  private collidesWithCard(x: number, y: number, w: number, h: number): boolean {
+    return Object.values(this.nodes).some((item) => {
+      const meta = item.meta;
+      if (!meta) return false;
+      const otherX = meta.x + (item.offset?.dx ?? 0);
+      const otherY = meta.y + (item.offset?.dy ?? 0);
+      return Math.abs(x - otherX) < (w + meta.w) / 2 + CARD_GAP
+        && Math.abs(y - otherY) < (h + meta.h) / 2 + CARD_GAP;
+    });
+  }
+
+  /** Find the closest open spot for a node or code card. The model normally
+   * gets placement right; this is a deterministic safety net for collisions.
+   * Because the same raw ops are replayed for both peers, they resolve to the
+   * same positions without needing a separate sync message. */
+  private resolveCardPlacement<T extends NodeOp | CodeOp>(op: T): T {
+    const w = op.op === "node" ? op.w || NODE_W : CODE_W;
+    const h = op.op === "node"
+      ? op.h || NODE_H
+      : 44 + (op.text || "").split("\n").slice(0, 4).length * 20;
+    if (!this.collidesWithCard(op.x, op.y, w, h)) return op;
+
+    // Scale the search to the incoming card. Horizontal candidates come first
+    // so a layered diagram tends to stay in its original row.
+    const stepX = Math.max(230, w + CARD_GAP);
+    const stepY = Math.max(140, h + CARD_GAP);
+    for (let ring = 1; ring <= 8; ring++) {
+      const candidates: Array<{ col: number; row: number }> = [];
+      for (let col = -ring; col <= ring; col++) {
+        for (let row = -ring; row <= ring; row++) {
+          if (Math.max(Math.abs(col), Math.abs(row)) !== ring) continue;
+          candidates.push({ col, row });
+        }
+      }
+      candidates.sort((a, b) => {
+        const score = ({ col, row }: { col: number; row: number }) =>
+          Math.abs(col) * stepX + Math.abs(row) * stepY * 3;
+        const aScore = score(a), bScore = score(b);
+        if (aScore !== bScore) return aScore - bScore;
+        // Prefer moving back toward the home canvas centre when tied.
+        const home = ({ col, row }: { col: number; row: number }) =>
+          Math.abs(op.x + col * stepX - VW / 2) + Math.abs(op.y + row * stepY - VH / 2);
+        return home(a) - home(b);
+      });
+      for (const candidate of candidates) {
+        const x = op.x + candidate.col * stepX;
+        const y = op.y + candidate.row * stepY;
+        if (!this.collidesWithCard(x, y, w, h)) return { ...op, x, y } as T;
+      }
+    }
+
+    // A crowded home region can grow downward; the camera/minimap already
+    // auto-frame the infinite canvas, so clarity wins over forced overlap.
+    const bottom = Object.values(this.nodes).reduce(
+      (max, item) => Math.max(max, (item.meta?.y ?? 0) + (item.offset?.dy ?? 0) + (item.meta?.h ?? 0) / 2),
+      VH
+    );
+    return { ...op, x: op.x, y: bottom + h / 2 + CARD_GAP } as T;
+  }
+
+  private resolvePlacement(op: DrawableOp): DrawableOp {
+    if (op.op === "node" || op.op === "code") return this.resolveCardPlacement(op);
+    return op;
   }
 
   clear(): void {
@@ -486,7 +564,7 @@ export class Whiteboard {
           for (const id of op.ids) if (this.byId[id]) this.byId[id].faded = true;
           continue;
         }
-        this.current = { item: this.plan(op), si: 0, prog: 0 };
+        this.current = { item: this.plan(this.resolvePlacement(op)), si: 0, prog: 0 };
       }
       const cur = this.current;
       if (cur.si >= cur.item.strokes.length) {

@@ -99,6 +99,11 @@ export type DrawableOp = Exclude<WhiteboardOp, ClearOp | FadeOp>;
 export interface BoardNodeSummary {
   id: string;
   label: string;
+  /** rendered center and dimensions, including any manual move */
+  x: number;
+  y: number;
+  w: number;
+  h: number;
   sub?: string;
   dead?: boolean;
 }
