@@ -96,6 +96,30 @@ Frontend is pure static files — host anywhere (Vercel/Netlify/S3) and set
 `window.FORGE_API = "https://your-backend"` in `config.js`. Backend is a single
 Node process (needs outbound HTTPS + optionally a `claude` login); CORS is open.
 
+## Free Render deployment
+
+This repo includes a single-service [`render.yaml`](../render.yaml). It builds the
+React frontend, serves it from Express, and keeps WebSocket signaling on the same
+origin. In Render, create a **Blueprint** from this GitHub repository and choose
+the included configuration. Set `ANTHROPIC_API_KEY` as a secret before deploying.
+
+Render generates `FORGE_ACCESS_TOKEN` automatically. Copy its value from the
+service environment page and invite people with:
+
+```text
+https://your-service.onrender.com/#token=YOUR_FORGE_ACCESS_TOKEN
+```
+
+The fragment is not sent to the server; the frontend adds it to protected API and
+WebSocket requests. Do not share the bare deployment URL. Leave GitHub token and
+device-flow variables unset unless you explicitly need the in-app repo picker.
+
+The hosting tier is free, but Anthropic API usage is billed by Anthropic. Without
+an API key, Forge cannot use the local Claude CLI fallback on Render. ElevenLabs
+is optional because browser TTS is used when its key is absent. Render free
+instances sleep after idle periods, so the first visit after a pause can take
+about a minute.
+
 ## Demo tips
 
 - Chips in the chat panel are pre-baked killer questions, including

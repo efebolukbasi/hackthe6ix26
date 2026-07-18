@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: forge-meeting
+    runtime: node
+    plan: free
+    buildCommand: npm --prefix forge/frontend ci && npm --prefix forge/backend ci && npm --prefix forge/frontend run build
+    startCommand: npm --prefix forge/backend start
+    healthCheckPath: /
+    envVars:
+      - key: NODE_VERSION
+        value: 22.16.0
+      - key: NODE_ENV
+        value: production
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: FORGE_ACCESS_TOKEN
+        generateValue: true
+      - key: ELEVENLABS_API_KEY
+        sync: false

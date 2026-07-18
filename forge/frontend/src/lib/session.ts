@@ -6,7 +6,7 @@
 
 import { Whiteboard } from "./whiteboard";
 import { RoomLink, type CastEvent } from "./rtc";
-import { API } from "../config";
+import { API, apiFetch } from "../config";
 import { useStore } from "../state/store";
 import type {
   AgentStep,
@@ -177,7 +177,7 @@ export class ForgeSession {
         };
         sb.addEventListener("updateend", () => { appending = false; drain(); });
         try {
-          const res = await fetch(`${API}/api/tts/stream`, {
+          const res = await apiFetch(`${API}/api/tts/stream`, {
             method: "POST", headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ text }), signal: abortCtrl.signal,
           });
@@ -305,7 +305,7 @@ export class ForgeSession {
     this.lastListenAt = Date.now();
     const batch = this.buffer.slice(-10);
     try {
-      const res = await fetch(`${API}/api/listen`, {
+      const res = await apiFetch(`${API}/api/listen`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ transcript: batch }),
@@ -346,7 +346,7 @@ export class ForgeSession {
       this.transcript("Forge", ackMsg);
       void this.speak(ackMsg);
 
-      const res = await fetch(`${API}/api/agent`, {
+      const res = await apiFetch(`${API}/api/agent`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         signal: this.agentAbort.signal,
@@ -445,7 +445,7 @@ export class ForgeSession {
     this.caption("Forge", ack, true); this.transcript("Forge", ack);
     void this.speak(ack); // fire-and-forget
     try {
-      const res = await fetch(`${API}/api/agent/code`, {
+      const res = await apiFetch(`${API}/api/agent/code`, {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ task }),
       });
@@ -755,7 +755,7 @@ export class ForgeSession {
 
   private async fetchHealth(): Promise<void> {
     try {
-      const res = await fetch(`${API}/api/health`);
+      const res = await apiFetch(`${API}/api/health`);
       this.health = (await res.json()) as Health;
       useStore.setState({
         health: this.health,
@@ -874,7 +874,7 @@ export class ForgeSession {
     const params = new URLSearchParams({ path: attr.file });
     if (attr.startLine != null) params.set("start", String(attr.startLine));
     if (attr.endLine != null) params.set("end", String(attr.endLine));
-    fetch(`${API}/api/repo/file?${params}`)
+    apiFetch(`${API}/api/repo/file?${params}`)
       .then((r) => r.json())
       .then((data: { path: string; startLine: number; lines: string[]; githubUrl?: string }) => {
         useStore.setState({
@@ -897,7 +897,7 @@ export class ForgeSession {
   async runWalkthrough(nodeLabel: string, attr: { file: string; startLine?: number; endLine?: number }): Promise<void> {
     const board = this.wb ? this.wb.summary() : { title: null, nodes: [], arrows: [] };
     try {
-      const res = await fetch(`${API}/api/agent/walkthrough`, {
+      const res = await apiFetch(`${API}/api/agent/walkthrough`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

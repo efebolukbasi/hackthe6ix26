@@ -2,7 +2,7 @@
 // audio/video then flows browser↔browser, peer-to-peer via STUN — and
 // (b) "cast" events that keep Forge state (utterances, steps, hand) in sync
 // across both participants.
-import { API } from "../config";
+import { ACCESS_TOKEN, API } from "../config";
 import { useStore } from "../state/store";
 import type { WhiteboardOp } from "../types";
 
@@ -72,7 +72,8 @@ export class RoomLink {
   connect(name: string, stream: MediaStream | null): void {
     this.localStream = stream;
     const base = API || window.location.origin;
-    const ws = new WebSocket(`${base.replace(/^http/, "ws")}/ws`);
+    const token = ACCESS_TOKEN ? `?token=${encodeURIComponent(ACCESS_TOKEN)}` : "";
+    const ws = new WebSocket(`${base.replace(/^http/, "ws")}/ws${token}`);
     this.ws = ws;
     ws.onopen = () => ws.send(JSON.stringify({ t: "join", name }));
     ws.onmessage = (e) => void this.handle(JSON.parse(String(e.data)) as ServerMsg);

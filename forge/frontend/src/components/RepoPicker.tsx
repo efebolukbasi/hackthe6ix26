@@ -1,7 +1,7 @@
 // GitHub login + repo picker. Zero-click when the backend already has a token
 // (env or the host's `gh` login); otherwise GitHub's device flow (short code).
 import { useEffect, useState } from "react";
-import { API } from "../config";
+import { API, apiFetch } from "../config";
 import { useStore } from "../state/store";
 
 interface Repo {
@@ -33,9 +33,9 @@ export default function RepoPicker() {
 
   const refresh = async () => {
     try {
-      const s = (await (await fetch(`${API}/api/github/status`)).json()) as GhStatus;
+      const s = (await (await apiFetch(`${API}/api/github/status`)).json()) as GhStatus;
       setGh(s);
-      if (s.connected) setRepos((await (await fetch(`${API}/api/github/repos`)).json()) as Repo[]);
+      if (s.connected) setRepos((await (await apiFetch(`${API}/api/github/repos`)).json()) as Repo[]);
     } catch {
       setGh({ connected: false, deviceFlowAvailable: false });
     }
@@ -46,14 +46,14 @@ export default function RepoPicker() {
 
   const connect = async () => {
     setNote("");
-    const d = (await (await fetch(`${API}/api/github/device/start`, { method: "POST" })).json()) as DeviceInfo & { error?: string };
+    const d = (await (await apiFetch(`${API}/api/github/device/start`, { method: "POST" })).json()) as DeviceInfo & { error?: string };
     if (d.error) { setNote(d.error); return; }
     setDevice(d);
     window.open(d.verification_uri, "_blank");
     const poll = async () => {
       try {
         const r = (await (
-          await fetch(`${API}/api/github/device/poll`, {
+          await apiFetch(`${API}/api/github/device/poll`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ device_code: d.device_code }),
@@ -74,7 +74,7 @@ export default function RepoPicker() {
     setNote(`Reading ${fullName}…`);
     try {
       const r = (await (
-        await fetch(`${API}/api/repo/load`, {
+        await apiFetch(`${API}/api/repo/load`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ url: `https://github.com/${fullName}` }),

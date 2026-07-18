@@ -3,6 +3,7 @@
 // events (utterances, whiteboard steps, hand state) so both sides share one
 // meeting. One global room, capped at two humans (hackathon scope).
 import { WebSocketServer, WebSocket } from "ws";
+import { timingSafeEqual } from "node:crypto";
 import type { Server } from "node:http";
 
 interface Member {
@@ -18,6 +19,13 @@ type ClientMsg = JoinMsg | SignalMsg | CastMsg;
 
 const MAX_HUMANS = 2;
 
+function tokenMatches(actual: string | null, expected: string): boolean {
+  if (!actual) return false;
+  const a = Buffer.from(actual);
+  const b = Buffer.from(expected);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
 export function attachRoom(server: Server): void {
   const wss = new WebSocketServer({ noServer: true });
   const members = new Map<number, Member>();
@@ -25,6 +33,14 @@ export function attachRoom(server: Server): void {
 
   server.on("upgrade", (req, socket, head) => {
     if (!req.url?.startsWith("/ws")) return socket.destroy();
+    const expectedToken = process.env.FORGE_ACCESS_TOKEN;
+    if (expectedToken) {
+      const token = new URL(req.url, "http://localhost").searchParams.get("token");
+      if (!tokenMatches(token, expectedToken)) {
+        socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
+        return socket.destroy();
+      }
+    }
     wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
   });
 

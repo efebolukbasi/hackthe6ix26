@@ -3,6 +3,7 @@ import "dotenv/config";
 import express from "express";
 import type { Request, Response } from "express";
 import cors from "cors";
+import { timingSafeEqual } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -45,6 +46,21 @@ const REPO_SOURCE = process.env.REPO_PATH || process.env.GITHUB_REPO || join(__d
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
+
+function tokenMatches(actual: string | undefined, expected: string): boolean {
+  if (!actual) return false;
+  const a = Buffer.from(actual);
+  const b = Buffer.from(expected);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+// The static app remains public so invitees can load it, but every API and
+// WebSocket request requires the fragment-derived invite token when configured.
+app.use("/api", (req, res, next) => {
+  const expectedToken = process.env.FORGE_ACCESS_TOKEN;
+  if (!expectedToken || tokenMatches(req.header("X-Forge-Access-Token"), expectedToken)) return next();
+  res.status(401).json({ error: "invalid Forge invite" });
+});
 
 let repoMeta: RepoMeta = { name: "(indexing…)", fileCount: 0 };
 
