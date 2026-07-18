@@ -211,3 +211,32 @@ button { font-family: inherit; cursor: pointer; border: none; }
 }
 .name-input:focus { border-color: var(--teal); }
 .name-input::placeholder { color: #5a6270; }
+
+/* ————— repo picker ————— */
+.repopicker { padding: 0 16px 8px; position: relative; }
+.repo-current {
+  width: 100%; text-align: left; background: #e9edf3; color: #23406e;
+  font-size: 12.5px; padding: 8px 12px; border-radius: 10px;
+}
+.repo-current:hover { background: #d8e2f0; }
+.repo-gh { color: #77808d; }
+.repo-drop {
+  position: absolute; z-index: 5; left: 16px; right: 16px; top: 100%;
+  background: #fff; border: 1px solid #d5dae1; border-radius: 12px;
+  box-shadow: 0 12px 32px rgba(0,0,0,0.14); padding: 10px;
+}
+.repo-drop input {
+  width: 100%; border: 1px solid #d5dae1; border-radius: 8px;
+  padding: 7px 10px; font-size: 12.5px; font-family: inherit; outline: none; margin-bottom: 6px;
+}
+.repo-drop input:focus { border-color: var(--teal); }
+.repo-list { max-height: 220px; overflow-y: auto; display: flex; flex-direction: column; gap: 2px; }
+.repo-list button {
+  text-align: left; background: none; padding: 7px 8px; border-radius: 8px;
+  font-size: 12.5px; color: #1b2028;
+}
+.repo-list button:hover { background: #eef2f7; }
+.repo-connect {
+  width: 100%; background: #1b2028; color: #fff; padding: 9px; border-radius: 8px; font-size: 13px;
+}
+.repo-hint { font-size: 12px; color: #5d6570; padding: 6px 4px; line-height: 1.45; }

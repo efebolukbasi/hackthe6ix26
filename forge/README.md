@@ -48,9 +48,12 @@ Open http://localhost:5180 in **Chrome**, allow mic/cam, Join.
   into the prompt — and in CLI mode Forge also gets **live read-only tools**
   (Grep/Read/Glob) inside that repo, so "where do we handle X?" is verified
   against the actual code and answered with a `file:line` **code card** drawn
-  on the board. Point it at any repo: set `REPO_PATH` (local) or `GITHUB_REPO`
-  (URL, shallow-cloned) in `.env`, or switch live:
-  `curl -X POST localhost:5180/api/repo/load -H 'Content-Type: application/json' -d '{"url":"https://github.com/owner/repo"}'`
+  on the board. **Switching repos is a login, not config**: the 📁 picker at the
+  top of the side panel lists your GitHub repos — click one and Forge re-reads it
+  live (private repos included). Login is zero-click when the host has `gh`
+  logged in (or `GITHUB_TOKEN` set); otherwise set `GITHUB_CLIENT_ID` and the
+  picker offers device-flow login (enter a short code on github.com).
+  `REPO_PATH`/`GITHUB_REPO` env still work for a fixed default.
 
 ## Using it in a meeting
 

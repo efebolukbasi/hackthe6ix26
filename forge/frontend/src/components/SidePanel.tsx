@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { CHIPS, session } from "../lib/session";
 import { useStore } from "../state/store";
+import RepoPicker from "./RepoPicker";
 
 export default function SidePanel() {
   const panelOpen = useStore((s) => s.panelOpen);
@@ -27,6 +28,7 @@ export default function SidePanel() {
         <span>Ask Forge</span>
         <button id="panel-close" onClick={() => session.closePanel()}>✕</button>
       </div>
+      <RepoPicker />
       <div className="chips" id="chips">
         {CHIPS.map((q) => (
           <button key={q} onClick={() => session.ask(q)}>{q}</button>

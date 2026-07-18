@@ -13,6 +13,7 @@ import { respond, listen, setRepoContext } from "./lib/agent.ts";
 import { synthesize, ttsEnabled } from "./lib/tts.ts";
 import { llmMode } from "./lib/llm.ts";
 import { attachRoom } from "./lib/room.ts";
+import * as github from "./lib/github.ts";
 import type { AgentRequestBody, RepoMeta } from "./lib/types.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -26,10 +27,14 @@ async function ensureRepo(source: string): Promise<string> {
   const m = source.match(/^https:\/\/github\.com\/[\w.-]+\/([\w.-]+?)(\.git)?\/?$/);
   if (!m) return resolve(source);
   const dir = join(REPO_CACHE, m[1]);
+  const token = await github.githubToken();
   if (existsSync(join(dir, ".git"))) {
     await execFileP("git", ["-C", dir, "pull", "--ff-only"], { timeout: 30_000 }).catch(() => {});
   } else {
-    await execFileP("git", ["clone", "--depth", "1", source, dir], { timeout: 120_000 });
+    // Token in the URL enables private repos; the remote is reset afterwards
+    // so the token never persists on disk.
+    await execFileP("git", ["clone", "--depth", "1", github.tokenizedCloneUrl(source, token), dir], { timeout: 120_000 });
+    await execFileP("git", ["-C", dir, "remote", "set-url", "origin", source], { timeout: 5000 }).catch(() => {});
   }
   return dir;
 }
@@ -50,6 +55,34 @@ app.get("/api/health", (_req: Request, res: Response) => {
 app.post("/api/agent", (req: Request, res: Response) => respond(req.body as AgentRequestBody, res));
 
 app.post("/api/listen", async (req: Request, res: Response) => res.json(await listen(req.body as AgentRequestBody)));
+
+// GitHub login: zero-click via env token or the host's `gh` CLI, else device flow.
+app.get("/api/github/status", async (_req: Request, res: Response) => res.json(await github.status()));
+
+app.get("/api/github/repos", async (_req: Request, res: Response) => {
+  try {
+    res.json(await github.listRepos());
+  } catch (err) {
+    const e = err as { status?: number; message?: string };
+    res.status(e.status || 502).json({ error: e.message || String(err) });
+  }
+});
+
+app.post("/api/github/device/start", async (_req: Request, res: Response) => {
+  try {
+    const d = await github.deviceStart();
+    res.json({ user_code: d.user_code, verification_uri: d.verification_uri, device_code: d.device_code, interval: d.interval });
+  } catch (err) {
+    const e = err as { status?: number; message?: string };
+    res.status(e.status || 502).json({ error: e.message || String(err) });
+  }
+});
+
+app.post("/api/github/device/poll", async (req: Request, res: Response) => {
+  const device_code = String((req.body as { device_code?: string } | undefined)?.device_code || "");
+  if (!device_code) return res.status(400).json({ error: "no device_code" });
+  res.json(await github.devicePoll(device_code));
+});
 
 // Point Forge at a different repo mid-meeting: local path or GitHub URL.
 app.post("/api/repo/load", async (req: Request, res: Response) => {
