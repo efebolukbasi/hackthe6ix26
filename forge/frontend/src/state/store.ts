@@ -34,6 +34,11 @@ export interface ForgeState {
   panelOpen: boolean;
   streamReady: boolean;
   prejoinHint: string;
+  /** display name entered on the pre-join screen */
+  myName: string;
+  /** connected human peer (P2P call), if any */
+  remoteName: string | null;
+  remoteStream: MediaStream | null;
 }
 
 export const useStore = create<ForgeState>()(() => ({
@@ -55,4 +60,7 @@ export const useStore = create<ForgeState>()(() => ({
   panelOpen: false,
   streamReady: false,
   prejoinHint: "use Chrome · allow camera & microphone",
+  myName: "",
+  remoteName: null,
+  remoteStream: null,
 }));

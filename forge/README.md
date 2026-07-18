@@ -57,6 +57,23 @@ Open http://localhost:5180 in **Chrome**, allow mic/cam, Join.
   Say "go ahead" or click the hand to let it speak.
 - "stop presenting" / "thanks Forge" interrupts it; "clear the board" wipes it.
 
+## Two-person calls (P2P)
+
+Forge calls now hold **two humans + Forge**. Audio/video flows browser-to-browser
+(WebRTC, STUN only — true P2P); the backend's `/ws` endpoint handles signaling and
+keeps Forge state (transcript, whiteboard steps, raise-hand) in sync on both sides.
+
+To invite someone outside your network:
+
+```bash
+npm run tunnel     # public https URL → send it to your friend
+```
+
+They open the URL in Chrome, enter a name, Join — done. (HTTPS is required for
+their mic/cam, which the tunnel provides.) Wear headphones on both ends, or the
+mics will transcribe each other's speakers. Only one hand-raise "driver" runs at
+a time (the first joiner), so Forge won't interject twice.
+
 ## Split deployment
 
 Frontend is pure static files — host anywhere (Vercel/Netlify/S3) and set

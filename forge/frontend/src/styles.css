@@ -199,3 +199,15 @@ button { font-family: inherit; cursor: pointer; border: none; }
 #backend-pill { margin-right: 8px; font-size: 11px; color: #4a5462; }
 #backend-pill.ok { color: var(--teal); }
 #backend-pill.err { color: var(--red); }
+
+/* ————— P2P peer tile & name input ————— */
+#tiles.trio .tile { width: min(31%, 470px); }
+#room.presenting #tiles.trio .tile { width: 100%; }
+#peercam { width: 100%; height: 100%; object-fit: cover; }
+.name-input {
+  margin-bottom: 16px; width: 250px; text-align: center;
+  background: #12151b; border: 1px solid #262c37; color: var(--text);
+  padding: 11px 16px; border-radius: 999px; font-size: 14px; font-family: inherit; outline: none;
+}
+.name-input:focus { border-color: var(--teal); }
+.name-input::placeholder { color: #5a6270; }
