@@ -7,6 +7,7 @@ export default function PreJoin() {
   const streamReady = useStore((s) => s.streamReady);
   const hint = useStore((s) => s.prejoinHint);
   const [name, setName] = useState("");
+  const [nameError, setNameError] = useState("");
 
   useEffect(() => {
     void session.boot();
@@ -15,6 +16,12 @@ export default function PreJoin() {
   useEffect(() => {
     if (streamReady && videoRef.current) videoRef.current.srcObject = session.stream;
   }, [streamReady]);
+
+  const handleJoin = () => {
+    if (!name.trim()) { setNameError("Please enter your name"); return; }
+    setNameError("");
+    void session.join(name);
+  };
 
   return (
     <div id="prejoin">
@@ -27,15 +34,16 @@ export default function PreJoin() {
         <p className="prejoin-note"><span className="dot" /> <strong>Forge</strong>, your AI engineering teammate, is already in the call</p>
         <div className="join-group">
           <input
-            className="name-input"
+            className={"name-input" + (nameError ? " input-error" : "")}
             placeholder="Your name"
             maxLength={24}
             value={name}
-            onChange={(e) => setName(e.target.value)}
-            onKeyDown={(e) => { if (e.key === "Enter") void session.join(name); }}
+            onChange={(e) => { setName(e.target.value); if (nameError) setNameError(""); }}
+            onKeyDown={(e) => { if (e.key === "Enter") handleJoin(); }}
           />
-          <button id="joinbtn" onClick={() => void session.join(name)}>Join now</button>
+          <button id="joinbtn" onClick={handleJoin}>Join now</button>
         </div>
+        {nameError && <p className="name-error">{nameError}</p>}
         <p className="prejoin-hint">{hint}</p>
       </div>
     </div>

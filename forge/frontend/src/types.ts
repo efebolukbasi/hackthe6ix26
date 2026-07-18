@@ -29,6 +29,7 @@ export interface NodeOp {
   h?: number;
   sub?: string;
   color?: string;
+  attr?: { file: string; startLine?: number; endLine?: number };
 }
 
 export interface ArrowOp {
@@ -76,6 +77,7 @@ export interface CodeOp {
   line?: number;
   text?: string;
   color?: string;
+  attr?: { file: string; startLine?: number; endLine?: number };
 }
 
 export type WhiteboardOp =
@@ -123,7 +125,17 @@ export interface AgentStep {
   ops?: WhiteboardOp[];
 }
 
-export type StreamMsg = AgentStep | { type: "done" };
+export interface ToolEvent { type: "tool"; name: string; input: string; }
+export interface AgentFocusEvent { type: "focus"; file: string; startLine: number; endLine: number; }
+export interface ProgressEvent { type: "progress"; text: string; }
+
+export type StreamMsg =
+  | AgentStep
+  | { type: "done" }
+  | { type: "error"; message: string }
+  | ToolEvent
+  | AgentFocusEvent
+  | ProgressEvent;
 
 // ---------- transcript / health ----------
 
