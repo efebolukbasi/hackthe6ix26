@@ -38,7 +38,6 @@ export default function Tiles() {
   const remoteStream = useStore((s) => s.remoteStream);
   const myName = useStore((s) => s.myName);
   const listeningActive = useStore((s) => s.listeningActive);
-  const thinkingTrace = useStore((s) => s.thinkingTrace);
   const forgeVolume = useStore((s) => s.forgeVolume);
   const peerVolume = useStore((s) => s.peerVolume);
 
@@ -56,7 +55,6 @@ export default function Tiles() {
 
   const working = stage === "working";
   const handVisible = handRaised || stage === "ready";
-  const activity = working && thinkingTrace.length > 0 ? thinkingTrace[thinkingTrace.length - 1] : "";
   const orbClass = [
     "orb-wrap",
     working ? "working" : "",
@@ -94,7 +92,6 @@ export default function Tiles() {
         </button>
         <div className="nametag">Forge · AI Engineer</div>
         <div className="agent-status" id="agentstatus"><span className="status-dot" />{agentStatus}</div>
-        {activity && <div className="agent-activity" title={activity}>{activity}</div>}
         <VolumeControl value={forgeVolume} onChange={(v) => session.setForgeVolume(v)} label="Forge" />
       </div>
     </div>

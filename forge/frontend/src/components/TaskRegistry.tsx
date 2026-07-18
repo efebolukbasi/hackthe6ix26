@@ -4,7 +4,6 @@ import type { ForgeTask, ForgeTaskStatus } from "../types";
 
 const KIND_ICON: Record<ForgeTask["kind"], string> = {
   answer: "💬",
-  walkthrough: "🧭",
   issue: "🐙",
 };
 

@@ -2,11 +2,9 @@
 // local read_file/grep/list_files tool loop over the loaded repository.
 import { REPO_TOOL_DEFS, runRepoTool } from "./repoTools.ts";
 
-const API_MODELS: Record<string, string> = {
-  sonnet: "claude-sonnet-5",
-  haiku: "claude-haiku-4-5-20251001",
-  opus: "claude-opus-4-8",
-};
+// Forge keeps exploration quick and predictable: every Anthropic request uses
+// Haiku. There is intentionally no per-request model switch here.
+const HAIKU_MODEL = "claude-haiku-4-5-20251001";
 
 export function llmMode(): "api" {
   return "api";
@@ -15,7 +13,6 @@ export function llmMode(): "api" {
 interface StreamTextOptions {
   system: string;
   prompt: string;
-  model?: string;
   maxTokens?: number;
   onDelta?: (chunk: string) => void;
   /** Called when the model uses a tool (name, serialised input). */
@@ -30,7 +27,6 @@ interface StreamTextOptions {
 export async function streamText({
   system,
   prompt,
-  model = "sonnet",
   maxTokens = 4000,
   onDelta = () => {},
   onTool,
@@ -39,13 +35,12 @@ export async function streamText({
   cwd,
 }: StreamTextOptions): Promise<string> {
   if (!process.env.ANTHROPIC_API_KEY) throw new Error("ANTHROPIC_API_KEY is required");
-  return apiStream({ system, prompt, model, maxTokens, onDelta, onTool, signal, tools, cwd });
+  return apiStream({ system, prompt, maxTokens, onDelta, onTool, signal, tools, cwd });
 }
 
 interface ApiStreamOptions {
   system: string;
   prompt: string;
-  model: string;
   maxTokens: number;
   onDelta: (chunk: string) => void;
   onTool?: (name: string, input: string) => void;
@@ -131,7 +126,7 @@ async function apiTurn(
   return { blocks: ordered, stopReason };
 }
 
-async function apiStream({ system, prompt, model, maxTokens, onDelta, onTool, signal, tools, cwd }: ApiStreamOptions): Promise<string> {
+async function apiStream({ system, prompt, maxTokens, onDelta, onTool, signal, tools, cwd }: ApiStreamOptions): Promise<string> {
   const toolsOn = !!(tools && cwd);
   const messages: unknown[] = [{ role: "user", content: prompt }];
   let full = "";
@@ -144,7 +139,7 @@ async function apiStream({ system, prompt, model, maxTokens, onDelta, onTool, si
     const lastTurn = turn === MAX_TURNS - 1;
     const { blocks, stopReason } = await apiTurn(
       {
-        model: API_MODELS[model] || model,
+        model: HAIKU_MODEL,
         max_tokens: maxTokens,
         stream: true,
         system,

@@ -139,7 +139,7 @@ export type StreamMsg =
 
 // ---------- Forge task registry ----------
 
-export type ForgeTaskKind = "answer" | "walkthrough" | "issue";
+export type ForgeTaskKind = "answer" | "issue";
 
 export type ForgeTaskStatus =
   | "queued"

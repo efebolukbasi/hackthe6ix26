@@ -114,7 +114,6 @@ export class ForgeSession {
   private sid = Math.random().toString(36).slice(2, 8);
   private taskSeq = 0;
   private activeTaskId: string | null = null;
-  private walkthroughTaskId: string | null = null;
   private walkthroughAbort: AbortController | null = null;
   private issueTaskId: string | null = null;
   private issueAbort: AbortController | null = null;
@@ -191,9 +190,8 @@ export class ForgeSession {
     if (!wasActive) this.listeningChime();
   }
 
-  /** Append a line to the visible working trace and mirror it to the peer,
-   * so both participants can watch what Forge is doing while it works. Also
-   * records the line on the owning task so the registry shows it. */
+  /** Record a tool/progress line on the owning task and mirror it to the
+   * peer. The task registry is the single visible surface for this detail. */
   private traceLine(line: string, taskId: string | null = this.activeTaskId, cast = true): void {
     useStore.setState((s) => ({ thinkingTrace: [...s.thinkingTrace.slice(-11), line] }));
     this.taskTrace(taskId, line);
@@ -201,7 +199,7 @@ export class ForgeSession {
   }
 
   // ---------- task registry ----------
-  // Every unit of Forge work (answer, walkthrough, issue) is a task both
+  // Every autonomous unit of Forge work (answer or issue) is a task both
   // participants can see and cancel. Owners drive their tasks and cast
   // upserts; a peer cancels someone else's task by asking the owner.
 
@@ -270,12 +268,6 @@ export class ForgeSession {
     }
     if (this.activeTaskId === id) {
       this.cancelAgent();
-      return;
-    }
-    if (this.walkthroughTaskId === id) {
-      this.walkthroughAbort?.abort();
-      if (!this.agentBusy && !this.remoteAgentActive) this.cancelSpeech();
-      this.setTask(id, { status: "cancelled" });
       return;
     }
     if (this.issueTaskId === id) {
@@ -483,8 +475,6 @@ export class ForgeSession {
           if (text && (!this.inTtsTail() || isAddressed(text) || STOP.test(text))) {
             this.handleUtterance(text, "voice");
           }
-        } else if (!this.inTtsTail()) {
-          this.caption("You", res[0].transcript);
         }
       }
     };
@@ -557,17 +547,13 @@ export class ForgeSession {
     return acks[Math.floor(Math.random() * acks.length)];
   }
 
-  /** The beat between "ready" and speaking: a short pause, extended while the
-   * local mic hears someone talking, released early by an invite or cancel. */
+  /** Hold a prepared answer until the team explicitly gives Forge the floor. */
   private readyPause(): Promise<void> {
     return new Promise((resolve) => {
-      const started = Date.now();
       let released = false;
       this.readyRelease = () => { released = true; };
       const tick = () => {
-        const elapsed = Date.now() - started;
-        const someoneTalking = useStore.getState().youTalking;
-        if (this.cancelled || released || elapsed >= 8_000 || (elapsed >= 900 && !someoneTalking)) {
+        if (this.cancelled || released) {
           this.readyRelease = null;
           resolve();
           return;
@@ -753,6 +739,7 @@ export class ForgeSession {
       this.pendingInterrupt = null;
     }
     this.agentAbort?.abort();
+    this.walkthroughAbort?.abort();
     this.cancelSpeech();
     this.wb?.finishNow();
     this.exitPresenting();
@@ -1307,12 +1294,12 @@ export class ForgeSession {
 
   async runWalkthrough(nodeLabel: string, attr: { file: string; startLine?: number; endLine?: number }): Promise<void> {
     const board = this.wb ? this.wb.summary() : { title: null, nodes: [], arrows: [] };
-    const task = this.newTask("walkthrough", `Walk through ${nodeLabel}`, "working");
-    this.walkthroughTaskId = task.id;
+    // Viewing code is user-initiated navigation, not a Forge task. It should
+    // never appear in the task registry or expose tool calls elsewhere.
     const abort = new AbortController();
     this.walkthroughAbort = abort;
-    // A walkthrough is agent work too — show the working stage and tool
-    // activity instead of silently sitting in "listening" while Claude reads.
+    // Keep Forge visibly working while the walkthrough loads, without making
+    // this user-initiated code view a task.
     const wasIdle = !this.agentBusy && !this.remoteAgentActive;
     if (wasIdle) {
       useStore.setState({ thinkingTrace: [] });
@@ -1346,10 +1333,10 @@ export class ForgeSession {
           try {
             const msg = JSON.parse(line) as { type: string; say?: string; ops?: AgentStep["ops"]; file?: string; startLine?: number; endLine?: number; name?: string; input?: string };
             if (msg.type === "tool") {
-              this.traceLine(`🔍 ${msg.name ?? "tool"}: ${(msg.input ?? "").slice(0, 80)}`, task.id);
+              // Deliberately hidden: this is code-panel navigation, not a
+              // task Forge volunteered to perform.
             } else if (msg.type === "step") {
               useStore.setState({ thinkingTrace: [] });
-              this.setTask(task.id, { status: "presenting" });
               await this.playStep({ type: "step", say: msg.say ?? "", ops: msg.ops }, true);
             } else if (msg.type === "focus") {
               const hl = { start: msg.startLine ?? 1, end: msg.endLine ?? msg.startLine ?? 1 };
@@ -1360,8 +1347,6 @@ export class ForgeSession {
         }
       }
     } catch { /* silently fail — walkthrough is best-effort */ } finally {
-      this.setTask(task.id, { status: abort.signal.aborted ? "cancelled" : "done" });
-      this.walkthroughTaskId = null;
       this.walkthroughAbort = null;
       if (wasIdle && !this.agentBusy && !this.remoteAgentActive) {
         useStore.setState({ thinkingTrace: [] });
@@ -1401,6 +1386,7 @@ export class ForgeSession {
     this.stopRecog();
     this.cancelSpeech();
     this.agentAbort?.abort();
+    this.walkthroughAbort?.abort();
     this.stream?.getTracks().forEach((t) => t.stop());
     useStore.setState({ phase: "ended" });
   }

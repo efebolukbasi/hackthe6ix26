@@ -1,6 +1,12 @@
 // Prompt builders for Forge. The op schema mirrors frontend/whiteboard.js.
 import type { TranscriptLine } from "./types.ts";
 
+const SPEECH_PRONUNCIATION = `
+SPEECH PRONUNCIATION:
+- In every "say" value, pronounce a file extension as separate English letter names. For example, say "server dot tee ess" for server.ts and "component dot tee ess ex" for component.tsx. Do this for any extension, including unfamiliar ones.
+- Apply this only to the spoken "say" text. Keep real paths and extensions unchanged in JSON fields such as "file", "focus", code text, and drawing ops.
+`.trim();
+
 export const OPS_SPEC = `
 DRAWING OPS (JSON objects inside "ops" arrays):
   {"op":"clear"}                                          — wipe the board (start of a NEW topic only)
@@ -39,6 +45,8 @@ ${liveTools ? `- You have read-only repository tools (read/grep/list over the te
 - When drawing a node that corresponds directly to a specific file or class in the codebase, add an optional "attr" field: {"op":"node",...,"attr":{"file":"src/server.ts","startLine":1}}. Only emit attr when you have confirmed the file (and its line numbers) from the digest or a tool result.
 - File contents in the digest are line-numbered ("  12| …") — those are the file's REAL line numbers. Use them for attr fields and code cards; never guess line numbers.
 
+${SPEECH_PRONUNCIATION}
+
 OUTPUT FORMAT — CRITICAL:
 Respond ONLY with NDJSON: one JSON object per line. No markdown, no code fences, no text outside the JSON lines.
 Each line: {"say":"<what you speak next>","ops":[<zero or more drawing ops drawn while you say it>]}
@@ -61,6 +69,8 @@ export function buildWalkthroughSystem(repoDigest: string, liveTools = false): s
   return `You are Forge, an AI engineer doing a live code walkthrough for the team. You are walking through a specific component, speaking naturally while pointing to exact lines in the file.
 ${liveTools ? `- You have read-only repository tools (read/grep/list over the team's repo). Read the file mentioned to get the exact code before starting your walkthrough.` : ""}
 - File contents in the digest are line-numbered ("  12| …") — those are the file's REAL line numbers; use them for every "focus" field.
+
+${SPEECH_PRONUNCIATION}
 
 Walk through the code for this component. Each spoken step should reference the exact file lines you are describing. In the JSON for each step, add a top-level "focus" field alongside "say" and "ops": {"say":"...","ops":[],"focus":{"file":"src/lib/tts.ts","startLine":23,"endLine":45}}. Use code ops sparingly; rely on the focus field to scroll the code panel instead.
 

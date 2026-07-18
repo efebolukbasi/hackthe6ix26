@@ -716,7 +716,7 @@ button:active { transform: scale(0.96); }
 
 /* ————— active task registry ————— */
 #task-registry {
-  position: fixed; z-index: 15; left: 30px; top: 30px; width: 318px;
+  position: fixed; z-index: 15; left: 30px; top: 30px; width: min(318px, calc(100vw - 60px));
   display: flex; flex-direction: column; gap: 6px;
   pointer-events: none;
 }
@@ -738,6 +738,7 @@ button:active { transform: scale(0.96); }
   animation: task-in 0.32s cubic-bezier(0.2, 0.8, 0.2, 1) both;
   transition: opacity 0.4s ease, border-color 0.3s ease;
   pointer-events: auto;
+  min-width: 0;
 }
 @keyframes task-in { from { opacity: 0; transform: translateY(-7px) scale(0.97); } }
 .task-row.done, .task-row.cancelled, .task-row.error { opacity: 0.55; }
@@ -765,12 +766,12 @@ button:active { transform: scale(0.96); }
 }
 .task-cancel:hover { background: rgba(229, 72, 77, 0.85); color: #fff; border-color: transparent; }
 .task-trace {
-  flex-basis: 100%; margin-top: 3px;
+  flex-basis: 100%; min-width: 0; max-width: 100%; margin-top: 3px;
   border-top: 1px dashed var(--stroke-soft); padding-top: 5px;
 }
 .task-trace-line {
   font-family: Menlo, monospace; font-size: 10.5px; color: var(--faint);
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; line-height: 1.7;
+  display: block; max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; line-height: 1.7;
 }
 
 /* ————— per-tile volume ————— */

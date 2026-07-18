@@ -6,10 +6,11 @@ import RepoPicker from "./RepoPicker";
 export default function SidePanel() {
   const panelOpen = useStore((s) => s.panelOpen);
   const transcript = useStore((s) => s.transcript);
-  const stage = useStore((s) => s.stage);
-  const thinkingTrace = useStore((s) => s.thinkingTrace);
   const [text, setText] = useState("");
   const msgsRef = useRef<HTMLDivElement>(null);
+  // Keep the complete transcript in session state for meeting context, but
+  // the panel is Forge's reply history rather than a live human transcript.
+  const forgeMessages = transcript.filter((message) => message.who === "Forge");
 
   useEffect(() => {
     const el = msgsRef.current;
@@ -36,17 +37,9 @@ export default function SidePanel() {
           <button key={q} onClick={() => session.ask(q)}>{q}</button>
         ))}
       </div>
-      {(stage === "working" || stage === "ready") && thinkingTrace.length > 0 && (
-        <div className="trace-panel">
-          <div className="trace-header">{stage === "ready" ? "Forge is ready to answer" : "Forge is checking…"}</div>
-          {thinkingTrace.map((line, i) => (
-            <div key={i} className="trace-line">{line}</div>
-          ))}
-        </div>
-      )}
       <div className="msgs" id="msgs" ref={msgsRef}>
-        {transcript.map((m, i) => (
-          <div key={i} className={"m" + (m.who === "Forge" ? " agent" : "")}>
+        {forgeMessages.map((m, i) => (
+          <div key={i} className="m agent">
             <div className="who">{m.who}</div>
             <div>{m.text}</div>
           </div>

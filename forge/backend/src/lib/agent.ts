@@ -22,7 +22,6 @@ export async function draftIssue(command: string, transcript: TranscriptLine[]):
   const text = await streamText({
     system: "You write clear, actionable GitHub issues for an engineering team.",
     prompt: buildIssuePrompt(command, transcript),
-    model: process.env.FORGE_MODEL || "sonnet",
     maxTokens: 800,
   });
   const start = text.indexOf("{");
@@ -123,7 +122,6 @@ export async function respond(
     const fullText = await streamText({
       system: SYSTEM,
       prompt: buildUser({ question, transcript, board, invited, reason, interrupted }),
-      model: process.env.FORGE_MODEL || "sonnet",
       onDelta: (t: string) => parser.push(t),
       onTool: (name, input) => send({ type: "tool", name, input }),
       signal: abort.signal,
@@ -201,7 +199,6 @@ export async function walkthrough(
     await streamText({
       system: walkthroughSystem,
       prompt: buildWalkthroughUser(nodeLabel, attr, transcript, board),
-      model: process.env.FORGE_MODEL || "sonnet",
       onDelta: (t: string) => parser.push(t),
       onTool: (name, input) => send({ type: "tool", name, input }),
       signal: abort.signal,
@@ -234,7 +231,6 @@ export async function listen(
     const text = await streamText({
       system: "You are a concise meeting-assistant classifier.",
       prompt: buildListenPrompt(transcript),
-      model: process.env.FORGE_LISTEN_MODEL || "haiku",
       maxTokens: 200,
     });
     const m = text.match(/\{[\s\S]*\}/);

@@ -58,9 +58,9 @@ export interface ForgeState {
   /** connected human peer (P2P call), if any */
   remoteName: string | null;
   remoteStream: MediaStream | null;
-  /** thinking / tool trace lines shown in SidePanel */
+  /** latest tool/progress trace; task rows own the visible rendering */
   thinkingTrace: string[];
-  /** active/queued/recently-finished Forge tasks (answers, walkthroughs, issues) */
+  /** active/queued/recently-finished Forge tasks (answers and issues) */
   tasks: ForgeTask[];
   /** playback volume for Forge's voice (0..1) */
   forgeVolume: number;
