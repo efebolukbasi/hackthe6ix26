@@ -1,0 +1,11 @@
+export default function Ended() {
+  return (
+    <div id="ended">
+      <div className="ended-card">
+        <p>You left the call.</p>
+        <p className="ended-sub">Forge waved goodbye 👋</p>
+        <button onClick={() => location.reload()}>Rejoin</button>
+      </div>
+    </div>
+  );
+}

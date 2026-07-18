@@ -1,0 +1,32 @@
+import { useEffect, useRef } from "react";
+import { session } from "../lib/session";
+import { useStore } from "../state/store";
+
+export default function PreJoin() {
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const streamReady = useStore((s) => s.streamReady);
+  const hint = useStore((s) => s.prejoinHint);
+
+  useEffect(() => {
+    void session.boot();
+  }, []);
+
+  useEffect(() => {
+    if (streamReady && videoRef.current) videoRef.current.srcObject = session.stream;
+  }, [streamReady]);
+
+  return (
+    <div id="prejoin">
+      <div className="prejoin-card">
+        <div className="logo">forge<span>·</span></div>
+        <div className="preview-wrap">
+          <video id="preview" ref={videoRef} autoPlay playsInline muted />
+          <div className="preview-tag">You</div>
+        </div>
+        <p className="prejoin-note"><span className="dot" /> <strong>Forge</strong>, your AI engineering teammate, is already in the call</p>
+        <button id="joinbtn" onClick={() => void session.join()}>Join now</button>
+        <p className="prejoin-hint">{hint}</p>
+      </div>
+    </div>
+  );
+}

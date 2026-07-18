@@ -2,13 +2,63 @@
 // real time with a visible pen tip, like a person sketching on a board.
 // Virtual coordinate space is 1200x720, letterboxed into the canvas.
 
+import type {
+  ArrowOp,
+  BoardArrowSummary,
+  BoardNodeSummary,
+  BoardSummary,
+  DrawableOp,
+  NodeOp,
+  WhiteboardOp,
+} from "../types";
+
 const VW = 1200, VH = 720;
 const INK = "#28323f";
 const NODE_W = 180, NODE_H = 70;
 const PEN_SPEED = 1050;  // virtual px per second
 const CHAR_SPEED = 26;   // characters per second for type-on text
 
-function mulberry32(a) {
+interface Pt { x: number; y: number }
+
+interface PathStroke {
+  kind: "path";
+  pts: Pt[];
+  cum: number[];
+  total: number;
+  color: string;
+  width: number;
+  duration: number;
+}
+
+interface TextStroke {
+  kind: "text";
+  text: string;
+  x: number;
+  y: number;
+  font: string;
+  color: string;
+  align: "left" | "center";
+  halo: boolean;
+  duration: number;
+}
+
+type Stroke = PathStroke | TextStroke;
+
+interface NodeMeta { x: number; y: number; w: number; h: number; color: string; dead: boolean }
+
+interface BoardItem {
+  type: DrawableOp["op"];
+  id?: string;
+  op: DrawableOp;
+  strokes: Stroke[];
+  faded: boolean;
+  meta?: NodeMeta;
+  target?: string;
+}
+
+interface CurrentDraw { item: BoardItem; si: number; prog: number }
+
+function mulberry32(a: number): () => number {
   return function () {
     a |= 0; a = (a + 0x6d2b79f5) | 0;
     let t = Math.imul(a ^ (a >>> 15), 1 | a);
@@ -17,28 +67,28 @@ function mulberry32(a) {
   };
 }
 
-function hexToRgba(hex, a) {
+function hexToRgba(hex: string, a: number): string {
   const n = parseInt(hex.slice(1), 16);
   return `rgba(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}, ${a})`;
 }
 
 // --- geometric samplers (unjittered base points) ---
 
-function sampleLine(pts, ax, ay, bx, by, step = 11) {
+function sampleLine(pts: Pt[], ax: number, ay: number, bx: number, by: number, step = 11): void {
   const len = Math.hypot(bx - ax, by - ay);
   const n = Math.max(2, Math.round(len / step));
   for (let i = 0; i <= n; i++) pts.push({ x: ax + ((bx - ax) * i) / n, y: ay + ((by - ay) * i) / n });
 }
 
-function sampleArc(pts, cx, cy, r, a0, a1, n = 5) {
+function sampleArc(pts: Pt[], cx: number, cy: number, r: number, a0: number, a1: number, n = 5): void {
   for (let i = 0; i <= n; i++) {
     const a = a0 + ((a1 - a0) * i) / n;
     pts.push({ x: cx + Math.cos(a) * r, y: cy + Math.sin(a) * r });
   }
 }
 
-function roundedRectPts(x, y, w, h, r = 14) {
-  const pts = [];
+function roundedRectPts(x: number, y: number, w: number, h: number, r = 14): Pt[] {
+  const pts: Pt[] = [];
   const HP = Math.PI / 2;
   sampleLine(pts, x + r, y, x + w - r, y);
   sampleArc(pts, x + w - r, y + r, r, -HP, 0);
@@ -51,8 +101,8 @@ function roundedRectPts(x, y, w, h, r = 14) {
   return pts;
 }
 
-function quadPts(p0, c, p1, n = 26) {
-  const pts = [];
+function quadPts(p0: Pt, c: Pt, p1: Pt, n = 26): Pt[] {
+  const pts: Pt[] = [];
   for (let i = 0; i <= n; i++) {
     const t = i / n, u = 1 - t;
     pts.push({
@@ -63,8 +113,8 @@ function quadPts(p0, c, p1, n = 26) {
   return pts;
 }
 
-function ellipsePts(cx, cy, rx, ry, overlap = 0.55) {
-  const pts = [];
+function ellipsePts(cx: number, cy: number, rx: number, ry: number, overlap = 0.55): Pt[] {
+  const pts: Pt[] = [];
   const from = -0.5, to = 2 * Math.PI + overlap;
   const n = 44;
   for (let i = 0; i <= n; i++) {
@@ -74,11 +124,11 @@ function ellipsePts(cx, cy, rx, ry, overlap = 0.55) {
   return pts;
 }
 
-function jitter(pts, amp, rnd) {
+function jitter(pts: Pt[], amp: number, rnd: () => number): Pt[] {
   return pts.map((p) => ({ x: p.x + (rnd() * 2 - 1) * amp, y: p.y + (rnd() * 2 - 1) * amp }));
 }
 
-function withLengths(pts) {
+function withLengths(pts: Pt[]): { pts: Pt[]; cum: number[]; total: number } {
   const cum = [0];
   let total = 0;
   for (let i = 1; i < pts.length; i++) {
@@ -88,54 +138,60 @@ function withLengths(pts) {
   return { pts, cum, total };
 }
 
-function rectEdgePoint(from, node, pad = 8) {
+function rectEdgePoint(from: { x: number; y: number }, node: { x: number; y: number; w: number; h: number }, pad = 8): Pt {
   const dx = node.x - from.x || 1e-6, dy = node.y - from.y || 1e-6;
   const s = Math.min((node.w / 2 + pad) / Math.abs(dx), (node.h / 2 + pad) / Math.abs(dy));
   return { x: node.x - dx * s, y: node.y - dy * s };
 }
 
 export class Whiteboard {
-  constructor(canvas) {
+  canvas: HTMLCanvasElement;
+  private ctx: CanvasRenderingContext2D;
+  private items: BoardItem[] = [];
+  private byId: Record<string, BoardItem> = {};
+  private nodes: Record<string, BoardItem> = {};
+  private queue: WhiteboardOp[] = [];
+  private current: CurrentDraw | null = null;
+  private _seed = 7;
+
+  constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
-    this.ctx = canvas.getContext("2d");
-    this.items = [];
-    this.byId = {};
-    this.nodes = {};
-    this.queue = [];
-    this.current = null;
-    this._seed = 7;
+    this.ctx = canvas.getContext("2d")!;
   }
 
-  get busy() {
+  get busy(): boolean {
     return this.queue.length > 0 || !!this.current;
   }
 
   // Compact board state for the agent prompt (what's currently drawn).
-  summary() {
-    const title = this.items.find((i) => i.type === "title")?.op.text || null;
+  summary(): BoardSummary {
+    const titleItem = this.items.find((i) => i.type === "title");
+    const title = (titleItem && titleItem.op.op === "title" ? titleItem.op.text : null) || null;
     const nodes = Object.values(this.nodes).map((n) => {
-      const o = { id: n.id, label: n.op.label };
-      if (n.op.sub) o.sub = n.op.sub;
+      const op = n.op as NodeOp;
+      const o: BoardNodeSummary = { id: n.id as string, label: op.label };
+      if (op.sub) o.sub = op.sub;
       if (n.meta?.dead) o.dead = true;
       return o;
     });
     const arrows = this.items
-      .filter((i) => i.type === "arrow" && i.op.from)
+      .filter((i) => i.type === "arrow" && (i.op as ArrowOp).from)
       .map((i) => {
-        const o = { from: i.op.from, to: i.op.to };
+        const op = i.op as ArrowOp;
+        const o: BoardArrowSummary = { from: op.from, to: op.to };
         if (i.id) o.id = i.id;
-        if (i.op.label) o.label = i.op.label;
+        if (op.label) o.label = op.label;
         if (i.faded) o.faded = true;
         return o;
       });
     return { title, nodes, arrows };
   }
 
-  enqueue(ops) {
+  enqueue(ops: WhiteboardOp[]): void {
     for (const op of ops) this.queue.push(op);
   }
 
-  clear() {
+  clear(): void {
     this.items = [];
     this.byId = {};
     this.nodes = {};
@@ -143,28 +199,28 @@ export class Whiteboard {
     this.current = null;
   }
 
-  finishNow() {
+  finishNow(): void {
     let guard = 500;
     while (this.busy && guard-- > 0) this.update(1);
   }
 
-  _rnd() {
+  private _rnd(): () => number {
     return mulberry32((this._seed += 1013));
   }
 
-  _pathStroke(basePts, { color = INK, width = 2.5, amp = 1.5 } = {}) {
+  private _pathStroke(basePts: Pt[], { color = INK, width = 2.5, amp = 1.5 }: { color?: string; width?: number; amp?: number } = {}): PathStroke {
     const { pts, cum, total } = withLengths(jitter(basePts, amp, this._rnd()));
     return { kind: "path", pts, cum, total, color, width, duration: Math.max(0.12, total / PEN_SPEED) };
   }
 
-  _textStroke(text, x, y, { font = '21px "Patrick Hand"', color = INK, align = "center", halo = false } = {}) {
+  private _textStroke(text: string, x: number, y: number, { font = '21px "Patrick Hand"', color = INK, align = "center", halo = false }: { font?: string; color?: string; align?: "left" | "center"; halo?: boolean } = {}): TextStroke {
     return { kind: "text", text, x, y, font, color, align, halo, duration: Math.max(0.15, text.length / CHAR_SPEED) };
   }
 
   // --- op → item planner ---
-  plan(op) {
-    const S = [];
-    const item = { type: op.op, id: op.id, op, strokes: S, faded: false };
+  plan(op: DrawableOp): BoardItem {
+    const S: Stroke[] = [];
+    const item: BoardItem = { type: op.op, id: op.id, op, strokes: S, faded: false };
     const ctx = this.ctx;
 
     if (op.op === "title") {
@@ -172,7 +228,7 @@ export class Whiteboard {
       ctx.font = font;
       const w = ctx.measureText(op.text).width;
       S.push(this._textStroke(op.text, 56, 58, { font, align: "left" }));
-      const u = [];
+      const u: Pt[] = [];
       sampleLine(u, 56, 84, 56 + w, 86);
       S.push(this._pathStroke(u, { color: "#e8a13c", width: 3, amp: 1.2 }));
     }
@@ -238,7 +294,7 @@ export class Whiteboard {
       item.target = op.target;
       const x0 = t.x - t.w / 2 - 8, x1 = t.x + t.w / 2 + 8;
       const y0 = t.y - t.h / 2 - 8, y1 = t.y + t.h / 2 + 8;
-      const d1 = [], d2 = [];
+      const d1: Pt[] = [], d2: Pt[] = [];
       sampleLine(d1, x0, y0, x1, y1);
       sampleLine(d2, x1, y0, x0, y1);
       S.push(this._pathStroke(d1, { color: "#d94f46", width: 3.6, amp: 1.8 }));
@@ -248,14 +304,14 @@ export class Whiteboard {
     return item;
   }
 
-  _complete(item) {
+  private _complete(item: BoardItem): void {
     this.items.push(item);
     if (item.id) this.byId[item.id] = item;
-    if (item.type === "node") this.nodes[item.id] = item;
-    if (item.type === "cross" && this.nodes[item.target]) this.nodes[item.target].meta.dead = true;
+    if (item.type === "node") this.nodes[item.id as string] = item;
+    if (item.type === "cross" && item.target && this.nodes[item.target]) this.nodes[item.target].meta!.dead = true;
   }
 
-  update(dt) {
+  update(dt: number): void {
     let budget = dt;
     let guard = 200;
     while (budget > 0 && guard-- > 0) {
@@ -294,7 +350,7 @@ export class Whiteboard {
 
   // --- rendering ---
 
-  _drawPath(ctx, s, upTo = Infinity) {
+  private _drawPath(ctx: CanvasRenderingContext2D, s: PathStroke, upTo = Infinity): Pt {
     ctx.strokeStyle = s.color;
     ctx.lineWidth = s.width;
     ctx.lineCap = "round";
@@ -319,7 +375,7 @@ export class Whiteboard {
     return tip;
   }
 
-  _drawText(ctx, s, chars = Infinity) {
+  private _drawText(ctx: CanvasRenderingContext2D, s: TextStroke, chars = Infinity): Pt {
     const text = chars >= s.text.length ? s.text : s.text.slice(0, Math.max(0, Math.floor(chars)));
     ctx.font = s.font;
     ctx.textBaseline = "middle";
@@ -336,7 +392,7 @@ export class Whiteboard {
     return { x: startX + ctx.measureText(text).width + 2, y: s.y };
   }
 
-  _drawItem(ctx, item, partialSi = Infinity, partialProg = 0) {
+  private _drawItem(ctx: CanvasRenderingContext2D, item: BoardItem, partialSi = Infinity, partialProg = 0): Pt | null {
     ctx.save();
     if (item.faded) ctx.globalAlpha = 0.26;
     const dead = item.type === "node" && item.meta?.dead;
@@ -348,18 +404,19 @@ export class Whiteboard {
       ctx.roundRect(m.x - m.w / 2, m.y - m.h / 2, m.w, m.h, 14);
       ctx.fill();
     }
-    let tip = null;
+    let tip: Pt | null = null;
     for (let i = 0; i < item.strokes.length; i++) {
       if (i > partialSi) break;
       const s = item.strokes[i];
       const partial = i === partialSi;
       let color = s.color;
       if (dead && s.color !== "#d94f46") color = "#9aa4b2";
-      const painted = { ...s, color };
       if (s.kind === "path") {
+        const painted: PathStroke = { ...s, color };
         const upTo = partial ? (partialProg / s.duration) * s.total : Infinity;
         tip = this._drawPath(ctx, painted, upTo);
       } else {
+        const painted: TextStroke = { ...s, color };
         const chars = partial ? (partialProg / s.duration) * s.text.length : Infinity;
         tip = this._drawText(ctx, painted, chars);
       }
@@ -368,7 +425,7 @@ export class Whiteboard {
     return tip;
   }
 
-  render() {
+  render(): void {
     const { canvas, ctx } = this;
     const d = devicePixelRatio || 1;
     const cw = canvas.clientWidth, ch = canvas.clientHeight;
