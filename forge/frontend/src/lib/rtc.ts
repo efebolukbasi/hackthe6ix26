@@ -18,7 +18,7 @@ export type CastEvent =
   | { k: "board-move"; id: string; dx: number; dy: number }
   | { k: "board-sync"; ops: WhiteboardOp[]; moves: Array<{ id: string; dx: number; dy: number }> }
   | { k: "focus"; file: string; startLine: number; endLine: number }
-  | { k: "code-panel-open"; file: string; githubUrl?: string };
+  | { k: "code-panel-open"; file: string; startLine?: number; endLine?: number; githubUrl?: string };
 
 interface ServerMsg {
   t: "welcome" | "peer-joined" | "peer-left" | "signal" | "cast" | "full";

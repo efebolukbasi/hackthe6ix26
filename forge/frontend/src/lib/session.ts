@@ -410,59 +410,6 @@ export class ForgeSession {
     }
   }
 
-  async runCodeAgent(task: string): Promise<void> {
-    if (this.agentBusy) return;
-    this.agentBusy = true;
-    this.cancelled = false;
-    this.lowerHand();
-    this.room?.cast({ k: "agent-start" });
-    this.setStatus("coding\u2026");
-    useStore.setState({ thinking: true, thinkingTrace: [], listeningActive: false });
-    const ack = "On it \u2014 I'll make those changes and report back.";
-    this.caption("Forge", ack, true); this.transcript("Forge", ack);
-    void this.speak(ack); // fire-and-forget
-    try {
-      const res = await apiFetch(`${API}/api/agent/code`, {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ task }),
-      });
-      const reader = res.body!.getReader(); const dec = new TextDecoder();
-      let buf = "";
-      for (;;) {
-        const { done, value } = await reader.read(); if (done) break;
-        buf += dec.decode(value, { stream: true });
-        const lines = buf.split("\n"); buf = lines.pop() ?? "";
-        for (const line of lines) {
-          if (!line.trim()) continue;
-          try {
-            const msg = JSON.parse(line) as { type: string; name?: string; input?: string; text?: string; summary?: string; message?: string };
-            if (msg.type === "tool") useStore.setState((s) => ({ thinkingTrace: [...s.thinkingTrace, `\uD83D\uDD27 ${msg.name ?? ""}: ${String(msg.input ?? "").slice(0, 60)}`] }));
-            if (msg.type === "progress") useStore.setState((s) => ({ thinkingTrace: [...s.thinkingTrace, String(msg.text ?? "").slice(0, 80)] }));
-            if (msg.type === "done") {
-              const summary = msg.summary || "Done.";
-              this.caption("Forge", summary, true); this.transcript("Forge", summary);
-              this.room?.cast({ k: "step", say: summary, ops: [] });
-              await this.speak(summary);
-            }
-            if (msg.type === "error") throw new Error(msg.message);
-          } catch { /* ignore parse errors */ }
-        }
-      }
-    } catch (err) {
-      if (!this.cancelled) {
-        const line = err instanceof Error && err.message.includes("claude")
-          ? "I need Claude Code CLI installed and no API key to use coding mode."
-          : "Something went wrong with that coding task.";
-        this.caption("Forge", line, true); this.transcript("Forge", line); await this.speak(line);
-      }
-    } finally {
-      this.room?.cast({ k: "agent-end" });
-      useStore.setState({ thinking: false, thinkingTrace: [] });
-      this.hideCaption(); this.setListening();
-      this.agentBusy = false;
-    }
-  }
-
   private async playStep(step: AgentStep, broadcast = false): Promise<void> {
     if (broadcast) this.room?.cast({ k: "step", say: step.say, ops: step.ops });
     if (step.ops?.length) {
@@ -665,7 +612,7 @@ export class ForgeSession {
         useStore.setState({ codePanelHighlight: { start: ev.startLine, end: ev.endLine } });
         break;
       case "code-panel-open":
-        useStore.setState({ codePanelOpen: true, codePanelFile: ev.file, codePanelGithubUrl: ev.githubUrl ?? null });
+        void this.loadCodePanel(ev.file, ev.startLine, ev.endLine, ev.githubUrl);
         break;
     }
   }
@@ -822,7 +769,16 @@ export class ForgeSession {
   }
 
   attachBoard(canvas: HTMLCanvasElement): Whiteboard {
-    if (!this.wb || this.wb.canvas !== canvas) this.wb = new Whiteboard(canvas);
+    if (!this.wb || this.wb.canvas !== canvas) {
+      this.wb = new Whiteboard(canvas);
+      // A peer can finish its room sync before React mounts this canvas.
+      // Replaying the saved state makes that timing harmless.
+      if (this.boardOps.length) {
+        this.wb.enqueue(this.boardOps);
+        this.wb.finishNow();
+        for (const move of this.boardMoves) this.wb.moveItem(move.id, move.dx, move.dy);
+      }
+    }
     return this.wb;
   }
 
@@ -903,11 +859,36 @@ export class ForgeSession {
             ? { start: attr.startLine, end: attr.endLine ?? attr.startLine }
             : null,
         });
-        this.room?.cast({ k: "code-panel-open", file: data.path, githubUrl: data.githubUrl });
+        this.room?.cast({
+          k: "code-panel-open",
+          file: data.path,
+          startLine: data.startLine,
+          endLine: attr.endLine,
+          githubUrl: data.githubUrl,
+        });
         // kick off the live walkthrough now that the panel is open
         void this.runWalkthrough(nodeLabel, attr);
       })
       .catch(() => { /* silently ignore missing file endpoint */ });
+  }
+
+  private async loadCodePanel(file: string, startLine?: number, endLine?: number, githubUrl?: string): Promise<void> {
+    const params = new URLSearchParams({ path: file });
+    if (startLine != null) params.set("start", String(startLine));
+    if (endLine != null) params.set("end", String(endLine));
+    try {
+      const res = await apiFetch(`${API}/api/repo/file?${params}`);
+      if (!res.ok) return;
+      const data = (await res.json()) as { path: string; startLine: number; lines: string[]; githubUrl?: string };
+      useStore.setState({
+        codePanelOpen: true,
+        codePanelFile: data.path,
+        codePanelLines: data.lines,
+        codePanelStartLine: data.startLine,
+        codePanelGithubUrl: data.githubUrl ?? githubUrl ?? null,
+        codePanelHighlight: startLine != null ? { start: startLine, end: endLine ?? startLine } : null,
+      });
+    } catch { /* remote code view is best-effort */ }
   }
 
   async runWalkthrough(nodeLabel: string, attr: { file: string; startLine?: number; endLine?: number }): Promise<void> {
