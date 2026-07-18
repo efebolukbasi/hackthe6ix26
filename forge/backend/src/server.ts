@@ -7,7 +7,7 @@ import { timingSafeEqual } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { execFile, execFileSync, spawn } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
 import { buildDigest } from "./lib/repo.ts";
 import { respond, listen, setRepoContext, getRepoCwd, walkthrough } from "./lib/agent.ts";
@@ -165,60 +165,6 @@ app.post("/api/tts", async (req: Request, res: Response) => {
     const message = err instanceof Error ? err.message : String(err);
     res.status(status).json({ error: message });
   }
-});
-
-app.post("/api/agent/code", (req: Request, res: Response) => {
-  const body = req.body as { task?: string } | undefined;
-  const task = String(body?.task || "").trim();
-  if (!task) return res.status(400).json({ error: "no task" });
-  const cwd = getRepoCwd();
-  if (!cwd) return res.status(400).json({ error: "no repo loaded" });
-
-  res.writeHead(200, { "Content-Type": "application/x-ndjson; charset=utf-8", "Cache-Control": "no-cache" });
-  const send = (obj: Record<string, unknown>): void => { if (!res.writableEnded) res.write(JSON.stringify(obj) + "\n"); };
-
-  const systemPrompt = "You are Forge, an AI engineer. Make focused, safe code changes to accomplish the task. After changes, report which files you touched. Never run destructive shell commands.";
-  const child = spawn(
-    "claude",
-    ["-p", "--model", process.env.FORGE_MODEL || "sonnet",
-      "--max-turns", "12",
-      "--allowedTools", "Read,Grep,Glob,Edit,Write,Bash",
-      "--output-format", "stream-json",
-      "--include-partial-messages",
-      "--verbose"],
-    { cwd, env: { ...process.env }, stdio: ["pipe", "pipe", "pipe"] }
-  );
-  child.stdin!.write(`${systemPrompt}\n\nTask: ${task}`);
-  child.stdin!.end();
-
-  let lineBuf = "";
-  child.stdout!.on("data", (d: Buffer) => {
-    lineBuf += d.toString();
-    const lines = lineBuf.split("\n"); lineBuf = lines.pop() ?? "";
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      try {
-        const msg = JSON.parse(line) as Record<string, unknown>;
-        if (msg.type === "stream_event") {
-          const ev = msg.event as Record<string, unknown> | undefined;
-          if (ev?.type === "content_block_delta") {
-            const delta = ev.delta as Record<string, unknown> | undefined;
-            if (delta?.type === "text_delta") send({ type: "progress", text: delta.text });
-          } else if (ev?.type === "content_block_start") {
-            const cb = ev.content_block as Record<string, unknown> | undefined;
-            if (cb?.type === "tool_use") send({ type: "tool", name: cb.name, input: JSON.stringify(cb.input || {}) });
-          }
-        } else if (msg.type === "result") {
-          send({ type: "done", summary: String(msg.result || "").slice(0, 1000) });
-        }
-      } catch { /* non-JSON */ }
-    }
-  });
-  child.on("close", (code) => {
-    if (!res.writableEnded) { send({ type: "done", summary: `Process exited (${code})` }); res.end(); }
-  });
-  child.on("error", (err: Error) => { send({ type: "error", message: err.message }); res.end(); });
-  res.on("close", () => child.kill("SIGKILL"));
 });
 
 app.get("/api/repo/file", (req: Request, res: Response) => {
