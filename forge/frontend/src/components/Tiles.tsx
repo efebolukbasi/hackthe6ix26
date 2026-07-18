@@ -9,13 +9,14 @@ export default function Tiles() {
   const youTalking = useStore((s) => s.youTalking);
   const camOff = useStore((s) => s.camOff);
   const orbSpeaking = useStore((s) => s.orbSpeaking);
-  const thinking = useStore((s) => s.thinking);
+  const stage = useStore((s) => s.stage);
   const handRaised = useStore((s) => s.handRaised);
   const agentStatus = useStore((s) => s.agentStatus);
   const remoteName = useStore((s) => s.remoteName);
   const remoteStream = useStore((s) => s.remoteStream);
   const myName = useStore((s) => s.myName);
   const listeningActive = useStore((s) => s.listeningActive);
+  const thinkingTrace = useStore((s) => s.thinkingTrace);
 
   useEffect(() => {
     if (streamReady && videoRef.current) videoRef.current.srcObject = session.stream;
@@ -25,10 +26,13 @@ export default function Tiles() {
     if (peerRef.current && remoteStream) peerRef.current.srcObject = remoteStream;
   }, [remoteStream]);
 
+  const working = stage === "working";
+  const handVisible = handRaised || stage === "ready";
+  const activity = working && thinkingTrace.length > 0 ? thinkingTrace[thinkingTrace.length - 1] : "";
   const orbClass = [
     "orb-wrap",
-    thinking ? "working" : "",
-    listeningActive && !thinking && !orbSpeaking && !handRaised ? "listening" : "",
+    working ? "working" : "",
+    listeningActive && stage === "listening" && !orbSpeaking ? "listening" : "",
     orbSpeaking ? "speaking" : "",
   ].filter(Boolean).join(" ");
 
@@ -50,13 +54,18 @@ export default function Tiles() {
           <span className="halo h1" /><span className="halo h2" />
           <div className={"orb" + (orbSpeaking ? " speaking" : "")} id="orb" />
         </div>
-        <div className={"thinking" + (thinking ? "" : " hidden")} id="thinking"><span /><span /><span /></div>
-        <button className={"hand" + (handRaised ? "" : " hidden")} id="hand" title="Let Forge speak" onClick={() => session.handClick()}>
+        <div className={"thinking" + (working ? "" : " hidden")} id="thinking"><span /><span /><span /></div>
+        <button className={"hand" + (handVisible ? "" : " hidden")} id="hand" title="Let Forge speak" onClick={() => session.handClick()}>
           <span className="hand-emoji">✋</span>
-          <span className="hand-label">Forge has a thought — <strong>invite</strong></span>
+          <span className="hand-label">
+            {stage === "ready"
+              ? <>Forge is ready — <strong>go ahead</strong></>
+              : <>Forge has a thought — <strong>invite</strong></>}
+          </span>
         </button>
         <div className="nametag">Forge · AI Engineer</div>
         <div className="agent-status" id="agentstatus"><span className="status-dot" />{agentStatus}</div>
+        {activity && <div className="agent-activity" title={activity}>{activity}</div>}
       </div>
     </div>
   );

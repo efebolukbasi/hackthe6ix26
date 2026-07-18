@@ -271,6 +271,16 @@ button:active { transform: scale(0.96); }
 }
 .status-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--ember); box-shadow: 0 0 8px var(--ember); }
 
+/* live tool-call line shown on the agent tile while Forge works */
+.agent-activity {
+  position: absolute; right: 12px; bottom: 12px; z-index: 2; max-width: 58%;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10.5px; color: var(--bone); opacity: 0.85;
+  background: rgba(10, 10, 9, 0.55); backdrop-filter: blur(10px);
+  border: 1px solid var(--stroke-soft); padding: 4px 10px; border-radius: 999px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
 /* agent tile + orb: obsidian glass with an ember heart */
 .tile.agent {
   display: flex; align-items: center; justify-content: center;

@@ -6,7 +6,7 @@ import RepoPicker from "./RepoPicker";
 export default function SidePanel() {
   const panelOpen = useStore((s) => s.panelOpen);
   const transcript = useStore((s) => s.transcript);
-  const thinking = useStore((s) => s.thinking);
+  const stage = useStore((s) => s.stage);
   const thinkingTrace = useStore((s) => s.thinkingTrace);
   const [text, setText] = useState("");
   const msgsRef = useRef<HTMLDivElement>(null);
@@ -36,9 +36,9 @@ export default function SidePanel() {
           <button key={q} onClick={() => session.ask(q)}>{q}</button>
         ))}
       </div>
-      {thinking && thinkingTrace.length > 0 && (
+      {(stage === "working" || stage === "ready") && thinkingTrace.length > 0 && (
         <div className="trace-panel">
-          <div className="trace-header">Forge is checking…</div>
+          <div className="trace-header">{stage === "ready" ? "Forge is ready to answer" : "Forge is checking…"}</div>
           {thinkingTrace.map((line, i) => (
             <div key={i} className="trace-line">{line}</div>
           ))}

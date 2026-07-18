@@ -7,7 +7,7 @@
 import { Whiteboard } from "./whiteboard";
 import { RoomLink, type CastEvent, type StageSync } from "./rtc";
 import { API, apiFetch } from "../config";
-import { useStore } from "../state/store";
+import { useStore, type ForgeStage } from "../state/store";
 import type {
   AgentStep,
   Health,
@@ -18,6 +18,9 @@ import type {
 } from "../types";
 
 const delay = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+const normalizeSpeech = (s: string): string =>
+  s.toLowerCase().replace(/[^a-z0-9' ]+/g, " ").replace(/\s+/g, " ").trim();
 
 // Direct-address detection: Forge speaks only when spoken TO — its name at
 // the start of the utterance (optionally after a lead-in like "hey"), or as a
@@ -110,6 +113,15 @@ export class ForgeSession {
   private stage: { file: string; startLine?: number; endLine?: number } | null = null;
   private stageKey: string | null = null;
 
+  // Self-echo filter state: what Forge itself said recently, plus a short
+  // window after TTS ends during which Chrome is still finalizing audio it
+  // heard while Forge was talking.
+  private recentForgeLines: Array<{ text: string; expires: number }> = [];
+  private ttsTailUntil = 0;
+
+  // Resolves the "ready" pause early when someone invites Forge to speak.
+  private readyRelease: (() => void) | null = null;
+
   constructor() {
     // Demo/debug hook: feed an utterance as if it were heard through the mic
     // (handy in loud demo halls: window.forge.hear("we should use redis for this")).
@@ -137,16 +149,69 @@ export class ForgeSession {
     useStore.setState((s) => ({ transcript: [...s.transcript, { who, text }] }));
   }
 
-  private setStatus(t: string): void {
-    useStore.setState({ agentStatus: t });
+  /** Single place every stage transition goes through, so the visible status
+   * can never disagree with what Forge is actually doing. */
+  private setStage(stage: ForgeStage, detail = ""): void {
+    const labels: Record<ForgeStage, string> = {
+      listening: "listening",
+      working: "working on it…",
+      ready: "✋ ready to answer",
+      presenting: "presenting",
+      speaking: "speaking",
+      hand: "✋ has a thought",
+    };
+    useStore.setState({ stage, agentStatus: detail || labels[stage] });
   }
 
   /** Transition Forge to the "listening" state and play a soft listening chime. */
   private setListening(): void {
-    this.setStatus("listening");
+    this.setStage("listening");
     const wasActive = useStore.getState().listeningActive;
     useStore.setState({ listeningActive: true });
     if (!wasActive) this.listeningChime();
+  }
+
+  /** Append a line to the visible working trace and mirror it to the peer,
+   * so both participants can watch what Forge is doing while it works. */
+  private traceLine(line: string, cast = true): void {
+    useStore.setState((s) => ({ thinkingTrace: [...s.thinkingTrace.slice(-11), line] }));
+    if (cast) this.room?.cast({ k: "trace", line });
+  }
+
+  // ---------- self-echo filter ----------
+  // Speech recognition stays on while Forge talks (for barge-in), and Chrome
+  // often finalizes the tail of Forge's own TTS seconds AFTER playback ends.
+  // Without this filter that tail gets logged as if a human in the call said it.
+
+  private noteForgeLine(text: string): void {
+    const now = Date.now();
+    this.recentForgeLines = this.recentForgeLines.filter((l) => l.expires > now);
+    const norm = normalizeSpeech(text);
+    if (norm) this.recentForgeLines.push({ text: norm, expires: now + 30_000 });
+  }
+
+  private inTtsTail(): boolean {
+    return this.ttsSpeaking || Date.now() < this.ttsTailUntil;
+  }
+
+  private isSelfEcho(raw: string): boolean {
+    const heard = normalizeSpeech(raw);
+    if (!heard) return false;
+    const tokens = heard.split(" ");
+    const now = Date.now();
+    for (const line of this.recentForgeLines) {
+      if (line.expires <= now) continue;
+      // Verbatim fragment of something Forge just said.
+      if ((tokens.length >= 3 || this.inTtsTail()) && line.text.includes(heard)) return true;
+      // Fuzzy: most of the heard words came out of Forge's own mouth.
+      if (tokens.length >= 4) {
+        const lineTokens = new Set(line.text.split(" "));
+        let overlap = 0;
+        for (const t of tokens) if (lineTokens.has(t)) overlap++;
+        if (overlap / tokens.length >= 0.7) return true;
+      }
+    }
+    return false;
   }
 
   // ---------- voice output: ElevenLabs first, browser TTS fallback ----------
@@ -186,9 +251,28 @@ export class ForgeSession {
     const abortCtrl = new AbortController();
     this.currentTtsAbort = abortCtrl;
     return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(watchdog);
+        resolve();
+      };
+      const fail = (err: unknown) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(watchdog);
+        if (abortCtrl.signal.aborted) resolve();
+        else reject(err instanceof Error ? err : new Error(String(err)));
+      };
+      // Every Forge line on every client sits behind the speech chain — if this
+      // promise never settles (blocked autoplay, stalled stream), that client
+      // goes permanently silent while the other participant keeps hearing
+      // Forge fine. The watchdog guarantees the chain always moves on.
+      const watchdog = setTimeout(finish, Math.max(15_000, text.split(/\s+/).length * 700 + 8_000));
       ms.addEventListener("sourceopen", async () => {
         let sb: SourceBuffer;
-        try { sb = ms.addSourceBuffer("audio/mpeg"); } catch { resolve(); return; }
+        try { sb = ms.addSourceBuffer("audio/mpeg"); } catch { finish(); return; }
         const queue: ArrayBuffer[] = [];
         let appending = false;
         const drain = () => {
@@ -205,7 +289,9 @@ export class ForgeSession {
           });
           if (!res.ok) throw new Error(`tts/stream ${res.status}`);
           const reader = res.body!.getReader();
-          a.play().catch(() => {});
+          // A blocked play() means nobody would ever hear this line — fail
+          // fast so the caller falls back to browser TTS instead of silence.
+          a.play().catch((err) => fail(err));
           for (;;) {
             const { done, value } = await reader.read();
             if (done) break;
@@ -214,19 +300,18 @@ export class ForgeSession {
           }
           // Wait for buffer to drain then end stream
           await new Promise<void>(r => {
-            const check = () => { if (!sb.updating && !queue.length) r(); else setTimeout(check, 50); };
+            const check = () => { if (settled || (!sb.updating && !queue.length)) r(); else setTimeout(check, 50); };
             check();
           });
-          if (ms.readyState === "open") ms.endOfStream();
+          if (!settled && ms.readyState === "open") ms.endOfStream();
         } catch (err) {
-          if (!abortCtrl.signal.aborted) reject(err);
-          else resolve();
+          fail(err);
           return;
         }
-        a.addEventListener("ended", () => resolve(), { once: true });
-        a.addEventListener("error", () => resolve(), { once: true });
+        a.addEventListener("ended", finish, { once: true });
+        a.addEventListener("error", finish, { once: true });
       });
-      a.addEventListener("error", () => resolve(), { once: true });
+      a.addEventListener("error", finish, { once: true });
     }).finally(() => {
       URL.revokeObjectURL(url);
       this.currentAudio = null;
@@ -246,6 +331,7 @@ export class ForgeSession {
 
   private async speakNow(text: string): Promise<void> {
     if (this.cancelled && this.agentBusy) return; // skip queued lines after a barge-in
+    this.noteForgeLine(text); // remember it BEFORE the mic can hear it
     this.ttsSpeaking = true;
     useStore.setState({ orbSpeaking: true, listeningActive: false });
     try {
@@ -255,6 +341,7 @@ export class ForgeSession {
       if (!this.cancelled) await this.browserSpeak(text);
     }
     this.ttsSpeaking = false;
+    this.ttsTailUntil = Date.now() + 2_000;
     useStore.setState({ orbSpeaking: false });
     setTimeout(() => this.startRecog(), 300);
   }
@@ -279,12 +366,14 @@ export class ForgeSession {
         if (res.isFinal) {
           const text = res[0].transcript.trim();
           // Keep recognition alive while Forge speaks so a participant can
-          // barge in. During TTS, only explicit control phrases are accepted
-          // to avoid treating Forge's own narration as meeting speech.
-          if (text && (!this.ttsSpeaking || isAddressed(text) || STOP.test(text))) {
+          // barge in. During TTS — and the tail window right after, while
+          // Chrome finalizes what it heard during playback — only explicit
+          // control phrases are accepted, to avoid treating Forge's own
+          // narration as meeting speech.
+          if (text && (!this.inTtsTail() || isAddressed(text) || STOP.test(text))) {
             this.handleUtterance(text, "voice");
           }
-        } else if (!this.ttsSpeaking) {
+        } else if (!this.inTtsTail()) {
           this.caption("You", res[0].transcript);
         }
       }
@@ -309,7 +398,7 @@ export class ForgeSession {
     if (this.handRaised || this.agentBusy) return;
     this.handReason = reason;
     useStore.setState({ handRaised: true });
-    this.setStatus("✋ has a thought");
+    this.setStage("hand");
     this.chime(0.4);
     this.room?.cast({ k: "hand", raised: true, reason });
     clearTimeout(this.handTimer);
@@ -347,19 +436,56 @@ export class ForgeSession {
   }
 
   // ---------- the agent ----------
+  /** The ack line every run opens with — receipt is never in doubt. */
+  private ackFor(invited: boolean): string {
+    if (invited) return "Sure — give me a moment to pull this together.";
+    const acks = [
+      "Got it — let me dig in.",
+      "On it — one moment.",
+      "Good question — let me check the repo.",
+    ];
+    return acks[Math.floor(Math.random() * acks.length)];
+  }
+
+  /** The beat between "ready" and speaking: a short pause, extended while the
+   * local mic hears someone talking, released early by an invite or cancel. */
+  private readyPause(): Promise<void> {
+    return new Promise((resolve) => {
+      const started = Date.now();
+      let released = false;
+      this.readyRelease = () => { released = true; };
+      const tick = () => {
+        const elapsed = Date.now() - started;
+        const someoneTalking = useStore.getState().youTalking;
+        if (this.cancelled || released || elapsed >= 8_000 || (elapsed >= 900 && !someoneTalking)) {
+          this.readyRelease = null;
+          resolve();
+          return;
+        }
+        setTimeout(tick, 120);
+      };
+      setTimeout(tick, 120);
+    });
+  }
+
+  private releaseReady(): void {
+    this.readyRelease?.();
+  }
+
   private async runAgent({ question = "", invited = false, reason = "", interrupted = false }: { question?: string; invited?: boolean; reason?: string; interrupted?: boolean }): Promise<void> {
     if (this.agentBusy || this.remoteAgentActive) return;
     this.agentBusy = true;
     this.cancelled = false;
     this.lowerHand();
-    this.room?.cast({ k: "agent-start" });
-    this.setStatus("thinking…");
-    useStore.setState({ thinking: true, listeningActive: false });
+    useStore.setState({ listeningActive: false, thinkingTrace: [] });
+    // Stage 1 — acknowledge receipt. The ack rides the agent-start cast so
+    // BOTH participants hear the same acknowledgment, not just the asker.
+    const ackMsg = this.ackFor(invited);
+    this.room?.cast({ k: "agent-start", ack: ackMsg });
+    this.setStage("working");
     this.agentAbort = new AbortController();
 
     try {
-      // Fire-and-forget ack so the user knows we heard them, then think silently.
-      const ackMsg = "Let me look into that.";
       this.caption("Forge", ackMsg, true);
       this.transcript("Forge", ackMsg);
       void this.speak(ackMsg);
@@ -395,9 +521,10 @@ export class ForgeSession {
           try { msg = JSON.parse(line) as StreamMsg; } catch { continue; }
           if (msg.type === "tool") {
             const t = msg as { type: "tool"; name: string; input: string };
-            useStore.setState((s) => ({ thinkingTrace: [...s.thinkingTrace, `\uD83D\uDD0D ${t.name}: ${t.input.slice(0, 60)}`] }));
+            this.traceLine(`\uD83D\uDD0D ${t.name}: ${t.input.slice(0, 80)}`);
           } else if (msg.type === "step") {
-            useStore.setState({ thinking: false });
+            // A parsed step is not a finished answer \u2014 steps are buffered and
+            // played after "done", so the stage stays "working" until then.
             preparedSteps.push(msg);
           } else if (msg.type === "done") {
             break outer;
@@ -413,7 +540,15 @@ export class ForgeSession {
       // Play whatever arrived — even if the stream died before its "done"
       // marker, the steps we already parsed are still worth presenting.
       if (preparedSteps.length > 0) {
-        useStore.setState({ thinking: false, thinkingTrace: [] });
+        if (!this.cancelled) {
+          // Stage 3 — ready: raise the hand, chime, and wait for a polite
+          // gap (or an explicit "go ahead") before taking the floor.
+          this.setStage("ready");
+          this.chime(0.5);
+          this.room?.cast({ k: "agent-ready" });
+          await this.readyPause();
+        }
+        useStore.setState({ thinkingTrace: [] });
         for (const step of preparedSteps) {
           if (this.cancelled) break;
           await this.playStep(step, true);
@@ -433,10 +568,11 @@ export class ForgeSession {
       }
     } finally {
       this.room?.cast({ k: "agent-end" });
-      useStore.setState({ thinking: false, thinkingTrace: [] });
+      useStore.setState({ thinkingTrace: [] });
       this.hideCaption();
-      this.setListening();
       this.agentBusy = false;
+      this.readyRelease = null;
+      this.setListening();
       this.agentAbort = null;
       this.buffer = [];
       const next = this.pendingInterrupt;
@@ -461,7 +597,7 @@ export class ForgeSession {
     }
     this.caption("Forge", step.say, true);
     this.transcript("Forge", step.say);
-    this.setStatus(step.ops?.length ? "presenting" : "speaking");
+    this.setStage(step.ops?.length ? "presenting" : "speaking");
     await Promise.all([this.speak(step.say), this.waitBoardIdle()]);
     if (this.cancelled) { this.wb?.finishNow(); return; }
     await delay(320);
@@ -519,6 +655,9 @@ export class ForgeSession {
 
   // ---------- utterance routing ----------
   handleUtterance(text: string, source: UtteranceSource): void {
+    // Forge hearing itself must never enter the meeting record as a human
+    // utterance. STOP is exempt so "stop talking" always works, even mid-echo.
+    if (source === "voice" && !STOP.test(text) && this.isSelfEcho(text)) return;
     this.transcript(this.myName, text);
     this.room?.cast({ k: "utter", who: this.myName, text });
 
@@ -543,8 +682,8 @@ export class ForgeSession {
     }
 
     // Check INVITE *before* direct address — "Forge, go ahead" invites rather than re-asks.
-    if (this.handRaised && INVITE.test(text)) {
-      void this.runAgent({ invited: true, reason: this.handReason });
+    if (INVITE.test(text) && (this.handRaised || useStore.getState().stage === "ready")) {
+      this.acceptInvite();
       return;
     }
 
@@ -588,22 +727,45 @@ export class ForgeSession {
       case "agent-start":
         this.remoteAgentActive = true;
         this.cancelled = false;
-        useStore.setState({ handRaised: false, thinking: true, listeningActive: false });
-        this.setStatus("thinking\u2026");
+        useStore.setState({ handRaised: false, listeningActive: false, thinkingTrace: [] });
+        this.setStage("working");
+        // Both participants hear the same acknowledgment.
+        if (ev.ack) {
+          this.caption("Forge", ev.ack, true);
+          this.transcript("Forge", ev.ack);
+          void this.speak(ev.ack);
+        }
+        break;
+      case "trace":
+        // Mirror of the driver's working trace, so this side also sees what
+        // Forge is doing while it prepares an answer.
+        useStore.setState((s) => ({ thinkingTrace: [...s.thinkingTrace.slice(-11), ev.line] }));
+        break;
+      case "agent-ready":
+        this.setStage("ready");
+        this.chime(0.5);
+        break;
+      case "invite":
+        // Peer said "go ahead" while OUR prepared answer was holding the floor.
+        if (this.agentBusy) this.releaseReady();
         break;
       case "step":
-        useStore.setState({ thinking: false });
-        // Skip queued steps if the run got cancelled while earlier ones played.
-        this.remoteChain = this.remoteChain.then(() =>
-          this.cancelled ? undefined : this.playStep({ type: "step", say: ev.say, ops: ev.ops })
-        );
+        useStore.setState({ thinkingTrace: [] });
+        // Skip queued steps if the run got cancelled while earlier ones
+        // played. The catch keeps one bad step from wedging the chain (and
+        // with it every future step, caption, and spoken line on this side).
+        this.remoteChain = this.remoteChain
+          .then(() => (this.cancelled ? undefined : this.playStep({ type: "step", say: ev.say, ops: ev.ops })))
+          .catch(() => {});
         break;
       case "agent-end":
-        this.remoteChain = this.remoteChain.then(() => {
-          this.remoteAgentActive = false;
-          this.hideCaption();
-          this.setListening();
-        });
+        this.remoteChain = this.remoteChain
+          .then(() => {
+            this.remoteAgentActive = false;
+            this.hideCaption();
+            this.setListening();
+          })
+          .catch(() => {});
         break;
       case "cancel":
         this.remoteAgentActive = false;
@@ -623,7 +785,7 @@ export class ForgeSession {
       case "hand":
         this.handReason = ev.reason;
         useStore.setState({ handRaised: ev.raised });
-        if (ev.raised) this.setStatus("\u270B has a thought");
+        if (ev.raised) this.setStage("hand");
         else if (!this.agentBusy && !this.remoteAgentActive) this.setListening();
         break;
       case "board-edit":
@@ -860,8 +1022,16 @@ export class ForgeSession {
     useStore.setState({ panelOpen: false });
   }
 
+  /** "Go ahead" — start a raised-hand run, or release a prepared answer
+   * (our own directly, a peer's via the invite cast). */
+  private acceptInvite(): void {
+    if (this.agentBusy) { this.releaseReady(); return; }
+    if (this.remoteAgentActive) { this.room?.cast({ k: "invite" }); return; }
+    void this.runAgent({ invited: true, reason: this.handReason });
+  }
+
   handClick(): void {
-    if (!this.agentBusy) void this.runAgent({ invited: true, reason: this.handReason });
+    this.acceptInvite();
   }
 
   ask(text: string): void {
@@ -993,6 +1163,13 @@ export class ForgeSession {
 
   async runWalkthrough(nodeLabel: string, attr: { file: string; startLine?: number; endLine?: number }): Promise<void> {
     const board = this.wb ? this.wb.summary() : { title: null, nodes: [], arrows: [] };
+    // A walkthrough is agent work too — show the working stage and tool
+    // activity instead of silently sitting in "listening" while Claude reads.
+    const wasIdle = !this.agentBusy && !this.remoteAgentActive;
+    if (wasIdle) {
+      useStore.setState({ thinkingTrace: [] });
+      this.setStage("working");
+    }
     try {
       const res = await apiFetch(`${API}/api/agent/walkthrough`, {
         method: "POST",
@@ -1018,8 +1195,11 @@ export class ForgeSession {
         for (const line of lines) {
           if (!line.trim()) continue;
           try {
-            const msg = JSON.parse(line) as { type: string; say?: string; ops?: AgentStep["ops"]; file?: string; startLine?: number; endLine?: number };
-            if (msg.type === "step") {
+            const msg = JSON.parse(line) as { type: string; say?: string; ops?: AgentStep["ops"]; file?: string; startLine?: number; endLine?: number; name?: string; input?: string };
+            if (msg.type === "tool") {
+              this.traceLine(`🔍 ${msg.name ?? "tool"}: ${(msg.input ?? "").slice(0, 80)}`);
+            } else if (msg.type === "step") {
+              useStore.setState({ thinkingTrace: [] });
               await this.playStep({ type: "step", say: msg.say ?? "", ops: msg.ops }, true);
             } else if (msg.type === "focus") {
               const hl = { start: msg.startLine ?? 1, end: msg.endLine ?? msg.startLine ?? 1 };
@@ -1029,7 +1209,12 @@ export class ForgeSession {
           } catch { /* ignore parse errors */ }
         }
       }
-    } catch { /* silently fail — walkthrough is best-effort */ }
+    } catch { /* silently fail — walkthrough is best-effort */ } finally {
+      if (wasIdle && !this.agentBusy && !this.remoteAgentActive) {
+        useStore.setState({ thinkingTrace: [] });
+        this.setListening();
+      }
+    }
   }
 
   end(): void {

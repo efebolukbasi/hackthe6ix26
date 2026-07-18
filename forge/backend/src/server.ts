@@ -5,7 +5,7 @@ import type { Request, Response } from "express";
 import cors from "cors";
 import { timingSafeEqual } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
-import { dirname, join, relative, resolve } from "node:path";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
@@ -206,7 +206,28 @@ app.post("/api/agent/walkthrough", (req: Request, res: Response) =>
 // back to the legacy static ../frontend otherwise.
 const distDir = join(__dirname, "..", "..", "frontend", "dist");
 const staticDir = existsSync(distDir) ? distDir : join(__dirname, "..", "..", "frontend");
-app.use(express.static(staticDir));
+// Hashed assets are immutable; index.html must always revalidate. Without
+// this, a browser keeps a cached index.html across a redeploy and requests
+// asset hashes that no longer exist on the server.
+app.use(express.static(staticDir, {
+  index: false,
+  setHeaders: (res, filePath) => {
+    if (filePath.includes(`${sep}assets${sep}`)) res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+    else res.setHeader("Cache-Control", "no-cache");
+  },
+}));
+// A missing hashed asset must be a plain-text 404 — Express's default HTML
+// 404 page (or an SPA fallback) would hand the browser text/html for a
+// .css/.js request, which strict MIME checking refuses to apply.
+app.get("/assets/*", (_req: Request, res: Response) => {
+  res.status(404).type("text/plain").send("asset not found — reload the page to pick up the latest build");
+});
+// SPA fallback for every non-API route (deep links, stale tabs).
+app.get("*", (req: Request, res: Response, next: () => void) => {
+  if (req.path.startsWith("/api") || req.path.startsWith("/ws")) return next();
+  res.setHeader("Cache-Control", "no-cache");
+  res.sendFile(join(staticDir, "index.html"));
+});
 
 const httpServer = app.listen(PORT, async () => {
   console.log(`forge backend → http://localhost:${PORT}`);

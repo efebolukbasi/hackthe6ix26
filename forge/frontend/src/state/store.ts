@@ -3,6 +3,12 @@ import type { Health, TranscriptLine } from "../types";
 
 export type Phase = "landing" | "prejoin" | "room" | "ended";
 
+/** Forge's meeting stage — the single source of truth for what Forge is doing.
+ *  listening → (question) working → ready → presenting/speaking → listening.
+ *  "hand" is the passive raise ("I have a thought"); "ready" is a prepared
+ *  answer waiting for a polite moment to start. */
+export type ForgeStage = "listening" | "working" | "ready" | "presenting" | "speaking" | "hand";
+
 export interface Caption {
   speaker: string;
   text: string;
@@ -16,12 +22,12 @@ export interface BackendPill {
 
 export interface ForgeState {
   phase: Phase;
+  stage: ForgeStage;
   agentStatus: string;
   caption: Caption;
   transcript: TranscriptLine[];
   handRaised: boolean;
   presenting: boolean;
-  thinking: boolean;
   orbSpeaking: boolean;
   youTalking: boolean;
   listeningActive: boolean;
@@ -53,12 +59,12 @@ export interface ForgeState {
 
 export const useStore = create<ForgeState>()(() => ({
   phase: "landing",
+  stage: "listening",
   agentStatus: "listening",
   caption: { speaker: "", text: "", visible: false },
   transcript: [],
   handRaised: false,
   presenting: false,
-  thinking: false,
   orbSpeaking: false,
   youTalking: false,
   listeningActive: false,

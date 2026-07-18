@@ -16,7 +16,10 @@ export interface StageSync {
 
 export type CastEvent =
   | { k: "utter"; who: string; text: string }
-  | { k: "agent-start" }
+  | { k: "agent-start"; ack?: string }
+  | { k: "trace"; line: string }
+  | { k: "agent-ready" }
+  | { k: "invite" }
   | { k: "step"; say: string; ops?: WhiteboardOp[] }
   | { k: "agent-end" }
   | { k: "cancel" }
