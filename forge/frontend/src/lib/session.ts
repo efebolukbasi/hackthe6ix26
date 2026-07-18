@@ -123,9 +123,14 @@ export class ForgeSession {
   private readyRelease: (() => void) | null = null;
 
   constructor() {
-    // Demo/debug hook: feed an utterance as if it were heard through the mic
-    // (handy in loud demo halls: window.forge.hear("we should use redis for this")).
-    window.forge = { hear: (text: string) => this.handleUtterance(text, "voice") };
+    // Demo/debug hooks: feed an utterance as if it were heard through the mic
+    // (handy in loud demo halls: window.forge.hear("we should use redis for
+    // this")), and draw a sample board with no backend (window.forge.demo()).
+    window.forge = {
+      hear: (text: string) => this.handleUtterance(text, "voice"),
+      demo: () => this.demoBoard(),
+      board: () => this.wb,
+    };
     speechSynthesis.onvoiceschanged = () => { this.cachedVoice = null; };
   }
 
@@ -1215,6 +1220,30 @@ export class ForgeSession {
         this.setListening();
       }
     }
+  }
+
+  /** Draw a scripted sample board without the backend — exercises every op
+   * type so the renderer can be demoed (and eyeballed) in isolation. */
+  private demoBoard(): void {
+    useStore.setState({ phase: "room", presenting: true });
+    setTimeout(() => {
+      this.wb?.clear();
+      this.wb?.enqueue([
+        { op: "title", text: "How Forge answers a question" },
+        { op: "node", id: "mic", label: "Mic + Speech", sub: "Web Speech API", x: 190, y: 210, color: "#4166d5" },
+        { op: "node", id: "sess", label: "ForgeSession", sub: "frontend/src/lib", x: 480, y: 210, color: "#7c4fd0" },
+        { op: "arrow", from: "mic", to: "sess", label: "utterance" },
+        { op: "node", id: "api", label: "POST /api/agent", sub: "NDJSON stream", x: 800, y: 210, color: "#c2453e" },
+        { op: "arrow", from: "sess", to: "api", label: "question" },
+        { op: "node", id: "claude", label: "Claude agent", sub: "backend brain", x: 1050, y: 400, color: "#e8862c" },
+        { op: "arrow", from: "api", to: "claude" },
+        { op: "node", id: "board", label: "Whiteboard", sub: "canvas renderer", x: 480, y: 490, color: "#279c94" },
+        { op: "arrow", from: "claude", to: "board", label: "ops", bow: 30 },
+        { op: "code", id: "wbcode", x: 300, y: 640, file: "frontend/src/lib/whiteboard.ts", line: 148, text: "export class Whiteboard {\n  readonly camera = new Camera();" },
+        { op: "note", text: "steps buffered until 'done',\nthen played with voice", x: 810, y: 520 },
+        { op: "circle", target: "board" },
+      ]);
+    }, 350);
   }
 
   end(): void {

@@ -190,8 +190,9 @@ declare global {
   interface Window {
     /** Optional backend origin override (split deploys). Empty/unset = same origin. */
     FORGE_API?: string;
-    /** Demo/debug hook: feed an utterance as if it were heard through the mic. */
-    forge?: { hear: (text: string) => void };
+    /** Demo/debug hooks: feed an utterance as if heard through the mic, draw
+     * a sample board without the backend, or grab the live whiteboard. */
+    forge?: { hear: (text: string) => void; demo: () => void; board: () => unknown };
     SpeechRecognition?: SpeechRecognitionCtor;
     webkitSpeechRecognition?: SpeechRecognitionCtor;
   }

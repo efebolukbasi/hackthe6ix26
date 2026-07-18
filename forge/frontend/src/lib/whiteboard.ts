@@ -1,7 +1,11 @@
-// Hand-drawn whiteboard engine. Ops are queued and drawn stroke-by-stroke in
-// real time with a visible pen tip, like a person sketching on a board.
-// Virtual coordinate space is 1200x720, letterboxed into the canvas.
+// Hand-drawn whiteboard engine on an interactive infinite canvas. Ops are
+// queued and drawn stroke-by-stroke in real time with a visible pen tip, like
+// a person sketching on a board, while a smooth camera pans and zooms over an
+// endless dot-grid world. Ops are authored against a 1200x720 "home" region;
+// the camera auto-frames whatever has been drawn (follow mode) until the user
+// takes over with pan/zoom, and a Fit action hands control back.
 
+import { Camera, type Bounds } from "./camera";
 import type {
   ArrowOp,
   BoardArrowSummary,
@@ -17,6 +21,10 @@ const INK = "#28323f";
 const NODE_W = 180, NODE_H = 70;
 const PEN_SPEED = 1050;  // virtual px per second
 const CHAR_SPEED = 26;   // characters per second for type-on text
+const POP_DUR = 0.55;    // settle pulse after an item completes
+const FADE_RATE = 6;     // alpha lerp rate toward fade target
+const HOVER_RATE = 11;   // hover glow ease rate
+const TRAIL_LIFE = 0.42; // pen comet trail lifetime (s)
 
 interface Pt { x: number; y: number }
 
@@ -40,6 +48,8 @@ interface TextStroke {
   align: "left" | "center";
   halo: boolean;
   duration: number;
+  w: number;    // measured full width (for bbox + centering)
+  size: number; // font px size (for bbox height)
 }
 
 type Stroke = PathStroke | TextStroke;
@@ -55,6 +65,10 @@ export interface BoardItem {
   meta?: NodeMeta;
   target?: string;
   offset?: { dx: number; dy: number };
+  bbox?: Bounds;
+  alpha: number;     // animated opacity (fade ops ease instead of snapping)
+  hoverT: number;    // eased 0→1 hover/lift emphasis
+  bornClock: number; // board clock when completed, drives the settle pulse
 }
 
 interface CurrentDraw { item: BoardItem; si: number; prog: number }
@@ -145,8 +159,20 @@ function rectEdgePoint(from: { x: number; y: number }, node: { x: number; y: num
   return { x: node.x - dx * s, y: node.y - dy * s };
 }
 
+function unionBounds(b: Bounds | null, minX: number, minY: number, maxX: number, maxY: number): Bounds {
+  if (!b) return { minX, minY, maxX, maxY };
+  b.minX = Math.min(b.minX, minX);
+  b.minY = Math.min(b.minY, minY);
+  b.maxX = Math.max(b.maxX, maxX);
+  b.maxY = Math.max(b.maxY, maxY);
+  return b;
+}
+
 export class Whiteboard {
   canvas: HTMLCanvasElement;
+  readonly camera = new Camera();
+  /** While true the camera auto-frames the drawing; any user gesture takes over. */
+  follow = true;
   private ctx: CanvasRenderingContext2D;
   private items: BoardItem[] = [];
   private byId: Record<string, BoardItem> = {};
@@ -154,6 +180,12 @@ export class Whiteboard {
   private queue: WhiteboardOp[] = [];
   private current: CurrentDraw | null = null;
   private _seed = 7;
+  private clock = 0;
+  private camReady = false;
+  private hoverId: string | null = null;
+  private liftId: string | null = null;
+  private trail: Array<{ x: number; y: number; t: number }> = [];
+  private mm = { s: 1, ox: 0, oy: 0 };
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
@@ -168,17 +200,22 @@ export class Whiteboard {
     return this.items;
   }
 
-  /** Map canvas pixel coords to virtual 1200×720 space. */
+  /** Map canvas pixel coords to world space through the camera. */
   canvasToVirtual(cx: number, cy: number): { x: number; y: number } {
-    const { s, ox, oy } = this.getScale();
-    return { x: (cx - ox) / s, y: (cy - oy) / s };
+    return this.camera.screenToWorld({ x: cx, y: cy });
   }
 
-  /** Return the scale/offset used by render(). */
-  getScale(): { s: number; ox: number; oy: number } {
-    const cw = this.canvas.clientWidth, ch = this.canvas.clientHeight;
-    const s = Math.min(cw / VW, ch / VH);
-    return { s, ox: (cw - VW * s) / 2, oy: (ch - VH * s) / 2 };
+  setHover(id: string | null): void {
+    this.hoverId = id;
+  }
+
+  /** Mark an item as being dragged (stronger emphasis + cast shadow). */
+  setLift(id: string | null): void {
+    this.liftId = id;
+  }
+
+  setFollow(on: boolean): void {
+    this.follow = on;
   }
 
   /** Hit-test items in reverse paint order (topmost first); returns first item whose meta bbox contains (vx, vy). */
@@ -214,7 +251,11 @@ export class Whiteboard {
     for (const arrow of this.items) {
       if (arrow.type !== "arrow") continue;
       const op = arrow.op as ArrowOp;
-      if (op.from === id || op.to === id) arrow.strokes = this.plan(op).strokes;
+      if (op.from === id || op.to === id) {
+        const fresh = this.plan(op);
+        arrow.strokes = fresh.strokes;
+        arrow.bbox = fresh.bbox;
+      }
     }
   }
 
@@ -253,11 +294,32 @@ export class Whiteboard {
     this.nodes = {};
     this.queue = [];
     this.current = null;
+    this.trail = [];
   }
 
   finishNow(): void {
     let guard = 500;
     while (this.busy && guard-- > 0) this.update(1);
+    // A synchronous replay (late join, barge-in) must not land as a wall of
+    // popping, cross-fading items — settle everything instantly.
+    for (const item of this.items) {
+      item.alpha = item.faded ? 0.26 : 1;
+      item.bornClock = -1e9;
+    }
+    this.trail = [];
+  }
+
+  /** World bounds of everything drawn (plus the item being drawn), or null. */
+  contentBounds(): Bounds | null {
+    let b: Bounds | null = null;
+    const include = (item: BoardItem) => {
+      if (!item.bbox) return;
+      const dx = item.offset?.dx ?? 0, dy = item.offset?.dy ?? 0;
+      b = unionBounds(b, item.bbox.minX + dx, item.bbox.minY + dy, item.bbox.maxX + dx, item.bbox.maxY + dy);
+    };
+    for (const item of this.items) include(item);
+    if (this.current) include(this.current.item);
+    return b;
   }
 
   private _rnd(): () => number {
@@ -270,13 +332,16 @@ export class Whiteboard {
   }
 
   private _textStroke(text: string, x: number, y: number, { font = '21px "Patrick Hand"', color = INK, align = "center", halo = false }: { font?: string; color?: string; align?: "left" | "center"; halo?: boolean } = {}): TextStroke {
-    return { kind: "text", text, x, y, font, color, align, halo, duration: Math.max(0.15, text.length / CHAR_SPEED) };
+    this.ctx.font = font;
+    const w = this.ctx.measureText(text).width;
+    const size = parseFloat(/([\d.]+)px/.exec(font)?.[1] ?? "20");
+    return { kind: "text", text, x, y, font, color, align, halo, w, size, duration: Math.max(0.15, text.length / CHAR_SPEED) };
   }
 
   // --- op → item planner ---
   plan(op: DrawableOp): BoardItem {
     const S: Stroke[] = [];
-    const item: BoardItem = { type: op.op, id: op.id, op, strokes: S, faded: false };
+    const item: BoardItem = { type: op.op, id: op.id, op, strokes: S, faded: false, alpha: 1, hoverT: 0, bornClock: Infinity };
     const ctx = this.ctx;
 
     if (op.op === "title") {
@@ -382,10 +447,24 @@ export class Whiteboard {
       S.push(this._pathStroke(d2, { color: "#d94f46", width: 3.6, amp: 1.8 }));
     }
 
+    // World-space extent of the finished item — drives camera follow, fit,
+    // minimap, and the settle-pulse pivot.
+    let bb: Bounds | null = null;
+    for (const s of S) {
+      if (s.kind === "path") {
+        for (const p of s.pts) bb = unionBounds(bb, p.x, p.y, p.x, p.y);
+      } else {
+        const x0 = s.align === "center" ? s.x - s.w / 2 : s.x;
+        bb = unionBounds(bb, x0, s.y - s.size * 0.62, x0 + s.w, s.y + s.size * 0.62);
+      }
+    }
+    if (bb) item.bbox = bb;
+
     return item;
   }
 
   private _complete(item: BoardItem): void {
+    item.bornClock = this.clock;
     this.items.push(item);
     if (item.id) this.byId[item.id] = item;
     if (item.type === "node" || item.type === "code") this.nodes[item.id as string] = item;
@@ -429,6 +508,40 @@ export class Whiteboard {
     }
   }
 
+  /** Per-frame driver: advances drawing, eased item states, camera, then paints. */
+  frame(dt: number): void {
+    this.clock += dt;
+    this.update(dt);
+
+    for (const item of this.items) {
+      const alphaTarget = item.faded ? 0.26 : 1;
+      item.alpha += (alphaTarget - item.alpha) * Math.min(1, dt * FADE_RATE);
+      const hoverTarget = item.id && (item.id === this.hoverId || item.id === this.liftId) ? 1 : 0;
+      item.hoverT += (hoverTarget - item.hoverT) * Math.min(1, dt * HOVER_RATE);
+    }
+
+    const cw = this.canvas.clientWidth, ch = this.canvas.clientHeight;
+    if (cw && ch) {
+      if (this.follow) this.followContent(cw, ch);
+      if (!this.camReady) { this.camera.snap(); this.camReady = true; }
+      this.camera.update(dt);
+    }
+
+    this.render();
+    const cutoff = this.clock - TRAIL_LIFE;
+    if (this.trail.length && this.trail[0].t < cutoff) this.trail = this.trail.filter((p) => p.t >= cutoff);
+  }
+
+  /** Auto-frame the drawing (never tighter than a comfortable reading size). */
+  private followContent(cw: number, ch: number): void {
+    let b = this.contentBounds();
+    if (!b) b = { minX: 0, minY: 0, maxX: VW, maxY: VH };
+    const minW = 720, minH = 450;
+    const cx = (b.minX + b.maxX) / 2, cy = (b.minY + b.maxY) / 2;
+    const w = Math.max(b.maxX - b.minX, minW), h = Math.max(b.maxY - b.minY, minH);
+    this.camera.fitBounds({ minX: cx - w / 2, minY: cy - h / 2, maxX: cx + w / 2, maxY: cy + h / 2 }, cw, ch, 72, 1.05);
+  }
+
   // --- rendering ---
 
   private _drawPath(ctx: CanvasRenderingContext2D, s: PathStroke, upTo = Infinity): Pt {
@@ -461,8 +574,7 @@ export class Whiteboard {
     ctx.font = s.font;
     ctx.textBaseline = "middle";
     ctx.textAlign = "left";
-    const fullW = ctx.measureText(s.text).width;
-    const startX = s.align === "center" ? s.x - fullW / 2 : s.x;
+    const startX = s.align === "center" ? s.x - s.w / 2 : s.x;
     if (s.halo && text) {
       ctx.strokeStyle = "#fdfcf9";
       ctx.lineWidth = 6;
@@ -475,17 +587,55 @@ export class Whiteboard {
 
   private _drawItem(ctx: CanvasRenderingContext2D, item: BoardItem, partialSi = Infinity, partialProg = 0): Pt | null {
     ctx.save();
+    ctx.globalAlpha = item.alpha;
     if (item.offset) ctx.translate(item.offset.dx, item.offset.dy);
-    if (item.faded) ctx.globalAlpha = 0.26;
+
+    // Settle pulse (fresh items) + hover emphasis, scaled about the item center.
+    const bb = item.bbox;
+    const popT = (this.clock - item.bornClock) / POP_DUR;
+    let scale = 1;
+    if (popT >= 0 && popT < 1) scale *= 1 + 0.045 * Math.sin(popT * Math.PI);
+    if (item.hoverT > 0.001) scale *= 1 + (item.id === this.liftId ? 0.024 : 0.014) * item.hoverT;
+    if (scale !== 1 && bb) {
+      const cx = (bb.minX + bb.maxX) / 2, cy = (bb.minY + bb.maxY) / 2;
+      ctx.translate(cx, cy);
+      ctx.scale(scale, scale);
+      ctx.translate(-cx, -cy);
+    }
+
     const dead = item.type === "node" && item.meta?.dead;
-    // fill for completed, alive nodes
-    if (item.type === "node" && partialSi === Infinity && !dead && item.meta) {
-      const m = item.meta;
-      ctx.fillStyle = hexToRgba(m.color, 0.06);
+    const m = item.meta;
+
+    // Cast shadow while an item is being dragged around.
+    if (m && item.id === this.liftId && item.hoverT > 0.02) {
+      ctx.fillStyle = `rgba(30, 40, 55, ${0.10 * item.hoverT})`;
+      ctx.beginPath();
+      ctx.roundRect(m.x - m.w / 2 - 2, m.y - m.h / 2 + 4, m.w + 4, m.h + 4, 16);
+      ctx.fill();
+    }
+
+    // fill for completed, alive nodes — eases in with the settle pulse,
+    // deepens on hover.
+    if ((item.type === "node" || item.type === "code") && partialSi === Infinity && !dead && m) {
+      const fillIn = Math.min(1, Math.max(0, popT * 2));
+      ctx.fillStyle = hexToRgba(m.color, (0.06 + 0.05 * item.hoverT) * fillIn);
       ctx.beginPath();
       ctx.roundRect(m.x - m.w / 2, m.y - m.h / 2, m.w, m.h, 14);
       ctx.fill();
     }
+
+    // Hover glow: soft ring just outside the card, in the card's own color.
+    if (m && item.hoverT > 0.02 && !dead) {
+      const pad = 5;
+      for (const [lw, a] of [[9, 0.08], [3.5, 0.18]] as const) {
+        ctx.strokeStyle = hexToRgba(m.color, a * item.hoverT);
+        ctx.lineWidth = lw;
+        ctx.beginPath();
+        ctx.roundRect(m.x - m.w / 2 - pad, m.y - m.h / 2 - pad, m.w + pad * 2, m.h + pad * 2, 18);
+        ctx.stroke();
+      }
+    }
+
     let tip: Pt | null = null;
     for (let i = 0; i < item.strokes.length; i++) {
       if (i > partialSi) break;
@@ -503,6 +653,24 @@ export class Whiteboard {
         tip = this._drawText(ctx, painted, chars);
       }
     }
+
+    // Completed arrows carry a slow ember current so flow direction reads at
+    // a glance even on a still board.
+    if (item.type === "arrow" && partialSi === Infinity && item.strokes[0]?.kind === "path") {
+      const main = item.strokes[0];
+      ctx.save();
+      ctx.setLineDash([11, 17]);
+      ctx.lineDashOffset = -((this.clock * 26) % 28);
+      ctx.strokeStyle = "rgba(232, 161, 60, 0.5)";
+      ctx.lineWidth = 2;
+      ctx.lineCap = "round";
+      ctx.beginPath();
+      ctx.moveTo(main.pts[0].x, main.pts[0].y);
+      for (let i = 1; i < main.pts.length; i++) ctx.lineTo(main.pts[i].x, main.pts[i].y);
+      ctx.stroke();
+      ctx.restore();
+    }
+
     ctx.restore();
     return tip;
   }
@@ -519,30 +687,159 @@ export class Whiteboard {
     ctx.setTransform(d, 0, 0, d, 0, 0);
     ctx.fillStyle = "#fdfcf9";
     ctx.fillRect(0, 0, cw, ch);
-    ctx.fillStyle = "rgba(31, 41, 55, 0.055)";
-    for (let gx = 18; gx < cw; gx += 26)
-      for (let gy = 18; gy < ch; gy += 26) ctx.fillRect(gx, gy, 2, 2);
 
-    const s = Math.min(cw / VW, ch / VH);
-    ctx.translate((cw - VW * s) / 2, (ch - VH * s) / 2);
-    ctx.scale(s, s);
+    const cam = this.camera;
+    ctx.save();
+    ctx.scale(cam.z, cam.z);
+    ctx.translate(cam.x, cam.y);
+
+    this.drawGrid(ctx, cw, ch);
 
     for (const item of this.items) this._drawItem(ctx, item);
 
     if (this.current) {
       const cur = this.current;
       const tip = this._drawItem(ctx, cur.item, cur.si, cur.prog);
-      if (tip) {
-        ctx.fillStyle = INK;
-        ctx.beginPath();
-        ctx.arc(tip.x, tip.y, 4.5, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.strokeStyle = "rgba(40, 50, 63, 0.25)";
-        ctx.lineWidth = 6;
-        ctx.beginPath();
-        ctx.arc(tip.x, tip.y, 8, 0, Math.PI * 2);
-        ctx.stroke();
+      const stroke = cur.item.strokes[cur.si];
+      if (tip && stroke?.kind === "path") {
+        const last = this.trail[this.trail.length - 1];
+        if (!last || last.x !== tip.x || last.y !== tip.y) this.trail.push({ x: tip.x, y: tip.y, t: this.clock });
+      }
+      this.drawTrail(ctx);
+      if (tip) this.drawPenTip(ctx, tip);
+    } else {
+      this.drawTrail(ctx);
+    }
+
+    ctx.restore();
+
+    // Soft paper vignette keeps the eye on the drawing.
+    const g = ctx.createRadialGradient(cw / 2, ch / 2, Math.min(cw, ch) * 0.42, cw / 2, ch / 2, Math.max(cw, ch) * 0.78);
+    g.addColorStop(0, "rgba(40, 50, 63, 0)");
+    g.addColorStop(1, "rgba(40, 50, 63, 0.05)");
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, cw, ch);
+  }
+
+  /** Infinite dot grid in world space; spacing snaps by powers of two so the
+   * screen density stays comfortable at any zoom. */
+  private drawGrid(ctx: CanvasRenderingContext2D, cw: number, ch: number): void {
+    const z = this.camera.z;
+    let step = 26;
+    while (step * z < 19) step *= 2;
+    while (step * z > 46) step /= 2;
+    const tl = this.camera.screenToWorld({ x: 0, y: 0 });
+    const br = this.camera.screenToWorld({ x: cw, y: ch });
+    const r = 1.1 / z;
+    ctx.fillStyle = "rgba(31, 41, 55, 0.055)";
+    const x0 = Math.floor(tl.x / step) * step;
+    const y0 = Math.floor(tl.y / step) * step;
+    for (let x = x0; x <= br.x; x += step) {
+      for (let y = y0; y <= br.y; y += step) {
+        const major = Math.round(x / step) % 4 === 0 && Math.round(y / step) % 4 === 0;
+        const s = major ? r * 1.8 : r * 1.15;
+        ctx.fillRect(x - s, y - s, s * 2, s * 2);
       }
     }
+  }
+
+  /** Fading comet behind the live pen tip. */
+  private drawTrail(ctx: CanvasRenderingContext2D): void {
+    for (const p of this.trail) {
+      const a = (this.clock - p.t) / TRAIL_LIFE;
+      if (a >= 1) continue;
+      ctx.fillStyle = `rgba(40, 50, 63, ${0.28 * (1 - a)})`;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 0.5 + 2.6 * (1 - a), 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  private drawPenTip(ctx: CanvasRenderingContext2D, tip: Pt): void {
+    ctx.fillStyle = INK;
+    ctx.beginPath();
+    ctx.arc(tip.x, tip.y, 4.5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = "rgba(40, 50, 63, 0.25)";
+    ctx.lineWidth = 6;
+    ctx.beginPath();
+    ctx.arc(tip.x, tip.y, 8 + Math.sin(this.clock * 5.2) * 1.1, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+
+  // --- minimap ---
+
+  /** Paint the overview map onto its own small canvas (called each frame). */
+  renderMinimap(mm: HTMLCanvasElement, mainW: number, mainH: number): void {
+    const d = devicePixelRatio || 1;
+    const mw = mm.clientWidth, mh = mm.clientHeight;
+    if (!mw || !mh) return;
+    if (mm.width !== Math.round(mw * d) || mm.height !== Math.round(mh * d)) {
+      mm.width = Math.round(mw * d);
+      mm.height = Math.round(mh * d);
+    }
+    const ctx = mm.getContext("2d")!;
+    ctx.setTransform(d, 0, 0, d, 0, 0);
+    ctx.clearRect(0, 0, mw, mh);
+
+    let b = this.contentBounds();
+    b = unionBounds(b, 0, 0, VW, VH);
+    // Always keep the viewport indicator inside the map — a user who panned
+    // into empty space must still see where they are relative to the drawing.
+    const vtl = this.camera.screenToWorld({ x: 0, y: 0 });
+    const vbr = this.camera.screenToWorld({ x: mainW, y: mainH });
+    b = unionBounds(b, vtl.x, vtl.y, vbr.x, vbr.y);
+    const pad = 60;
+    const bw = b.maxX - b.minX + pad * 2, bh = b.maxY - b.minY + pad * 2;
+    const s = Math.min(mw / bw, mh / bh);
+    const ox = (mw - (b.maxX - b.minX) * s) / 2 - b.minX * s;
+    const oy = (mh - (b.maxY - b.minY) * s) / 2 - b.minY * s;
+    this.mm = { s, ox, oy };
+    const X = (wx: number) => wx * s + ox;
+    const Y = (wy: number) => wy * s + oy;
+
+    // arrows first (under the cards)
+    for (const item of this.items) {
+      if (item.type !== "arrow") continue;
+      const op = item.op as ArrowOp;
+      const f = this.nodes[op.from], t = this.nodes[op.to];
+      if (!f?.meta || !t?.meta) continue;
+      ctx.strokeStyle = `rgba(180, 190, 205, ${0.5 * item.alpha})`;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(X(f.meta.x + (f.offset?.dx ?? 0)), Y(f.meta.y + (f.offset?.dy ?? 0)));
+      ctx.lineTo(X(t.meta.x + (t.offset?.dx ?? 0)), Y(t.meta.y + (t.offset?.dy ?? 0)));
+      ctx.stroke();
+    }
+    for (const item of this.items) {
+      if (item.type === "title" && item.bbox) {
+        ctx.fillStyle = `rgba(232, 161, 60, ${0.85 * item.alpha})`;
+        ctx.beginPath();
+        ctx.roundRect(X(item.bbox.minX), Y(item.bbox.minY), Math.max(6, (item.bbox.maxX - item.bbox.minX) * s), 2.5, 1.5);
+        ctx.fill();
+        continue;
+      }
+      const m = item.meta;
+      if (!m) continue;
+      const dx = item.offset?.dx ?? 0, dy = item.offset?.dy ?? 0;
+      ctx.fillStyle = m.dead ? `rgba(154, 164, 178, ${0.8 * item.alpha})` : hexToRgba(m.color, 0.85 * item.alpha);
+      ctx.beginPath();
+      ctx.roundRect(X(m.x + dx - m.w / 2), Y(m.y + dy - m.h / 2), Math.max(3, m.w * s), Math.max(3, m.h * s), 2);
+      ctx.fill();
+    }
+
+    // viewport rectangle
+    const tl = this.camera.screenToWorld({ x: 0, y: 0 });
+    const brw = this.camera.screenToWorld({ x: mainW, y: mainH });
+    ctx.strokeStyle = "rgba(255, 106, 40, 0.9)";
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.roundRect(X(tl.x), Y(tl.y), (brw.x - tl.x) * s, (brw.y - tl.y) * s, 3);
+    ctx.stroke();
+  }
+
+  /** Map a minimap canvas point back to world coords (for click-to-jump). */
+  minimapToWorld(mx: number, my: number): Pt {
+    return { x: (mx - this.mm.ox) / this.mm.s, y: (my - this.mm.oy) / this.mm.s };
   }
 }
