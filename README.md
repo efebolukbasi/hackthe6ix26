@@ -91,11 +91,11 @@ a time (the first joiner), so Forge won't interject twice.
 
 Frontend is pure static files — host anywhere (Vercel/Netlify/S3) and set
 `window.FORGE_API = "https://your-backend"` in `config.js`. Backend is a single
-Node process (needs outbound HTTPS + optionally a `claude` login); CORS is open.
+Node process (needs outbound HTTPS); CORS is open.
 
 ## Free Render deployment
 
-This repo includes a single-service [`render.yaml`](../render.yaml). It builds the
+This repo includes a single-service [`render.yaml`](render.yaml). It builds the
 React frontend, serves it from Express, and keeps WebSocket signaling on the same
 origin. In Render, create a **Blueprint** from this GitHub repository and choose
 the included configuration. Set `ANTHROPIC_API_KEY` as a secret before deploying.
@@ -119,9 +119,8 @@ the backend and is never sent to browsers.
 
 The hosting tier is free, but Anthropic API usage is billed by Anthropic. An
 `ANTHROPIC_API_KEY` is required for Forge's brain. ElevenLabs is optional because
-browser TTS is used when its key is absent. Render free
-instances sleep after idle periods, so the first visit after a pause can take
-about a minute.
+browser TTS is used when its key is absent. Render free instances sleep after idle
+periods, so the first visit after a pause can take about a minute.
 
 ## Demo tips
 
