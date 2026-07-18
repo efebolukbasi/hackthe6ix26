@@ -38,7 +38,9 @@ function stripAddress(text: string): string {
 const INVITE = /\b(go ahead|go for it|take it away|what do you think|your thoughts|tell us|share it|yes forge|sure forge|floor is yours|let's hear it)\b/i;
 const STOP = /\b(stop presenting|back to (the )?grid|that'?s enough|stop talking|be quiet|thanks,? forge|thank you,? forge)\b/i;
 const CLEAR = /\b((clear|wipe) the board|start over|clean slate)\b/i;
-const CREATE_ISSUE = /\b(?:create|open|file)\s+(?:a\s+)?github\s+issue\b/i;
+// Optional trailing topic becomes the issue title:
+//   "Forge, create a GitHub issue to fix the login timeout" → "Fix the login timeout"
+const CREATE_ISSUE = /\b(?:create|open|file)\s+(?:an?\s+)?(?:new\s+)?github\s+issue\b[\s:,-]*(?:to|about|for|on|saying|titled)?\s*(.*)$/i;
 
 export const CHIPS = [
   "Forge, how does this project itself work?",
@@ -470,12 +472,15 @@ export class ForgeSession {
     useStore.setState({ thinkingTrace: [] });
   }
 
-  private async createGitHubIssue(command: string): Promise<void> {
+  private async createGitHubIssue(command: string, topic?: string): Promise<void> {
     const context = useStore.getState().transcript
       .filter((line) => line.who !== "Forge" && line.text !== command)
       .slice(-12);
-    const subject = context[context.length - 1]?.text || "Meeting follow-up";
-    const title = `Meeting follow-up: ${subject}`.slice(0, 180);
+    // A spoken topic wins; otherwise fall back to the last thing said.
+    const title = (topic
+      ? topic.charAt(0).toUpperCase() + topic.slice(1)
+      : `Meeting follow-up: ${context[context.length - 1]?.text || "Meeting follow-up"}`
+    ).slice(0, 180);
     const body = [
       "Created from a Forge meeting.",
       "",
@@ -491,7 +496,7 @@ export class ForgeSession {
       });
       const out = (await res.json()) as { html_url?: string; number?: number; error?: string };
       if (!res.ok || !out.html_url) throw new Error(out.error || "issue creation failed");
-      await this.playStep({ type: "step", say: `Created GitHub issue number ${out.number}.`, ops: [] }, true);
+      await this.playStep({ type: "step", say: `Created GitHub issue number ${out.number}: ${title}.`, ops: [] }, true);
     } catch (err) {
       const message = err instanceof Error ? err.message : "issue creation failed";
       await this.playStep({ type: "step", say: `I couldn't create that GitHub issue: ${message}.`, ops: [] }, true);
@@ -518,8 +523,10 @@ export class ForgeSession {
       void this.speak("Board's clean.");
       return;
     }
-    if (CREATE_ISSUE.test(text)) {
-      void this.createGitHubIssue(text);
+    const issueMatch = text.match(CREATE_ISSUE);
+    if (issueMatch) {
+      // Trim trailing speech punctuation from the dictated topic.
+      void this.createGitHubIssue(text, issueMatch[1]?.replace(/[\s.!?,]+$/, "").trim() || undefined);
       return;
     }
 
