@@ -4,14 +4,21 @@
   "private": true,
   "type": "module",
   "description": "Forge backend — LLM brain, ElevenLabs TTS proxy, repo intelligence",
-  "main": "server.js",
+  "main": "src/server.ts",
   "scripts": {
-    "start": "node server.js",
-    "dev": "node --watch server.js"
+    "start": "node src/server.ts",
+    "dev": "node --watch src/server.ts",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.19.2"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3",
+    "@types/node": "^24.0.0",
+    "@types/express": "^4.17.21",
+    "@types/cors": "^2.8.17"
   }
 }

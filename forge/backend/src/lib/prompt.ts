@@ -1,4 +1,5 @@
 // Prompt builders for Forge. The op schema mirrors frontend/whiteboard.js.
+import type { TranscriptLine } from "./types.ts";
 
 export const OPS_SPEC = `
 DRAWING OPS (JSON objects inside "ops" arrays):
@@ -22,7 +23,7 @@ LAYOUT RULES:
 - Every arrow's from/to must reference node ids that exist on the board (already drawn, or drawn earlier in THIS response).
 `.trim();
 
-export function buildSystem(repoDigest) {
+export function buildSystem(repoDigest: string): string {
   return `You are Forge, an AI engineer who joins the team's meetings as an active participant. You are in a live video call right now, and you control a shared whiteboard. You speak while you sketch, like a calm senior engineer.
 
 OUTPUT FORMAT — CRITICAL:
@@ -43,20 +44,34 @@ THE TEAM'S REPOSITORY (you have read this — use it to answer questions about "
 ${repoDigest}`;
 }
 
-export function buildUser({ question, transcript = [], board = null, invited = false, reason = "" }) {
+export function buildUser({
+  question = "",
+  transcript = [],
+  board = null,
+  invited = false,
+  reason = "",
+}: {
+  question?: string;
+  transcript?: TranscriptLine[];
+  board?: unknown;
+  invited?: boolean;
+  reason?: string;
+}): string {
   const t = transcript.length
     ? `Recent meeting transcript:\n${transcript.map((l) => `${l.who}: ${l.text}`).join("\n")}`
     : "The meeting just started.";
-  const b = board && (board.nodes?.length || board.title)
-    ? `Current whiteboard contents: ${JSON.stringify(board)}`
-    : "The whiteboard is currently empty.";
+  const boardShape = board as { nodes?: unknown[]; title?: unknown } | null | undefined;
+  const b =
+    boardShape && (boardShape.nodes?.length || boardShape.title)
+      ? `Current whiteboard contents: ${JSON.stringify(board)}`
+      : "The whiteboard is currently empty.";
   const q = invited
     ? `You raised your hand${reason ? ` because: ${reason}` : ""} and the team just invited you to speak. Share your point about the discussion above.`
     : `A teammate just said to you: "${question}"`;
   return `${t}\n\n${b}\n\n${q}\n\nRespond now as Forge, in NDJSON lines as specified.`;
 }
 
-export function buildListenPrompt(transcript) {
+export function buildListenPrompt(transcript: TranscriptLine[]): string {
   return `You are Forge, an AI engineer silently listening in a team meeting. You do NOT interrupt for small talk, status updates, or things the team clearly has under control. You DO raise your hand when you could add real value: a factual correction about their codebase, a risky design decision being made, a tradeoff they are missing, or a question you can visually explain better than words.
 
 Transcript since your last check:

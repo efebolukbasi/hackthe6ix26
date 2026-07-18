@@ -4,20 +4,31 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { basename, extname, join, relative } from "node:path";
 import { promisify } from "node:util";
+import type { RepoMeta } from "./types.ts";
 
 const execFileP = promisify(execFile);
 
 const SKIP_DIRS = new Set(["node_modules", ".git", "dist", "build", ".next", ".tts-cache", "coverage", ".vercel"]);
 const TEXT_EXT = new Set([".js", ".mjs", ".ts", ".tsx", ".jsx", ".py", ".html", ".css", ".md", ".json", ".yml", ".yaml", ".toml", ".sh", ".txt"]);
 
-const TOTAL_BUDGET = 90_000;   // chars of file content in the digest
+const TOTAL_BUDGET = 90_000; // chars of file content in the digest
 const PER_FILE_CAP = 9_000;
 
-function walk(root) {
-  const files = [];
-  const visit = (dir) => {
+interface FileEntry {
+  path: string;
+  full: string;
+  size: number;
+}
+
+function walk(root: string): FileEntry[] {
+  const files: FileEntry[] = [];
+  const visit = (dir: string) => {
     let entries;
-    try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
     for (const e of entries) {
       if (e.name.startsWith(".") && e.name !== ".env.example") continue;
       const full = join(dir, e.name);
@@ -25,7 +36,11 @@ function walk(root) {
         if (!SKIP_DIRS.has(e.name)) visit(full);
       } else {
         let size = 0;
-        try { size = statSync(full).size; } catch { continue; }
+        try {
+          size = statSync(full).size;
+        } catch {
+          continue;
+        }
         files.push({ path: relative(root, full), full, size });
       }
     }
@@ -35,7 +50,7 @@ function walk(root) {
 }
 
 // Lower score = higher priority for inclusion.
-function priority(p) {
+function priority(p: string): number {
   const name = basename(p).toLowerCase();
   if (name.startsWith("readme")) return 0;
   if (name === "package.json") return 1;
@@ -46,7 +61,7 @@ function priority(p) {
   return 8;
 }
 
-async function git(repoPath, args) {
+async function git(repoPath: string, args: string[]): Promise<string> {
   try {
     const { stdout } = await execFileP("git", ["-C", repoPath, ...args], { timeout: 8000 });
     return stdout.trim();
@@ -55,7 +70,7 @@ async function git(repoPath, args) {
   }
 }
 
-export async function buildDigest(repoPath) {
+export async function buildDigest(repoPath: string): Promise<{ digest: string; meta: RepoMeta }> {
   const files = walk(repoPath);
   const tree = files.map((f) => `${f.path} (${f.size}b)`).join("\n");
 
@@ -64,11 +79,15 @@ export async function buildDigest(repoPath) {
     .sort((a, b) => priority(a.path) - priority(b.path) || a.size - b.size);
 
   let used = 0;
-  const chunks = [];
+  const chunks: string[] = [];
   for (const f of candidates) {
     if (used >= TOTAL_BUDGET) break;
-    let content;
-    try { content = readFileSync(f.full, "utf8"); } catch { continue; }
+    let content: string;
+    try {
+      content = readFileSync(f.full, "utf8");
+    } catch {
+      continue;
+    }
     if (content.length > PER_FILE_CAP) content = content.slice(0, PER_FILE_CAP) + "\n…(truncated)";
     if (used + content.length > TOTAL_BUDGET) continue;
     used += content.length;
