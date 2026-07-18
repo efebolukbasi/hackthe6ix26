@@ -50,6 +50,10 @@ export class RoomLink {
   private localStream: MediaStream | null = null;
   private pendingIce: RTCIceCandidateInit[] = [];
   private cb: RoomCallbacks;
+  private myName = "Guest";
+  private closedByUs = false;
+  private reconnectDelay = 1000;
+  private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
 
   constructor(cb: RoomCallbacks) {
     this.cb = cb;
@@ -65,13 +69,31 @@ export class RoomLink {
   }
 
   connect(name: string, stream: MediaStream | null): void {
+    this.myName = name;
     this.localStream = stream;
+    this.open();
+  }
+
+  private open(): void {
     const base = API || window.location.origin;
     const token = ACCESS_TOKEN ? `?token=${encodeURIComponent(ACCESS_TOKEN)}` : "";
     const ws = new WebSocket(`${base.replace(/^http/, "ws")}/ws${token}`);
     this.ws = ws;
-    ws.onopen = () => ws.send(JSON.stringify({ t: "join", name }));
+    ws.onopen = () => {
+      this.reconnectDelay = 1000;
+      ws.send(JSON.stringify({ t: "join", name: this.myName }));
+    };
     ws.onmessage = (e) => void this.handle(JSON.parse(String(e.data)) as ServerMsg);
+    // Dropped connection (backend restart, proxy idle timeout, flaky wifi):
+    // quietly reconnect and re-join so the meeting survives the hiccup.
+    ws.onclose = () => {
+      if (this.closedByUs || this.ws !== ws) return;
+      this.teardownPeer();
+      useStore.setState({ remoteName: null, remoteStream: null });
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = setTimeout(() => this.open(), this.reconnectDelay);
+      this.reconnectDelay = Math.min(this.reconnectDelay * 2, 10_000);
+    };
   }
 
   cast(event: CastEvent): void {
@@ -79,6 +101,8 @@ export class RoomLink {
   }
 
   close(): void {
+    this.closedByUs = true;
+    clearTimeout(this.reconnectTimer);
     this.teardownPeer();
     try { this.ws?.close(); } catch { /* noop */ }
     this.ws = null;

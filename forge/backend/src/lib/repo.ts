@@ -70,9 +70,13 @@ async function git(repoPath: string, args: string[]): Promise<string> {
   }
 }
 
+const MAX_TREE_FILES = 500; // keep the digest's tree section sane for big repos
+
 export async function buildDigest(repoPath: string): Promise<{ digest: string; meta: RepoMeta }> {
   const files = walk(repoPath);
-  const tree = files.map((f) => `${f.path} (${f.size}b)`).join("\n");
+  const tree =
+    files.slice(0, MAX_TREE_FILES).map((f) => `${f.path} (${f.size}b)`).join("\n") +
+    (files.length > MAX_TREE_FILES ? `\n…and ${files.length - MAX_TREE_FILES} more files` : "");
 
   const candidates = files
     .filter((f) => TEXT_EXT.has(extname(f.path)) || basename(f.path).toLowerCase().startsWith("readme"))

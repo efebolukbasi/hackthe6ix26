@@ -2,6 +2,7 @@ node_modules/
 dist/
 .env
 .tts-cache/
+.repo-cache/
 .DS_Store
 *.log
 .claude/worktrees/

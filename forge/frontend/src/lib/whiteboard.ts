@@ -220,7 +220,8 @@ export class Whiteboard {
 
   // Compact board state for the agent prompt (what's currently drawn).
   summary(): BoardSummary {
-    const titleItem = this.items.find((i) => i.type === "title");
+    // Latest title wins — a follow-up topic may have re-titled the board.
+    const titleItem = [...this.items].reverse().find((i) => i.type === "title");
     const title = (titleItem && titleItem.op.op === "title" ? titleItem.op.text : null) || null;
     const nodes = Object.values(this.nodes).map((n) => {
       const op = n.op as NodeOp & { file?: string };

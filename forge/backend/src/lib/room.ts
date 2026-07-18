@@ -51,8 +51,22 @@ export function attachRoom(server: Server): void {
     for (const m of members.values()) if (m.id !== except) send(m.ws, msg);
   };
 
+  // Heartbeat: Render/Cloudflare proxies drop idle sockets, and silently dead
+  // connections would otherwise hold a seat in the two-human room forever.
+  const alive = new WeakMap<WebSocket, boolean>();
+  const heartbeat = setInterval(() => {
+    for (const client of wss.clients) {
+      if (alive.get(client) === false) { client.terminate(); continue; }
+      alive.set(client, false);
+      client.ping();
+    }
+  }, 30_000);
+  wss.on("close", () => clearInterval(heartbeat));
+
   wss.on("connection", (ws) => {
     let me: Member | null = null;
+    alive.set(ws, true);
+    ws.on("pong", () => alive.set(ws, true));
 
     ws.on("message", (raw) => {
       let msg: ClientMsg;

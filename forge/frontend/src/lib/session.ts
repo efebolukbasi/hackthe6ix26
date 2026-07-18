@@ -210,7 +210,18 @@ export class ForgeSession {
     });
   }
 
-  private async speak(text: string): Promise<void> {
+  // All speech goes through a chain so concurrent callers (ack line, agent
+  // steps, peer-cast steps) never talk over each other.
+  private speechChain: Promise<void> = Promise.resolve();
+
+  private speak(text: string): Promise<void> {
+    const run = this.speechChain.then(() => this.speakNow(text));
+    this.speechChain = run.catch(() => {});
+    return run;
+  }
+
+  private async speakNow(text: string): Promise<void> {
+    if (this.cancelled && this.agentBusy) return; // skip queued lines after a barge-in
     this.ttsSpeaking = true;
     useStore.setState({ orbSpeaking: true, listeningActive: false });
     try {
@@ -365,14 +376,6 @@ export class ForgeSession {
             useStore.setState({ thinking: false });
             preparedSteps.push(msg);
           } else if (msg.type === "done") {
-            if (preparedSteps.length > 0) {
-              useStore.setState({ thinking: false, thinkingTrace: [] });
-              for (const step of preparedSteps) {
-                if (this.cancelled) break;
-                await this.playStep(step, true);
-              }
-              return;
-            }
             break outer;
           } else if (msg.type === "error") {
             // The backend follows an error event with a spoken fallback step.
@@ -383,7 +386,15 @@ export class ForgeSession {
         }
       }
 
-      if (preparedSteps.length === 0 && !this.cancelled) {
+      // Play whatever arrived — even if the stream died before its "done"
+      // marker, the steps we already parsed are still worth presenting.
+      if (preparedSteps.length > 0) {
+        useStore.setState({ thinking: false, thinkingTrace: [] });
+        for (const step of preparedSteps) {
+          if (this.cancelled) break;
+          await this.playStep(step, true);
+        }
+      } else if (!this.cancelled) {
         const line = "Hmm, I came up empty on that one — mind rephrasing?";
         this.caption("Forge", line, true);
         this.transcript("Forge", line);
@@ -563,7 +574,10 @@ export class ForgeSession {
         break;
       case "step":
         useStore.setState({ thinking: false });
-        this.remoteChain = this.remoteChain.then(() => this.playStep({ type: "step", say: ev.say, ops: ev.ops }));
+        // Skip queued steps if the run got cancelled while earlier ones played.
+        this.remoteChain = this.remoteChain.then(() =>
+          this.cancelled ? undefined : this.playStep({ type: "step", say: ev.say, ops: ev.ops })
+        );
         break;
       case "agent-end":
         this.remoteChain = this.remoteChain.then(() => {

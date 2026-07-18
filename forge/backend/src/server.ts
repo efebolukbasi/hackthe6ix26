@@ -25,12 +25,15 @@ const REPO_CACHE = join(__dirname, "..", ".repo-cache");
 // A repo "source" is either a local path or a GitHub URL (shallow-cloned into
 // the cache; pulled on re-load). Returns the local path to index.
 async function ensureRepo(source: string, userToken?: string | null): Promise<string> {
-  const m = source.match(/^https:\/\/github\.com\/[\w.-]+\/([\w.-]+?)(\.git)?\/?$/);
+  const m = source.match(/^https:\/\/github\.com\/([\w.-]+)\/([\w.-]+?)(\.git)?\/?$/);
   if (!m) return resolve(source);
-  const dir = join(REPO_CACHE, m[1]);
+  // Cache key includes the owner so acme/api and globex/api don't collide.
+  const dir = join(REPO_CACHE, `${m[1]}__${m[2]}`);
   const token = await github.githubToken(userToken);
   if (existsSync(join(dir, ".git"))) {
-    await execFileP("git", ["-C", dir, "pull", "--ff-only"], { timeout: 30_000 }).catch(() => {});
+    // Pull through the tokenized URL so private repos refresh too (the stored
+    // remote is intentionally token-free).
+    await execFileP("git", ["-C", dir, "pull", "--ff-only", github.tokenizedCloneUrl(source, token)], { timeout: 30_000 }).catch(() => {});
   } else {
     // Token in the URL enables private repos; the remote is reset afterwards
     // so the token never persists on disk.
@@ -233,7 +236,8 @@ app.get("/api/repo/file", (req: Request, res: Response) => {
   if (!existsSync(abs)) return res.status(404).json({ error: "not found" });
   const allLines = readFileSync(abs, "utf8").split("\n");
   const from = startLine - 1;
-  const to = endLine ? endLine : Math.min(allLines.length, from + 80);
+  // Cap the window so a bad request can't ship a whole generated file.
+  const to = Math.min(allLines.length, endLine ? endLine : from + 80, from + 400);
   const lines = allLines.slice(from, to);
   let githubUrl: string | undefined;
   try {

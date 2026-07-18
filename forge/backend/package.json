@@ -7,7 +7,7 @@
   "main": "src/server.ts",
   "scripts": {
     "start": "tsx src/server.ts",
-    "dev": "node --watch src/server.ts",
+    "dev": "tsx watch src/server.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
