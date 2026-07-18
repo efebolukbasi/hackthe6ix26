@@ -1,15 +1,18 @@
 // The Forge brain: turns meeting context into streamed whiteboard steps.
 import type { Response } from "express";
-import { streamText } from "./llm.ts";
+import { streamText, llmMode } from "./llm.ts";
 import { buildSystem, buildUser, buildListenPrompt } from "./prompt.ts";
 import type { AgentRequestBody, AgentStep, ListenResult, WhiteboardOp } from "./types.ts";
 
 let SYSTEM = "";
-export function setRepoDigest(digest: string): void {
-  SYSTEM = buildSystem(digest);
+let REPO_CWD: string | undefined;
+export function setRepoContext(digest: string, repoPath?: string): void {
+  REPO_CWD = repoPath;
+  // Live tools only exist on the CLI path; the API path answers from the digest.
+  SYSTEM = buildSystem(digest, llmMode() === "cli" && !!repoPath);
 }
 
-const KNOWN_OPS = new Set(["clear", "title", "node", "arrow", "note", "circle", "cross", "fade"]);
+const KNOWN_OPS = new Set(["clear", "title", "node", "arrow", "note", "circle", "cross", "fade", "code"]);
 
 function sanitizeStep(obj: unknown): AgentStep | null {
   const candidate = obj as { say?: unknown; ops?: unknown } | null | undefined;
@@ -62,7 +65,7 @@ export async function respond(
   res: Response,
   log: Pick<Console, "error"> = console
 ): Promise<void> {
-  const { question = "", transcript = [], board = null, invited = false, reason = "" } = body || {};
+  const { question = "", transcript = [], board = null, invited = false, reason = "", interrupted = false } = body || {};
   res.writeHead(200, {
     "Content-Type": "application/x-ndjson; charset=utf-8",
     "Cache-Control": "no-cache",
@@ -78,15 +81,40 @@ export async function respond(
   const parser = makeLineParser((step) => send({ type: "step", ...step }));
 
   try {
-    await streamText({
+    const fullText = await streamText({
       system: SYSTEM,
-      prompt: buildUser({ question, transcript, board, invited, reason }),
+      prompt: buildUser({ question, transcript, board, invited, reason, interrupted }),
       model: process.env.FORGE_MODEL || "sonnet",
       onDelta: (t: string) => parser.push(t),
       signal: abort.signal,
+      tools: true,
+      cwd: REPO_CWD,
     });
     const n = parser.flush();
-    if (n === 0) send({ type: "step", say: "Sorry — my thoughts got scrambled on that one. Ask me again?", ops: [] });
+    if (n === 0) {
+      // The model answered in prose instead of NDJSON (common for casual
+      // questions) — speak the prose itself rather than apologizing.
+      const plain = fullText
+        .replace(/```[\s\S]*?```/g, " ")
+        .replace(/\{[\s\S]*?\}/g, " ")
+        .replace(/[*_#`>|]/g, "")
+        .replace(/\s+/g, " ")
+        .trim();
+      if (plain) {
+        const sentences = plain.match(/[^.!?]+[.!?]+["']?|\S[^.!?]*$/g) ?? [plain];
+        let chunk = "";
+        const chunks: string[] = [];
+        for (const s of sentences) {
+          if (chunk && chunk.length + s.length > 240) { chunks.push(chunk.trim()); chunk = ""; }
+          chunk += s;
+          if (chunks.length === 2) break;
+        }
+        if (chunk.trim() && chunks.length < 3) chunks.push(chunk.trim());
+        for (const c of chunks) send({ type: "step", say: c, ops: [] });
+      } else {
+        send({ type: "step", say: "Sorry — my thoughts got scrambled on that one. Ask me again?", ops: [] });
+      }
+    }
     send({ type: "done" });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

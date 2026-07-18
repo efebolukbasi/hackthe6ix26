@@ -44,8 +44,13 @@ Open http://localhost:5180 in **Chrome**, allow mic/cam, Join.
 - **Voice**: with `ELEVENLABS_API_KEY` Forge speaks via ElevenLabs (flash model,
   cheap; identical lines are disk-cached so repeated demos cost ~0 credits).
   Without it, browser TTS.
-- **Repo intelligence**: on boot the backend indexes `REPO_PATH` (defaults to this
-  repo — the self-explaining demo) and folds a digest into the prompt.
+- **Repo intelligence**: on boot the backend indexes a repo and folds a digest
+  into the prompt — and in CLI mode Forge also gets **live read-only tools**
+  (Grep/Read/Glob) inside that repo, so "where do we handle X?" is verified
+  against the actual code and answered with a `file:line` **code card** drawn
+  on the board. Point it at any repo: set `REPO_PATH` (local) or `GITHUB_REPO`
+  (URL, shallow-cloned) in `.env`, or switch live:
+  `curl -X POST localhost:5180/api/repo/load -H 'Content-Type: application/json' -d '{"url":"https://github.com/owner/repo"}'`
 
 ## Using it in a meeting
 
@@ -56,7 +61,11 @@ Open http://localhost:5180 in **Chrome**, allow mic/cam, Join.
 - Just talk amongst yourselves → it listens passively and **raises its hand ✋**
   when it has something valuable (e.g. you claim Redis pub/sub is durable).
   Say "go ahead" or click the hand to let it speak.
-- "stop presenting" / "thanks Forge" interrupts it; "clear the board" wipes it.
+- **Interrupt it**: say "Forge, actually…" (or type) mid-presentation — it stops,
+  adjusts, and continues from the board it already drew. "stop presenting" /
+  "thanks Forge" halts it entirely; "clear the board" wipes it.
+- It answers non-technical questions too, in plain speech — diagrams only appear
+  when they genuinely help.
 
 ## Two-person calls (P2P)
 

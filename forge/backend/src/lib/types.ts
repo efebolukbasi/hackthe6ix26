@@ -20,7 +20,8 @@ export type WhiteboardOp =
   | { op: "note"; x: number; y: number; text: string; color?: string }
   | { op: "circle"; target: string; color?: string }
   | { op: "cross"; target: string }
-  | { op: "fade"; ids: string[] };
+  | { op: "fade"; ids: string[] }
+  | { op: "code"; id: string; x: number; y: number; file: string; line?: number; text?: string; color?: string };
 
 export interface AgentStep {
   say: string;
@@ -38,6 +39,8 @@ export interface AgentRequestBody {
   reason?: string;
   transcript?: TranscriptLine[];
   board?: unknown;
+  /** the team cut off an in-progress explanation with this new request */
+  interrupted?: boolean;
 }
 
 export interface ListenResult {

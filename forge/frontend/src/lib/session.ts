@@ -59,6 +59,7 @@ export class ForgeSession {
   private joined = false;
 
   private room: RoomLink | null = null;
+  private pendingInterrupt: string | null = null;
   private remoteAgentActive = false;
   private remoteChain: Promise<void> = Promise.resolve();
   private myName = "You";
@@ -223,8 +224,8 @@ export class ForgeSession {
   private async listenCheck(): Promise<void> {
     if (this.agentBusy || this.handRaised || this.ttsSpeaking) return;
     const chars = this.buffer.reduce((n, l) => n + l.text.length, 0);
-    if (chars < 60) return;
-    if (Date.now() - this.lastListenAt < 20_000) { this.scheduleListenCheck(); return; }
+    if (chars < 40) return;
+    if (Date.now() - this.lastListenAt < 12_000) { this.scheduleListenCheck(); return; }
     this.lastListenAt = Date.now();
     const batch = this.buffer.slice(-10);
     try {
@@ -239,7 +240,7 @@ export class ForgeSession {
   }
 
   // ---------- the agent ----------
-  private async runAgent({ question = "", invited = false, reason = "" }: { question?: string; invited?: boolean; reason?: string }): Promise<void> {
+  private async runAgent({ question = "", invited = false, reason = "", interrupted = false }: { question?: string; invited?: boolean; reason?: string; interrupted?: boolean }): Promise<void> {
     if (this.agentBusy || this.remoteAgentActive) return;
     this.agentBusy = true;
     this.cancelled = false;
@@ -259,6 +260,7 @@ export class ForgeSession {
           question,
           invited,
           reason,
+          interrupted,
           transcript: useStore.getState().transcript.slice(-14),
           board: this.wb ? this.wb.summary() : { title: null, nodes: [], arrows: [] },
         }),
@@ -305,6 +307,9 @@ export class ForgeSession {
       this.agentBusy = false;
       this.agentAbort = null;
       this.buffer = [];
+      const next = this.pendingInterrupt;
+      this.pendingInterrupt = null;
+      if (next) setTimeout(() => void this.runAgent({ question: next, interrupted: true }), 250);
     }
   }
 
@@ -333,6 +338,16 @@ export class ForgeSession {
       };
       tick();
     });
+  }
+
+  // Barge-in: halt the current explanation, then re-run with the new request.
+  // The board stays as-is so the follow-up can build on it.
+  private interrupt(text: string): void {
+    this.pendingInterrupt = text;
+    this.cancelled = true;
+    this.agentAbort?.abort();
+    this.cancelSpeech();
+    this.wb?.finishNow();
   }
 
   cancelAgent(): void {
@@ -364,6 +379,14 @@ export class ForgeSession {
       return;
     }
     if (source === "typed" || WAKE.test(text)) {
+      if (this.agentBusy) { this.interrupt(text); return; }
+      if (this.remoteAgentActive) {
+        // Stop the mirrored run on both ends, then take over with the new ask.
+        this.room?.cast({ k: "cancel" });
+        this.onCast({ k: "cancel" });
+        setTimeout(() => void this.runAgent({ question: text, interrupted: true }), 300);
+        return;
+      }
       void this.runAgent({ question: text });
       return;
     }
@@ -409,6 +432,7 @@ export class ForgeSession {
       case "cancel":
         this.remoteAgentActive = false;
         this.cancelled = true;
+        if (this.agentBusy) this.agentAbort?.abort(); // peer cancelled OUR run
         this.cancelSpeech();
         this.wb?.finishNow();
         this.exitPresenting();

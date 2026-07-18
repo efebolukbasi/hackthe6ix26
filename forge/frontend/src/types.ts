@@ -67,6 +67,17 @@ export interface FadeOp {
   ids: string[];
 }
 
+export interface CodeOp {
+  op: "code";
+  id: string;
+  x: number;
+  y: number;
+  file: string;
+  line?: number;
+  text?: string;
+  color?: string;
+}
+
 export type WhiteboardOp =
   | ClearOp
   | TitleOp
@@ -75,7 +86,8 @@ export type WhiteboardOp =
   | NoteOp
   | CircleOp
   | CrossOp
-  | FadeOp;
+  | FadeOp
+  | CodeOp;
 
 /** Ops that get planned into drawn strokes (clear/fade are handled inline). */
 export type DrawableOp = Exclude<WhiteboardOp, ClearOp | FadeOp>;

@@ -168,8 +168,8 @@ export class Whiteboard {
     const titleItem = this.items.find((i) => i.type === "title");
     const title = (titleItem && titleItem.op.op === "title" ? titleItem.op.text : null) || null;
     const nodes = Object.values(this.nodes).map((n) => {
-      const op = n.op as NodeOp;
-      const o: BoardNodeSummary = { id: n.id as string, label: op.label };
+      const op = n.op as NodeOp & { file?: string };
+      const o: BoardNodeSummary = { id: n.id as string, label: op.label ?? (op.file ? `code card: ${op.file}` : "") };
       if (op.sub) o.sub = op.sub;
       if (n.meta?.dead) o.dead = true;
       return o;
@@ -282,6 +282,20 @@ export class Whiteboard {
       });
     }
 
+    else if (op.op === "code") {
+      const { x, y } = op;
+      const lines = (op.text || "").split("\n").slice(0, 4).map((l) => l.slice(0, 46));
+      const w = 380, h = 44 + lines.length * 20;
+      const color = op.color || "#279c94";
+      item.meta = { x, y, w, h, color, dead: false };
+      S.push(this._pathStroke(roundedRectPts(x - w / 2, y - h / 2, w, h), { color, width: 2.4 }));
+      const header = op.line ? `${op.file}:${op.line}` : op.file;
+      S.push(this._textStroke(header, x - w / 2 + 14, y - h / 2 + 20, { font: '600 13.5px Menlo, monospace', color, align: "left" }));
+      lines.forEach((ln, i) => {
+        S.push(this._textStroke(ln, x - w / 2 + 14, y - h / 2 + 42 + i * 19, { font: '12px Menlo, monospace', color: "#3a4452", align: "left" }));
+      });
+    }
+
     else if (op.op === "circle") {
       const t = this.nodes[op.target]?.meta;
       if (!t) return item;
@@ -307,7 +321,7 @@ export class Whiteboard {
   private _complete(item: BoardItem): void {
     this.items.push(item);
     if (item.id) this.byId[item.id] = item;
-    if (item.type === "node") this.nodes[item.id as string] = item;
+    if (item.type === "node" || item.type === "code") this.nodes[item.id as string] = item;
     if (item.type === "cross" && item.target && this.nodes[item.target]) this.nodes[item.target].meta!.dead = true;
   }
 

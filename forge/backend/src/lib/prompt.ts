@@ -14,6 +14,9 @@ DRAWING OPS (JSON objects inside "ops" arrays):
   {"op":"circle","target":"api","color":"#e8a13c"}        — draw attention ellipse around a node
   {"op":"cross","target":"api"}                           — red X over a node (failure / removal)
   {"op":"fade","ids":["a1","a2"]}                         — fade out earlier items by id
+  {"op":"code","id":"c1","x":600,"y":420,"file":"src/lib/tts.ts","line":27,"text":"const hash = createHash(\\"sha1\\")\\n…up to 4 short lines"}
+      — a code-locator card (monospace) pinning a real file:line. Use when the team asks WHERE something
+        lives or you cite specific code. Cards act like nodes: arrows/circle/cross can target their id.
 
 CANVAS: 1200 wide x 720 tall, origin top-left. Titles occupy y<100.
 LAYOUT RULES:
@@ -23,8 +26,13 @@ LAYOUT RULES:
 - Every arrow's from/to must reference node ids that exist on the board (already drawn, or drawn earlier in THIS response).
 `.trim();
 
-export function buildSystem(repoDigest: string): string {
+export function buildSystem(repoDigest: string, liveTools = false): string {
   return `You are Forge, an AI engineer who joins the team's meetings as an active participant. You are in a live video call right now, and you control a shared whiteboard. You speak while you sketch, like a calm senior engineer.
+
+ANSWERING POLICY:
+- You can answer ANY question — engineering or otherwise — like a knowledgeable teammate. Keep spoken answers tight.
+- Draw ONLY when a picture genuinely helps: architectures, flows, comparisons, failure scenarios, or locating code. Plain factual/opinion questions get 1-2 lines with "ops":[]. Do not decorate answers with gratuitous diagrams.
+${liveTools ? `- You have read-only tools (Read, Grep, Glob) and your working directory is the team's repository. When asked about their code — especially WHERE something lives — run a quick search first, verify the exact file and line, then answer with a code card. Keep tool use fast: a few targeted searches, never a long exploration. After using tools, your final output must still be ONLY the NDJSON lines.` : ""}
 
 OUTPUT FORMAT — CRITICAL:
 Respond ONLY with NDJSON: one JSON object per line. No markdown, no code fences, no text outside the JSON lines.
@@ -50,12 +58,14 @@ export function buildUser({
   board = null,
   invited = false,
   reason = "",
+  interrupted = false,
 }: {
   question?: string;
   transcript?: TranscriptLine[];
   board?: unknown;
   invited?: boolean;
   reason?: string;
+  interrupted?: boolean;
 }): string {
   const t = transcript.length
     ? `Recent meeting transcript:\n${transcript.map((l) => `${l.who}: ${l.text}`).join("\n")}`
@@ -67,12 +77,14 @@ export function buildUser({
       : "The whiteboard is currently empty.";
   const q = invited
     ? `You raised your hand${reason ? ` because: ${reason}` : ""} and the team just invited you to speak. Share your point about the discussion above.`
-    : `A teammate just said to you: "${question}"`;
+    : interrupted
+      ? `You were mid-explanation when a teammate interrupted you with: "${question}". Adjust gracefully: address the new request directly, reuse whatever is already on the board when it helps, and don't restart from scratch unless the topic truly changed.`
+      : `A teammate just said to you: "${question}"`;
   return `${t}\n\n${b}\n\n${q}\n\nRespond now as Forge, in NDJSON lines as specified.`;
 }
 
 export function buildListenPrompt(transcript: TranscriptLine[]): string {
-  return `You are Forge, an AI engineer silently listening in a team meeting. You do NOT interrupt for small talk, status updates, or things the team clearly has under control. You DO raise your hand when you could add real value: a factual correction about their codebase, a risky design decision being made, a tradeoff they are missing, or a question you can visually explain better than words.
+  return `You are Forge, an AI engineer silently listening in a team meeting. You never blurt out — you raise your hand and wait to be invited. You do NOT raise it for small talk, status updates, or things the team clearly has under control. You DO raise your hand when you could add real value: the team asked a question aloud that nobody answered well (technical or not), someone is wrong about their codebase, a risky design decision is being made, a tradeoff is being missed, or a picture would explain the current confusion better than words.
 
 Transcript since your last check:
 ${transcript.map((l) => `${l.who}: ${l.text}`).join("\n")}

@@ -6,8 +6,10 @@ import cors from "cors";
 import { existsSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { buildDigest } from "./lib/repo.ts";
-import { respond, listen, setRepoDigest } from "./lib/agent.ts";
+import { respond, listen, setRepoContext } from "./lib/agent.ts";
 import { synthesize, ttsEnabled } from "./lib/tts.ts";
 import { llmMode } from "./lib/llm.ts";
 import { attachRoom } from "./lib/room.ts";
@@ -15,8 +17,25 @@ import type { AgentRequestBody, RepoMeta } from "./lib/types.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 5180);
+const execFileP = promisify(execFile);
+const REPO_CACHE = join(__dirname, "..", ".repo-cache");
+
+// A repo "source" is either a local path or a GitHub URL (shallow-cloned into
+// the cache; pulled on re-load). Returns the local path to index.
+async function ensureRepo(source: string): Promise<string> {
+  const m = source.match(/^https:\/\/github\.com\/[\w.-]+\/([\w.-]+?)(\.git)?\/?$/);
+  if (!m) return resolve(source);
+  const dir = join(REPO_CACHE, m[1]);
+  if (existsSync(join(dir, ".git"))) {
+    await execFileP("git", ["-C", dir, "pull", "--ff-only"], { timeout: 30_000 }).catch(() => {});
+  } else {
+    await execFileP("git", ["clone", "--depth", "1", source, dir], { timeout: 120_000 });
+  }
+  return dir;
+}
+
 // src/server.ts -> src -> backend -> forge -> repo root (three levels up).
-const REPO_PATH = resolve(process.env.REPO_PATH || join(__dirname, "..", "..", ".."));
+const REPO_SOURCE = process.env.REPO_PATH || process.env.GITHUB_REPO || join(__dirname, "..", "..", "..");
 
 const app = express();
 app.use(cors());
@@ -31,6 +50,22 @@ app.get("/api/health", (_req: Request, res: Response) => {
 app.post("/api/agent", (req: Request, res: Response) => respond(req.body as AgentRequestBody, res));
 
 app.post("/api/listen", async (req: Request, res: Response) => res.json(await listen(req.body as AgentRequestBody)));
+
+// Point Forge at a different repo mid-meeting: local path or GitHub URL.
+app.post("/api/repo/load", async (req: Request, res: Response) => {
+  const source = String((req.body as { url?: string } | undefined)?.url || "").trim();
+  if (!source) return res.status(400).json({ error: "no url" });
+  try {
+    const path = await ensureRepo(source);
+    const { digest, meta } = await buildDigest(path);
+    setRepoContext(digest, path);
+    repoMeta = meta;
+    console.log(`repo switched → ${path} (${meta.fileCount} files)`);
+    res.json({ ok: true, repo: meta });
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
 
 app.post("/api/tts", async (req: Request, res: Response) => {
   const body = req.body as { text?: string } | undefined;
@@ -57,9 +92,10 @@ app.use(express.static(staticDir));
 const httpServer = app.listen(PORT, async () => {
   console.log(`forge backend → http://localhost:${PORT}`);
   console.log(`  llm: ${llmMode()}${ttsEnabled() ? ", elevenlabs: on" : ", elevenlabs: OFF (browser TTS fallback)"}`);
-  console.log(`  indexing repo: ${REPO_PATH}`);
-  const { digest, meta } = await buildDigest(REPO_PATH);
-  setRepoDigest(digest);
+  console.log(`  indexing repo: ${REPO_SOURCE}`);
+  const repoPath = await ensureRepo(REPO_SOURCE);
+  const { digest, meta } = await buildDigest(repoPath);
+  setRepoContext(digest, repoPath);
   repoMeta = meta;
   console.log(`  repo indexed: ${meta.fileCount} files, ${meta.includedFiles} in digest (${meta.chars} chars)`);
 });

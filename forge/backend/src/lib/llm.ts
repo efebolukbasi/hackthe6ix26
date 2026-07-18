@@ -21,6 +21,9 @@ interface StreamTextOptions {
   maxTokens?: number;
   onDelta?: (chunk: string) => void;
   signal?: AbortSignal;
+  /** CLI mode only: allow read-only repo tools (Read/Grep/Glob) run from `cwd`. */
+  tools?: boolean;
+  cwd?: string;
 }
 
 // Streams text; calls onDelta(chunk) as text arrives. Resolves with full text.
@@ -31,16 +34,19 @@ export async function streamText({
   maxTokens = 4000,
   onDelta = () => {},
   signal,
+  tools = false,
+  cwd,
 }: StreamTextOptions): Promise<string> {
   if (process.env.ANTHROPIC_API_KEY) {
+    // API path has no tool loop — it answers from the digest alone.
     return apiStream({ system, prompt, model, maxTokens, onDelta, signal });
   }
   try {
-    return await cliStream({ system, prompt, model, onDelta, signal, streamJson: true });
+    return await cliStream({ system, prompt, model, onDelta, signal, streamJson: true, tools, cwd });
   } catch (err) {
     if (signal?.aborted) throw err;
     // Older CLI without --include-partial-messages, or stream parse trouble.
-    return cliStream({ system, prompt, model, onDelta, signal, streamJson: false });
+    return cliStream({ system, prompt, model, onDelta, signal, streamJson: false, tools, cwd });
   }
 }
 
@@ -107,20 +113,25 @@ interface CliStreamOptions {
   onDelta: (chunk: string) => void;
   signal?: AbortSignal;
   streamJson: boolean;
+  tools?: boolean;
+  cwd?: string;
 }
 
-function cliStream({ system, prompt, model, onDelta, signal, streamJson }: CliStreamOptions): Promise<string> {
+function cliStream({ system, prompt, model, onDelta, signal, streamJson, tools, cwd }: CliStreamOptions): Promise<string> {
   return new Promise((resolve, reject) => {
-    const args = ["-p", "--model", model, "--max-turns", "1"];
+    const args = ["-p", "--model", model];
+    // With tools on, Claude can grep/read the target repo live before answering.
+    if (tools && cwd) args.push("--max-turns", "8", "--allowedTools", "Read,Grep,Glob");
+    else args.push("--max-turns", "1");
     if (streamJson) args.push("--output-format", "stream-json", "--include-partial-messages", "--verbose");
 
     const child = spawn("claude", args, {
-      cwd: process.cwd(),
+      cwd: (tools && cwd) || process.cwd(),
       env: { ...process.env },
       stdio: ["pipe", "pipe", "pipe"],
     });
 
-    const killTimer = setTimeout(() => child.kill("SIGKILL"), 120_000);
+    const killTimer = setTimeout(() => child.kill("SIGKILL"), tools ? 180_000 : 120_000);
     const onAbort = () => child.kill("SIGKILL");
     signal?.addEventListener("abort", onAbort, { once: true });
 
