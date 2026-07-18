@@ -16,6 +16,7 @@ export type CastEvent =
   | { k: "hand"; raised: boolean; reason: string }
   | { k: "board-edit" }
   | { k: "board-move"; id: string; dx: number; dy: number }
+  | { k: "board-sync"; ops: WhiteboardOp[]; moves: Array<{ id: string; dx: number; dy: number }> }
   | { k: "focus"; file: string; startLine: number; endLine: number }
   | { k: "code-panel-open"; file: string; githubUrl?: string }
   | { k: "speaker-role"; isSpeaker: boolean };

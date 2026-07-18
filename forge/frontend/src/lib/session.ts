@@ -14,6 +14,7 @@ import type {
   SpeechRecognitionLike,
   StreamMsg,
   TranscriptLine,
+  WhiteboardOp,
 } from "../types";
 
 const delay = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -81,12 +82,9 @@ export class ForgeSession {
   private remoteChain: Promise<void> = Promise.resolve();
   private myName = "You";
 
-  // Speaker-role: the peer with the lower room id plays TTS audio. Others
-  // only update captions and board state. Defaults to true (alone in room).
-  private isSpeaker = true;
-
-  // Deferred answer flow: steps are collected silently, then presented when invited.
-  private pendingSteps: AgentStep[] = [];
+  // Board state is replayed to a participant who joins after Forge has drawn.
+  private boardOps: WhiteboardOp[] = [];
+  private boardMoves: Array<{ id: string; dx: number; dy: number }> = [];
 
   constructor() {
     // Demo/debug hook: feed an utterance as if it were heard through the mic
@@ -216,13 +214,11 @@ export class ForgeSession {
     this.ttsSpeaking = true;
     this.stopRecog(); // don't transcribe our own voice
     useStore.setState({ orbSpeaking: true, listeningActive: false });
-    if (this.isSpeaker) {
-      try {
-        if (!this.health.tts || this.cancelled) throw new Error("tts off");
-        await this.elevenSpeak(text);
-      } catch {
-        if (!this.cancelled) await this.browserSpeak(text);
-      }
+    try {
+      if (!this.health.tts || this.cancelled) throw new Error("tts off");
+      await this.elevenSpeak(text);
+    } catch {
+      if (!this.cancelled) await this.browserSpeak(text);
     }
     this.ttsSpeaking = false;
     useStore.setState({ orbSpeaking: false });
@@ -233,10 +229,6 @@ export class ForgeSession {
     speechSynthesis.cancel();
     this.currentTtsAbort?.abort();
     if (this.currentAudio) { try { this.currentAudio.pause(); } catch { /* noop */ } this.currentAudio = null; }
-  }
-
-  setIsSpeaker(val: boolean): void {
-    this.isSpeaker = val;
   }
 
   // ---------- speech recognition ----------
@@ -326,22 +318,9 @@ export class ForgeSession {
     useStore.setState({ thinking: true, listeningActive: false });
     this.agentAbort = new AbortController();
 
-    let handedOff = false;
     try {
-      // If invited and we have prepared steps, play them without fetching again.
-      if (invited && this.pendingSteps.length > 0) {
-        const steps = this.pendingSteps;
-        this.pendingSteps = [];
-        useStore.setState({ thinking: false, thinkingTrace: [] });
-        for (const step of steps) {
-          if (this.cancelled) break;
-          await this.playStep(step, true);
-        }
-        return;
-      }
-
       // Fire-and-forget ack so the user knows we heard them, then think silently.
-      const ackMsg = "Let me look into that — I'll raise my hand when I have something.";
+      const ackMsg = "Let me look into that.";
       this.caption("Forge", ackMsg, true);
       this.transcript("Forge", ackMsg);
       void this.speak(ackMsg);
@@ -383,18 +362,18 @@ export class ForgeSession {
             preparedSteps.push(msg);
           } else if (msg.type === "done") {
             if (preparedSteps.length > 0) {
-              // Defer presentation: store steps and raise hand for invite.
-              handedOff = true;
-              this.pendingSteps = preparedSteps;
-              this.room?.cast({ k: "agent-end" });
               useStore.setState({ thinking: false, thinkingTrace: [] });
-              this.agentBusy = false;
-              this.raiseHand("ready-to-present");
+              for (const step of preparedSteps) {
+                if (this.cancelled) break;
+                await this.playStep(step, true);
+              }
               return;
             }
             break outer;
           } else if (msg.type === "error") {
-            throw new Error((msg as { type: "error"; message: string }).message);
+            // The backend follows an error event with a spoken fallback step.
+            // Keep reading instead of discarding that useful recovery message.
+            continue;
           }
           if (this.cancelled) { try { void reader.cancel(); } catch { /* noop */ } break outer; }
         }
@@ -414,22 +393,16 @@ export class ForgeSession {
         await this.speak(line);
       }
     } finally {
-      if (!handedOff) {
-        this.room?.cast({ k: "agent-end" });
-        useStore.setState({ thinking: false, thinkingTrace: [] });
-        this.hideCaption();
-        this.setListening();
-        this.agentBusy = false;
-        this.agentAbort = null;
-        this.buffer = [];
-        const next = this.pendingInterrupt;
-        this.pendingInterrupt = null;
-        if (next) setTimeout(() => void this.runAgent({ question: next, interrupted: true }), 250);
-      } else {
-        // Already cleaned up in the try block before returning.
-        this.agentAbort = null;
-        this.buffer = [];
-      }
+      this.room?.cast({ k: "agent-end" });
+      useStore.setState({ thinking: false, thinkingTrace: [] });
+      this.hideCaption();
+      this.setListening();
+      this.agentBusy = false;
+      this.agentAbort = null;
+      this.buffer = [];
+      const next = this.pendingInterrupt;
+      this.pendingInterrupt = null;
+      if (next) setTimeout(() => void this.runAgent({ question: next, interrupted: true }), 250);
     }
   }
 
@@ -489,6 +462,7 @@ export class ForgeSession {
   private async playStep(step: AgentStep, broadcast = false): Promise<void> {
     if (broadcast) this.room?.cast({ k: "step", say: step.say, ops: step.ops });
     if (step.ops?.length) {
+      this.boardOps.push(...step.ops);
       if (!useStore.getState().presenting) {
         this.enterPresenting();
         this.chime(1);
@@ -547,6 +521,8 @@ export class ForgeSession {
     if (CLEAR.test(text)) {
       if (this.agentBusy) return;
       this.wb?.clear();
+      this.boardOps = [];
+      this.boardMoves = [];
       this.room?.cast({ k: "board-clear" });
       this.caption("Forge", "Board's clean.");
       void this.speak("Board's clean.");
@@ -630,6 +606,8 @@ export class ForgeSession {
         break;
       case "board-clear":
         this.wb?.clear();
+        this.boardOps = [];
+        this.boardMoves = [];
         break;
       case "hand":
         this.handReason = ev.reason;
@@ -637,15 +615,20 @@ export class ForgeSession {
         if (ev.raised) this.setStatus("\u270B has a thought");
         else if (!this.agentBusy && !this.remoteAgentActive) this.setListening();
         break;
-      case "speaker-role":
-        // Remote says whether THEY are speaker; we are speaker if they are not.
-        this.isSpeaker = !ev.isSpeaker;
-        break;
       case "board-edit":
         this.cancelForBoardEdit();
         break;
       case "board-move":
         this.wb?.moveItem(ev.id, ev.dx, ev.dy);
+        this.boardMoves.push({ id: ev.id, dx: ev.dx, dy: ev.dy });
+        break;
+      case "board-sync":
+        this.wb?.clear();
+        this.boardOps = [...ev.ops];
+        this.boardMoves = [...ev.moves];
+        this.wb?.enqueue(ev.ops);
+        this.wb?.finishNow();
+        for (const move of ev.moves) this.wb?.moveItem(move.id, move.dx, move.dy);
         break;
       case "focus":
         useStore.setState({ codePanelHighlight: { start: ev.startLine, end: ev.endLine } });
@@ -790,22 +773,23 @@ export class ForgeSession {
     await this.fetchHealth();
     this.room = new RoomLink({
       onCast: (ev) => this.onCast(ev),
-      onPeerJoined: (peer) => { this.caption("Forge", `${peer} joined the call.`); this.chime(0.5); },
+      onPeerJoined: (peer) => {
+        this.caption("Forge", `${peer} joined the call.`);
+        this.chime(0.5);
+        this.syncBoardToPeer();
+      },
       onPeerLeft: (peer) => this.caption("Forge", `${peer} left the call.`),
     });
     this.room.connect(this.myName, this.stream);
-    await delay(500);
-    const repoName = this.health.repo?.name || "your repo";
-    const greeting = this.health.ok
-      ? `Hey, I'm Forge. I've read the ${repoName} codebase and I'm following along. Say my name to ask me anything, or just talk — I'll raise my hand when I can help.`
-      : `Hey, I'm Forge. My backend isn't reachable, so start the server and reload — then I can really join in.`;
-    this.caption("Forge", greeting, true);
-    this.transcript("Forge", greeting);
-    void this.speak(greeting);
     useStore.setState({ listeningActive: true });
   }
 
   // ---------- controls (invoked by components) ----------
+  private syncBoardToPeer(): void {
+    if (!this.boardOps.length) return;
+    this.room?.cast({ k: "board-sync", ops: this.boardOps, moves: this.boardMoves });
+  }
+
   attachBoard(canvas: HTMLCanvasElement): Whiteboard {
     if (!this.wb || this.wb.canvas !== canvas) this.wb = new Whiteboard(canvas);
     return this.wb;
@@ -867,6 +851,7 @@ export class ForgeSession {
 
   moveBoardItem(id: string, dx: number, dy: number): void {
     this.wb?.moveItem(id, dx, dy);
+    this.boardMoves.push({ id, dx, dy });
     this.room?.cast({ k: "board-move", id, dx, dy });
   }
 
