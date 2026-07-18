@@ -212,7 +212,6 @@ export class ForgeSession {
 
   private async speak(text: string): Promise<void> {
     this.ttsSpeaking = true;
-    this.stopRecog(); // don't transcribe our own voice
     useStore.setState({ orbSpeaking: true, listeningActive: false });
     try {
       if (!this.health.tts || this.cancelled) throw new Error("tts off");
@@ -244,7 +243,12 @@ export class ForgeSession {
         const res = e.results[i];
         if (res.isFinal) {
           const text = res[0].transcript.trim();
-          if (text) this.handleUtterance(text, "voice");
+          // Keep recognition alive while Forge speaks so a participant can
+          // barge in. During TTS, only explicit control phrases are accepted
+          // to avoid treating Forge's own narration as meeting speech.
+          if (text && (!this.ttsSpeaking || isAddressed(text) || STOP.test(text))) {
+            this.handleUtterance(text, "voice");
+          }
         } else if (!this.ttsSpeaking) {
           this.caption("You", res[0].transcript);
         }
