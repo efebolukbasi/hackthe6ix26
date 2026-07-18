@@ -3,7 +3,7 @@ import "dotenv/config";
 import express from "express";
 import type { Request, Response } from "express";
 import cors from "cors";
-import { timingSafeEqual } from "node:crypto";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -24,11 +24,11 @@ const REPO_CACHE = join(__dirname, "..", ".repo-cache");
 
 // A repo "source" is either a local path or a GitHub URL (shallow-cloned into
 // the cache; pulled on re-load). Returns the local path to index.
-async function ensureRepo(source: string): Promise<string> {
+async function ensureRepo(source: string, userToken?: string | null): Promise<string> {
   const m = source.match(/^https:\/\/github\.com\/[\w.-]+\/([\w.-]+?)(\.git)?\/?$/);
   if (!m) return resolve(source);
   const dir = join(REPO_CACHE, m[1]);
-  const token = await github.githubToken();
+  const token = await github.githubToken(userToken);
   if (existsSync(join(dir, ".git"))) {
     await execFileP("git", ["-C", dir, "pull", "--ff-only"], { timeout: 30_000 }).catch(() => {});
   } else {
@@ -47,6 +47,36 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
+const githubSessions = new Map<string, { token: string; expiresAt: number }>();
+const githubStates = new Map<string, { returnTo: string; expiresAt: number }>();
+
+function cookie(req: Request, name: string): string | null {
+  const value = req.header("cookie")?.split(";").map((part) => part.trim()).find((part) => part.startsWith(`${name}=`))?.slice(name.length + 1);
+  return value ? decodeURIComponent(value) : null;
+}
+
+function githubSessionToken(req: Request): string | null {
+  const id = cookie(req, "forge_github_session");
+  const session = id ? githubSessions.get(id) : undefined;
+  if (!session || session.expiresAt < Date.now()) {
+    if (id) githubSessions.delete(id);
+    return null;
+  }
+  return session.token;
+}
+
+function callbackUrl(req: Request): string {
+  return process.env.GITHUB_APP_CALLBACK_URL || `${req.header("x-forwarded-proto")?.split(",")[0] || req.protocol}://${req.get("host")}/api/github/callback`;
+}
+
+function safeReturnTo(value: unknown, callback: string): string {
+  try {
+    const target = new URL(String(value || ""));
+    if (target.origin === new URL(callback).origin) return target.toString();
+  } catch { /* use the app root */ }
+  return new URL("/", callback).toString();
+}
+
 function tokenMatches(actual: string | undefined, expected: string): boolean {
   if (!actual) return false;
   const a = Buffer.from(actual);
@@ -57,6 +87,10 @@ function tokenMatches(actual: string | undefined, expected: string): boolean {
 // The static app remains public so invitees can load it, but every API and
 // WebSocket request requires the fragment-derived invite token when configured.
 app.use("/api", (req, res, next) => {
+  // GitHub redirects the browser directly to these endpoints, so it cannot
+  // include the invite fragment's request header. The random OAuth state still
+  // protects the callback from unsolicited requests.
+  if (req.path === "/github/login" || req.path === "/github/callback") return next();
   const expectedToken = process.env.FORGE_ACCESS_TOKEN;
   if (!expectedToken || tokenMatches(req.header("X-Forge-Access-Token"), expectedToken)) return next();
   res.status(401).json({ error: "invalid Forge invite" });
@@ -72,32 +106,52 @@ app.post("/api/agent", (req: Request, res: Response) => respond(req.body as Agen
 
 app.post("/api/listen", async (req: Request, res: Response) => res.json(await listen(req.body as AgentRequestBody)));
 
-// GitHub login: zero-click via env token or the host's `gh` CLI, else device flow.
-app.get("/api/github/status", async (_req: Request, res: Response) => res.json(await github.status()));
+// GitHub App web sign-in, with an env token or local `gh` login as fallbacks.
+app.get("/api/github/status", async (req: Request, res: Response) => {
+  const userToken = githubSessionToken(req);
+  const status = await github.status(userToken);
+  res.json({ ...status, loginAvailable: !!process.env.GITHUB_APP_CLIENT_ID && !!process.env.GITHUB_APP_CLIENT_SECRET });
+});
 
-app.get("/api/github/repos", async (_req: Request, res: Response) => {
+app.get("/api/github/repos", async (req: Request, res: Response) => {
   try {
-    res.json(await github.listRepos());
+    res.json(await github.listRepos(githubSessionToken(req)));
   } catch (err) {
     const e = err as { status?: number; message?: string };
     res.status(e.status || 502).json({ error: e.message || String(err) });
   }
 });
 
-app.post("/api/github/device/start", async (_req: Request, res: Response) => {
-  try {
-    const d = await github.deviceStart();
-    res.json({ user_code: d.user_code, verification_uri: d.verification_uri, device_code: d.device_code, interval: d.interval });
-  } catch (err) {
-    const e = err as { status?: number; message?: string };
-    res.status(e.status || 502).json({ error: e.message || String(err) });
-  }
+app.get("/api/github/login", (req: Request, res: Response) => {
+  const clientId = process.env.GITHUB_APP_CLIENT_ID;
+  const clientSecret = process.env.GITHUB_APP_CLIENT_SECRET;
+  if (!clientId || !clientSecret) return res.status(503).json({ error: "GitHub App is not configured" });
+  const redirectUri = callbackUrl(req);
+  const state = randomBytes(24).toString("base64url");
+  githubStates.set(state, { returnTo: safeReturnTo(req.query.returnTo, redirectUri), expiresAt: Date.now() + 10 * 60_000 });
+  const authorize = new URL("https://github.com/login/oauth/authorize");
+  authorize.searchParams.set("client_id", clientId);
+  authorize.searchParams.set("redirect_uri", redirectUri);
+  authorize.searchParams.set("state", state);
+  res.redirect(authorize.toString());
 });
 
-app.post("/api/github/device/poll", async (req: Request, res: Response) => {
-  const device_code = String((req.body as { device_code?: string } | undefined)?.device_code || "");
-  if (!device_code) return res.status(400).json({ error: "no device_code" });
-  res.json(await github.devicePoll(device_code));
+app.get("/api/github/callback", async (req: Request, res: Response) => {
+  const state = String(req.query.state || "");
+  const pending = githubStates.get(state);
+  githubStates.delete(state);
+  if (!pending || pending.expiresAt < Date.now()) return res.status(400).send("GitHub sign-in expired. Return to Forge and try again.");
+  const code = String(req.query.code || "");
+  if (!code) return res.status(400).send("GitHub did not return an authorization code.");
+  try {
+    const token = await github.exchangeWebCode(code, callbackUrl(req));
+    const id = randomBytes(32).toString("base64url");
+    githubSessions.set(id, { token, expiresAt: Date.now() + 8 * 60 * 60_000 });
+    res.cookie("forge_github_session", id, { httpOnly: true, sameSite: "lax", secure: req.secure || req.header("x-forwarded-proto") === "https", maxAge: 8 * 60 * 60_000, path: "/" });
+    res.redirect(pending.returnTo);
+  } catch (err) {
+    res.status((err as { status?: number }).status || 502).send(err instanceof Error ? err.message : "GitHub sign-in failed");
+  }
 });
 
 app.post("/api/github/issues", async (req: Request, res: Response) => {
@@ -107,7 +161,7 @@ app.post("/api/github/issues", async (req: Request, res: Response) => {
   const title = String(body?.title || "Meeting follow-up").trim();
   const issueBody = String(body?.body || "Created from a Forge meeting.").trim();
   try {
-    res.json(await github.createIssue(cwd, title, issueBody));
+    res.json(await github.createIssue(cwd, title, issueBody, githubSessionToken(req)));
   } catch (err) {
     const e = err as { status?: number; message?: string };
     res.status(e.status || 502).json({ error: e.message || String(err) });
@@ -119,7 +173,7 @@ app.post("/api/repo/load", async (req: Request, res: Response) => {
   const source = String((req.body as { url?: string } | undefined)?.url || "").trim();
   if (!source) return res.status(400).json({ error: "no url" });
   try {
-    const path = await ensureRepo(source);
+    const path = await ensureRepo(source, githubSessionToken(req));
     const { digest, meta } = await buildDigest(path);
     setRepoContext(digest, path);
     repoMeta = meta;

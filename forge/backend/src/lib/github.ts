@@ -1,15 +1,10 @@
-// GitHub connection for Forge. Token sources, in priority order:
-//   1. GITHUB_TOKEN env
-//   2. the host's `gh` CLI login (zero-click when the demo machine has gh)
-//   3. OAuth device flow (needs GITHUB_CLIENT_ID; user enters a short code
-//      on github.com — no callback URL, works through tunnels)
-// The token stays server-side and in memory; it is never sent to the frontend.
+// GitHub connection for Forge. A GitHub App user token is scoped to the
+// current browser session; environment and `gh` tokens remain local fallbacks.
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
 const execFileP = promisify(execFile);
 
-let deviceToken: string | null = null;
 let cachedGhToken: string | null | undefined; // undefined = not probed yet
 
 async function ghCliToken(): Promise<string | null> {
@@ -23,8 +18,8 @@ async function ghCliToken(): Promise<string | null> {
   return cachedGhToken;
 }
 
-export async function githubToken(): Promise<string | null> {
-  return process.env.GITHUB_TOKEN || deviceToken || (await ghCliToken());
+export async function githubToken(userToken?: string | null): Promise<string | null> {
+  return userToken || process.env.GITHUB_TOKEN || (await ghCliToken());
 }
 
 async function api<T>(path: string, token: string): Promise<T> {
@@ -38,20 +33,18 @@ async function api<T>(path: string, token: string): Promise<T> {
 export interface GithubStatus {
   connected: boolean;
   user?: string;
-  via?: "env" | "device" | "gh";
-  deviceFlowAvailable: boolean;
+  via?: "app" | "env" | "gh";
 }
 
-export async function status(): Promise<GithubStatus> {
-  const deviceFlowAvailable = !!process.env.GITHUB_CLIENT_ID;
-  const token = await githubToken();
-  if (!token) return { connected: false, deviceFlowAvailable };
+export async function status(userToken?: string | null): Promise<GithubStatus> {
+  const token = await githubToken(userToken);
+  if (!token) return { connected: false };
   try {
     const user = await api<{ login: string }>("/user", token);
-    const via = process.env.GITHUB_TOKEN ? "env" : deviceToken ? "device" : "gh";
-    return { connected: true, user: user.login, via, deviceFlowAvailable };
+    const via = userToken ? "app" : process.env.GITHUB_TOKEN ? "env" : "gh";
+    return { connected: true, user: user.login, via };
   } catch {
-    return { connected: false, deviceFlowAvailable };
+    return { connected: false };
   }
 }
 
@@ -62,8 +55,8 @@ export interface RepoInfo {
   description: string | null;
 }
 
-export async function listRepos(): Promise<RepoInfo[]> {
-  const token = await githubToken();
+export async function listRepos(userToken?: string | null): Promise<RepoInfo[]> {
+  const token = await githubToken(userToken);
   if (!token) throw Object.assign(new Error("not connected to GitHub"), { status: 401 });
   const repos = await api<RepoInfo[]>("/user/repos?sort=pushed&per_page=100", token);
   return repos.map((r) => ({
@@ -81,8 +74,8 @@ export interface CreatedIssue {
 }
 
 /** Create an issue in the repository checked out at `repoPath`. */
-export async function createIssue(repoPath: string, title: string, body: string): Promise<CreatedIssue> {
-  const token = await githubToken();
+export async function createIssue(repoPath: string, title: string, body: string, userToken?: string | null): Promise<CreatedIssue> {
+  const token = await githubToken(userToken);
   if (!token) throw Object.assign(new Error("Connect GitHub before creating an issue"), { status: 401 });
 
   let remote: string;
@@ -108,36 +101,21 @@ export async function createIssue(repoPath: string, title: string, body: string)
   return res.json() as Promise<CreatedIssue>;
 }
 
-// ---- device flow ----
-
-export async function deviceStart(): Promise<{ user_code: string; verification_uri: string; device_code: string; interval: number }> {
-  const client_id = process.env.GITHUB_CLIENT_ID;
-  if (!client_id) throw Object.assign(new Error("GITHUB_CLIENT_ID not set"), { status: 400 });
-  const res = await fetch("https://github.com/login/device/code", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json" },
-    body: JSON.stringify({ client_id, scope: "repo" }),
-  });
-  if (!res.ok) throw new Error(`device start ${res.status}`);
-  return res.json() as Promise<{ user_code: string; verification_uri: string; device_code: string; interval: number }>;
-}
-
-export async function devicePoll(device_code: string): Promise<{ status: "ok" | "pending" | "error"; user?: string; error?: string }> {
-  const client_id = process.env.GITHUB_CLIENT_ID;
-  if (!client_id) return { status: "error", error: "GITHUB_CLIENT_ID not set" };
+/** Exchange a GitHub App web-flow code for a user-to-server access token. */
+export async function exchangeWebCode(code: string, redirectUri: string): Promise<string> {
+  const clientId = process.env.GITHUB_APP_CLIENT_ID;
+  const clientSecret = process.env.GITHUB_APP_CLIENT_SECRET;
+  if (!clientId || !clientSecret) throw Object.assign(new Error("GitHub App is not configured"), { status: 503 });
   const res = await fetch("https://github.com/login/oauth/access_token", {
     method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json" },
-    body: JSON.stringify({ client_id, device_code, grant_type: "urn:ietf:params:oauth:grant-type:device_code" }),
+    headers: { Accept: "application/json", "Content-Type": "application/json" },
+    body: JSON.stringify({ client_id: clientId, client_secret: clientSecret, code, redirect_uri: redirectUri }),
   });
-  const out = (await res.json()) as { access_token?: string; error?: string };
-  if (out.access_token) {
-    deviceToken = out.access_token;
-    const s = await status();
-    return { status: "ok", user: s.user };
+  const out = (await res.json()) as { access_token?: string; error?: string; error_description?: string };
+  if (!res.ok || !out.access_token) {
+    throw Object.assign(new Error(out.error_description || out.error || "GitHub authorization failed"), { status: 502 });
   }
-  if (out.error === "authorization_pending" || out.error === "slow_down") return { status: "pending" };
-  return { status: "error", error: out.error };
+  return out.access_token;
 }
 
 /** Clone URL with the token injected (stripped from the git remote after clone). */

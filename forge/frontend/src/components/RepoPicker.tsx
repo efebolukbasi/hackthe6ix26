@@ -12,14 +12,7 @@ interface Repo {
 interface GhStatus {
   connected: boolean;
   user?: string;
-  deviceFlowAvailable: boolean;
-}
-
-interface DeviceInfo {
-  user_code: string;
-  verification_uri: string;
-  device_code: string;
-  interval?: number;
+  loginAvailable: boolean;
 }
 
 export default function RepoPicker() {
@@ -29,7 +22,6 @@ export default function RepoPicker() {
   const [q, setQ] = useState("");
   const [open, setOpen] = useState(false);
   const [note, setNote] = useState("");
-  const [device, setDevice] = useState<DeviceInfo | null>(null);
 
   const refresh = async () => {
     try {
@@ -37,7 +29,7 @@ export default function RepoPicker() {
       setGh(s);
       if (s.connected) setRepos((await (await apiFetch(`${API}/api/github/repos`)).json()) as Repo[]);
     } catch {
-      setGh({ connected: false, deviceFlowAvailable: false });
+      setGh({ connected: false, loginAvailable: false });
     }
   };
   useEffect(() => {
@@ -45,29 +37,7 @@ export default function RepoPicker() {
   }, []);
 
   const connect = async () => {
-    setNote("");
-    const d = (await (await apiFetch(`${API}/api/github/device/start`, { method: "POST" })).json()) as DeviceInfo & { error?: string };
-    if (d.error) { setNote(d.error); return; }
-    setDevice(d);
-    window.open(d.verification_uri, "_blank");
-    const poll = async () => {
-      try {
-        const r = (await (
-          await apiFetch(`${API}/api/github/device/poll`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ device_code: d.device_code }),
-          })
-        ).json()) as { status: string; error?: string };
-        if (r.status === "ok") { setDevice(null); void refresh(); }
-        else if (r.status === "pending") setTimeout(() => void poll(), (d.interval || 5) * 1000);
-        else { setDevice(null); setNote(r.error || "login failed"); }
-      } catch {
-        setDevice(null);
-        setNote("login failed");
-      }
-    };
-    setTimeout(() => void poll(), (d.interval || 5) * 1000);
+    window.location.assign(`${API}/api/github/login?returnTo=${encodeURIComponent(window.location.href)}`);
   };
 
   const load = async (fullName: string) => {
@@ -100,16 +70,11 @@ export default function RepoPicker() {
       {open && (
         <div className="repo-drop">
           {!gh?.connected &&
-            (gh?.deviceFlowAvailable ? (
-              <button className="repo-connect" onClick={() => void connect()}>Connect GitHub</button>
+            (gh?.loginAvailable ? (
+              <button className="repo-connect" onClick={() => void connect()}>Sign in with GitHub</button>
             ) : (
-              <div className="repo-hint">No GitHub login — run `gh auth login` on the host, or set GITHUB_CLIENT_ID for device login.</div>
+              <div className="repo-hint">GitHub sign-in is not configured for this deployment.</div>
             ))}
-          {device && (
-            <div className="repo-hint">
-              Enter code <strong>{device.user_code}</strong> at {device.verification_uri}
-            </div>
-          )}
           {gh?.connected && (
             <>
               <input placeholder="Search your repos…" value={q} onChange={(e) => setQ(e.target.value)} />
