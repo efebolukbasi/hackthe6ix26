@@ -3,7 +3,7 @@ services:
     name: forge-meeting
     runtime: node
     plan: free
-    buildCommand: npm --prefix forge/frontend ci && npm --prefix forge/backend ci && npm --prefix forge/frontend run build
+    buildCommand: npm --prefix forge/frontend ci --include=dev && npm --prefix forge/backend ci --include=dev && npm --prefix forge/frontend run build
     startCommand: npm --prefix forge/backend start
     healthCheckPath: /
     envVars:
