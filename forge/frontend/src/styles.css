@@ -430,6 +430,8 @@ button:active { transform: scale(0.96); }
 .ctl svg { width: 21px; height: 21px; fill: var(--text); }
 .ctl.off { background: rgba(229, 72, 77, 0.9); border-color: transparent; }
 .ctl.off:hover { background: #f05a5f; }
+.ctl.copied { background: rgba(47, 158, 91, 0.9); border-color: transparent; }
+.ctl:disabled { cursor: not-allowed; opacity: 0.42; }
 .ctl.end { background: var(--red); width: 68px; border-radius: 999px; border-color: transparent; }
 .ctl.end:hover { background: #f05a5f; }
 .ctl.dim svg { fill: var(--faint); }
