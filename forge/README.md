@@ -48,12 +48,10 @@ Open http://localhost:5180 in **Chrome**, allow mic/cam, Join.
   into the prompt — and in CLI mode Forge also gets **live read-only tools**
   (Grep/Read/Glob) inside that repo, so "where do we handle X?" is verified
   against the actual code and answered with a `file:line` **code card** drawn
-  on the board. **Switching repos is a login, not config**: the 📁 picker at the
-  top of the side panel lists your GitHub repos — click one and Forge re-reads it
-  live (private repos included). Login is zero-click when the host has `gh`
-  logged in (or `GITHUB_TOKEN` set); otherwise configure the GitHub App sign-in
-  variables below and use the in-app **Sign in with GitHub** button.
-  `REPO_PATH`/`GITHUB_REPO` env still work for a fixed default.
+  on the board. The 📁 picker at the top of the side panel lists repositories
+  available to the backend's `GITHUB_TOKEN`; click one and Forge re-reads it
+  live (private repos included). `REPO_PATH`/`GITHUB_REPO` env still work for a
+  fixed default.
 
 ## Using it in a meeting
 
@@ -113,24 +111,12 @@ https://your-service.onrender.com/#token=YOUR_FORGE_ACCESS_TOKEN
 The fragment is not sent to the server; the frontend adds it to protected API and
 WebSocket requests. Do not share the bare deployment URL.
 
-### GitHub App sign-in
+### GitHub access
 
-This is optional, but enables each participant to select repositories and create
-issues using their own GitHub account, without a shared `GITHUB_TOKEN`.
-
-1. In GitHub, go to **Settings -> Developer settings -> GitHub Apps -> New GitHub App**.
-2. Make the app public, set its callback URL to
-   `https://forge-meeting.onrender.com/api/github/callback`, and grant repository
-   permissions **Contents: Read** and **Issues: Read and write**. The app must be
-   installed on the repository it should access; choose only that repository.
-3. Copy the GitHub App's **Client ID** and generate a **Client secret**.
-4. In Render, set `GITHUB_APP_CLIENT_ID` and `GITHUB_APP_CLIENT_SECRET`. Set
-   `GITHUB_APP_CALLBACK_URL` to the exact callback URL above.
-
-Participants click **Sign in with GitHub** in the repository picker. Forge stores
-their resulting token only in the running service's browser session; after a
-Render restart they sign in again. `GITHUB_TOKEN` remains an optional fallback
-for a fixed demo account.
+Configure one GitHub personal access token in Render as `GITHUB_TOKEN`. Grant it
+access to the repository's contents and issues, then use the 📁 picker to browse
+repositories or speak a meeting request to create an issue. The token stays on
+the backend and is never sent to browsers.
 
 The hosting tier is free, but Anthropic API usage is billed by Anthropic. Without
 an API key, Forge cannot use the local Claude CLI fallback on Render. ElevenLabs

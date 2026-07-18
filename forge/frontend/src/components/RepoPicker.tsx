@@ -1,5 +1,4 @@
-// GitHub login + repo picker. Zero-click when the backend already has a token
-// (env or the host's `gh` login); otherwise GitHub's device flow (short code).
+// Repo picker backed by the deployment's GITHUB_TOKEN environment variable.
 import { useEffect, useState } from "react";
 import { API, apiFetch } from "../config";
 import { useStore } from "../state/store";
@@ -12,7 +11,6 @@ interface Repo {
 interface GhStatus {
   connected: boolean;
   user?: string;
-  loginAvailable: boolean;
 }
 
 export default function RepoPicker() {
@@ -29,16 +27,12 @@ export default function RepoPicker() {
       setGh(s);
       if (s.connected) setRepos((await (await apiFetch(`${API}/api/github/repos`)).json()) as Repo[]);
     } catch {
-      setGh({ connected: false, loginAvailable: false });
+      setGh({ connected: false });
     }
   };
   useEffect(() => {
     void refresh();
   }, []);
-
-  const connect = async () => {
-    window.location.assign(`${API}/api/github/login?returnTo=${encodeURIComponent(window.location.href)}`);
-  };
 
   const load = async (fullName: string) => {
     setNote(`Reading ${fullName}…`);
@@ -69,12 +63,7 @@ export default function RepoPicker() {
       </button>
       {open && (
         <div className="repo-drop">
-          {!gh?.connected &&
-            (gh?.loginAvailable ? (
-              <button className="repo-connect" onClick={() => void connect()}>Sign in with GitHub</button>
-            ) : (
-              <div className="repo-hint">GitHub sign-in is not configured for this deployment.</div>
-            ))}
+          {!gh?.connected && <div className="repo-hint">Set GITHUB_TOKEN in the backend environment to browse repositories.</div>}
           {gh?.connected && (
             <>
               <input placeholder="Search your repos…" value={q} onChange={(e) => setQ(e.target.value)} />

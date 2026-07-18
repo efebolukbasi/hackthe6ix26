@@ -1,25 +1,12 @@
-// GitHub connection for Forge. A GitHub App user token is scoped to the
-// current browser session; environment and `gh` tokens remain local fallbacks.
+// GitHub connection for Forge. The deployment's GITHUB_TOKEN is the only
+// credential used for repository browsing, cloning, and issue creation.
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
 const execFileP = promisify(execFile);
 
-let cachedGhToken: string | null | undefined; // undefined = not probed yet
-
-async function ghCliToken(): Promise<string | null> {
-  if (cachedGhToken !== undefined) return cachedGhToken;
-  try {
-    const { stdout } = await execFileP("gh", ["auth", "token"], { timeout: 5000 });
-    cachedGhToken = stdout.trim() || null;
-  } catch {
-    cachedGhToken = null;
-  }
-  return cachedGhToken;
-}
-
-export async function githubToken(userToken?: string | null): Promise<string | null> {
-  return userToken || process.env.GITHUB_TOKEN || (await ghCliToken());
+export async function githubToken(): Promise<string | null> {
+  return process.env.GITHUB_TOKEN || null;
 }
 
 async function api<T>(path: string, token: string): Promise<T> {
@@ -33,16 +20,15 @@ async function api<T>(path: string, token: string): Promise<T> {
 export interface GithubStatus {
   connected: boolean;
   user?: string;
-  via?: "app" | "env" | "gh";
+  via?: "env";
 }
 
-export async function status(userToken?: string | null): Promise<GithubStatus> {
-  const token = await githubToken(userToken);
+export async function status(): Promise<GithubStatus> {
+  const token = await githubToken();
   if (!token) return { connected: false };
   try {
     const user = await api<{ login: string }>("/user", token);
-    const via = userToken ? "app" : process.env.GITHUB_TOKEN ? "env" : "gh";
-    return { connected: true, user: user.login, via };
+    return { connected: true, user: user.login, via: "env" };
   } catch {
     return { connected: false };
   }
@@ -55,8 +41,8 @@ export interface RepoInfo {
   description: string | null;
 }
 
-export async function listRepos(userToken?: string | null): Promise<RepoInfo[]> {
-  const token = await githubToken(userToken);
+export async function listRepos(): Promise<RepoInfo[]> {
+  const token = await githubToken();
   if (!token) throw Object.assign(new Error("not connected to GitHub"), { status: 401 });
   const repos = await api<RepoInfo[]>("/user/repos?sort=pushed&per_page=100", token);
   return repos.map((r) => ({
@@ -74,8 +60,8 @@ export interface CreatedIssue {
 }
 
 /** Create an issue in the repository checked out at `repoPath`. */
-export async function createIssue(repoPath: string, title: string, body: string, userToken?: string | null): Promise<CreatedIssue> {
-  const token = await githubToken(userToken);
+export async function createIssue(repoPath: string, title: string, body: string): Promise<CreatedIssue> {
+  const token = await githubToken();
   if (!token) throw Object.assign(new Error("Connect GitHub before creating an issue"), { status: 401 });
 
   let remote: string;
@@ -99,23 +85,6 @@ export async function createIssue(repoPath: string, title: string, body: string,
   });
   if (!res.ok) throw Object.assign(new Error(`GitHub API ${res.status}: ${(await res.text()).slice(0, 160)}`), { status: res.status });
   return res.json() as Promise<CreatedIssue>;
-}
-
-/** Exchange a GitHub App web-flow code for a user-to-server access token. */
-export async function exchangeWebCode(code: string, redirectUri: string): Promise<string> {
-  const clientId = process.env.GITHUB_APP_CLIENT_ID;
-  const clientSecret = process.env.GITHUB_APP_CLIENT_SECRET;
-  if (!clientId || !clientSecret) throw Object.assign(new Error("GitHub App is not configured"), { status: 503 });
-  const res = await fetch("https://github.com/login/oauth/access_token", {
-    method: "POST",
-    headers: { Accept: "application/json", "Content-Type": "application/json" },
-    body: JSON.stringify({ client_id: clientId, client_secret: clientSecret, code, redirect_uri: redirectUri }),
-  });
-  const out = (await res.json()) as { access_token?: string; error?: string; error_description?: string };
-  if (!res.ok || !out.access_token) {
-    throw Object.assign(new Error(out.error_description || out.error || "GitHub authorization failed"), { status: 502 });
-  }
-  return out.access_token;
 }
 
 /** Clone URL with the token injected (stripped from the git remote after clone). */

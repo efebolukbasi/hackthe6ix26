@@ -13,6 +13,8 @@ services:
         value: production
       - key: ANTHROPIC_API_KEY
         sync: false
+      - key: GITHUB_TOKEN
+        sync: false
       - key: FORGE_ACCESS_TOKEN
         generateValue: true
       - key: ELEVENLABS_API_KEY
