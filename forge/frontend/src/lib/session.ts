@@ -853,7 +853,7 @@ export class ForgeSession {
     this.room?.cast({ k: "board-edit" });
   }
 
-  openCodePanel(attr: { file: string; startLine?: number; endLine?: number }): void {
+  openCodePanel(attr: { file: string; startLine?: number; endLine?: number }, nodeLabel = "this component"): void {
     const params = new URLSearchParams({ path: attr.file });
     if (attr.startLine != null) params.set("start", String(attr.startLine));
     if (attr.endLine != null) params.set("end", String(attr.endLine));
@@ -871,6 +871,8 @@ export class ForgeSession {
             : null,
         });
         this.room?.cast({ k: "code-panel-open", file: data.path, githubUrl: data.githubUrl });
+        // kick off the live walkthrough now that the panel is open
+        void this.runWalkthrough(nodeLabel, attr);
       })
       .catch(() => { /* silently ignore missing file endpoint */ });
   }

@@ -85,8 +85,8 @@ export default function BoardCard() {
 
   const handleShowInCode = (item: BoardItem) => {
     setPopup(null);
-    const op = item.op as { attr?: { file: string; startLine?: number; endLine?: number } };
-    if (op.attr) session.openCodePanel(op.attr);
+    const op = item.op as { label?: string; attr?: { file: string; startLine?: number; endLine?: number } };
+    if (op.attr) session.openCodePanel(op.attr, op.label ?? "this component");
   };
 
   return (
