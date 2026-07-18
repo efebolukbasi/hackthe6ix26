@@ -4,3 +4,4 @@ dist/
 .tts-cache/
 .DS_Store
 *.log
+.claude/worktrees/
