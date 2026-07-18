@@ -4,14 +4,34 @@
 //     preferring stream-json partial output, falling back to plain text.
 import { spawn } from "node:child_process";
 
-const API_MODELS = { sonnet: "claude-sonnet-5", haiku: "claude-haiku-4-5-20251001", opus: "claude-opus-4-8" };
+const API_MODELS: Record<string, string> = {
+  sonnet: "claude-sonnet-5",
+  haiku: "claude-haiku-4-5-20251001",
+  opus: "claude-opus-4-8",
+};
 
-export function llmMode() {
+export function llmMode(): "api" | "cli" {
   return process.env.ANTHROPIC_API_KEY ? "api" : "cli";
 }
 
+interface StreamTextOptions {
+  system: string;
+  prompt: string;
+  model?: string;
+  maxTokens?: number;
+  onDelta?: (chunk: string) => void;
+  signal?: AbortSignal;
+}
+
 // Streams text; calls onDelta(chunk) as text arrives. Resolves with full text.
-export async function streamText({ system, prompt, model = "sonnet", maxTokens = 4000, onDelta = () => {}, signal }) {
+export async function streamText({
+  system,
+  prompt,
+  model = "sonnet",
+  maxTokens = 4000,
+  onDelta = () => {},
+  signal,
+}: StreamTextOptions): Promise<string> {
   if (process.env.ANTHROPIC_API_KEY) {
     return apiStream({ system, prompt, model, maxTokens, onDelta, signal });
   }
@@ -24,12 +44,21 @@ export async function streamText({ system, prompt, model = "sonnet", maxTokens =
   }
 }
 
-async function apiStream({ system, prompt, model, maxTokens, onDelta, signal }) {
+interface ApiStreamOptions {
+  system: string;
+  prompt: string;
+  model: string;
+  maxTokens: number;
+  onDelta: (chunk: string) => void;
+  signal?: AbortSignal;
+}
+
+async function apiStream({ system, prompt, model, maxTokens, onDelta, signal }: ApiStreamOptions): Promise<string> {
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     signal,
     headers: {
-      "x-api-key": process.env.ANTHROPIC_API_KEY,
+      "x-api-key": process.env.ANTHROPIC_API_KEY!,
       "anthropic-version": "2023-06-01",
       "content-type": "application/json",
     },
@@ -45,14 +74,14 @@ async function apiStream({ system, prompt, model, maxTokens, onDelta, signal }) 
 
   let full = "";
   let buf = "";
-  const reader = res.body.getReader();
+  const reader = res.body!.getReader();
   const dec = new TextDecoder();
   for (;;) {
     const { done, value } = await reader.read();
     if (done) break;
     buf += dec.decode(value, { stream: true });
     const lines = buf.split("\n");
-    buf = lines.pop();
+    buf = lines.pop() ?? "";
     for (const line of lines) {
       if (!line.startsWith("data: ")) continue;
       const payload = line.slice(6).trim();
@@ -63,13 +92,24 @@ async function apiStream({ system, prompt, model, maxTokens, onDelta, signal }) 
           full += ev.delta.text;
           onDelta(ev.delta.text);
         }
-      } catch { /* keep-alive lines etc. */ }
+      } catch {
+        /* keep-alive lines etc. */
+      }
     }
   }
   return full;
 }
 
-function cliStream({ system, prompt, model, onDelta, signal, streamJson }) {
+interface CliStreamOptions {
+  system: string;
+  prompt: string;
+  model: string;
+  onDelta: (chunk: string) => void;
+  signal?: AbortSignal;
+  streamJson: boolean;
+}
+
+function cliStream({ system, prompt, model, onDelta, signal, streamJson }: CliStreamOptions): Promise<string> {
   return new Promise((resolve, reject) => {
     const args = ["-p", "--model", model, "--max-turns", "1"];
     if (streamJson) args.push("--output-format", "stream-json", "--include-partial-messages", "--verbose");
@@ -84,8 +124,8 @@ function cliStream({ system, prompt, model, onDelta, signal, streamJson }) {
     const onAbort = () => child.kill("SIGKILL");
     signal?.addEventListener("abort", onAbort, { once: true });
 
-    child.stdin.write(`${system}\n\n${prompt}`);
-    child.stdin.end();
+    child.stdin!.write(`${system}\n\n${prompt}`);
+    child.stdin!.end();
 
     let full = "";
     let sawDelta = false;
@@ -93,12 +133,16 @@ function cliStream({ system, prompt, model, onDelta, signal, streamJson }) {
     let lineBuf = "";
     let stderr = "";
 
-    child.stdout.on("data", (d) => {
+    child.stdout!.on("data", (d: Buffer) => {
       const text = d.toString();
-      if (!streamJson) { plain += text; onDelta(text); return; }
+      if (!streamJson) {
+        plain += text;
+        onDelta(text);
+        return;
+      }
       lineBuf += text;
       const lines = lineBuf.split("\n");
-      lineBuf = lines.pop();
+      lineBuf = lines.pop() ?? "";
       for (const line of lines) {
         if (!line.trim()) continue;
         try {
@@ -113,12 +157,19 @@ function cliStream({ system, prompt, model, onDelta, signal, streamJson }) {
           } else if (msg.type === "result" && typeof msg.result === "string" && !sawDelta) {
             full = msg.result;
           }
-        } catch { /* non-JSON noise */ }
+        } catch {
+          /* non-JSON noise */
+        }
       }
     });
-    child.stderr.on("data", (d) => { stderr += d.toString(); });
+    child.stderr!.on("data", (d: Buffer) => {
+      stderr += d.toString();
+    });
 
-    child.on("error", (err) => { clearTimeout(killTimer); reject(err); });
+    child.on("error", (err) => {
+      clearTimeout(killTimer);
+      reject(err);
+    });
     child.on("close", (code) => {
       clearTimeout(killTimer);
       signal?.removeEventListener("abort", onAbort);
