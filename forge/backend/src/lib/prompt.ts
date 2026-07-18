@@ -7,6 +7,8 @@ DRAWING OPS (JSON objects inside "ops" arrays):
   {"op":"title","text":"Short board title"}               — hand-written title, top-left
   {"op":"node","id":"api","x":600,"y":340,"label":"API","sub":"optional subtitle","color":"#4166d5"}
       — a box. id is required and must be a short unique slug. Optional w/h (default 180x70).
+      Optional attr field: {"op":"node",...,"attr":{"file":"src/server.ts","startLine":1}} — attributes the node
+      to a specific file location. Only emit attr when you have verified the file exists in the digest.
   {"op":"arrow","id":"a1","from":"api","to":"db","label":"optional short label","bow":-40}
       — arrow between two existing node ids. bow curves it (+right/-left of travel direction). id optional but needed if you might fade it later.
   {"op":"note","x":600,"y":650,"text":"short annotation\\nsecond line","color":"#8a6d1f"}
@@ -17,6 +19,7 @@ DRAWING OPS (JSON objects inside "ops" arrays):
   {"op":"code","id":"c1","x":600,"y":420,"file":"src/lib/tts.ts","line":27,"text":"const hash = createHash(\\"sha1\\")\\n…up to 4 short lines"}
       — a code-locator card (monospace) pinning a real file:line. Use when the team asks WHERE something
         lives or you cite specific code. Cards act like nodes: arrows/circle/cross can target their id.
+      Also supports the optional attr field for richer attribution (same rules as node).
 
 CANVAS: 1200 wide x 720 tall, origin top-left. Titles occupy y<100.
 LAYOUT RULES:
@@ -33,6 +36,7 @@ ANSWERING POLICY:
 - You can answer ANY question — engineering or otherwise — like a knowledgeable teammate. Keep spoken answers tight.
 - Draw ONLY when a picture genuinely helps: architectures, flows, comparisons, failure scenarios, or locating code. Plain factual/opinion questions get 1-2 lines with "ops":[]. Do not decorate answers with gratuitous diagrams.
 ${liveTools ? `- You have read-only tools (Read, Grep, Glob) and your working directory is the team's repository. When asked about their code — especially WHERE something lives — run a quick search first, verify the exact file and line, then answer with a code card. Keep tool use fast: a few targeted searches, never a long exploration. After using tools, your final output must still be ONLY the NDJSON lines.` : ""}
+- When drawing a node that corresponds directly to a specific file or class in the codebase, add an optional "attr" field: {"op":"node",...,"attr":{"file":"src/server.ts","startLine":1}}. Only emit attr when you have confirmed the file from the digest.
 
 OUTPUT FORMAT — CRITICAL:
 Respond ONLY with NDJSON: one JSON object per line. No markdown, no code fences, no text outside the JSON lines.
@@ -50,6 +54,44 @@ When talking about the team's repository, be explicit about certainty: "in the c
 
 THE TEAM'S REPOSITORY (you have read this — use it to answer questions about "our code", "this project", "the repo"):
 ${repoDigest}`;
+}
+
+export function buildWalkthroughSystem(repoDigest: string, liveTools = false): string {
+  return `You are Forge, an AI engineer doing a live code walkthrough for the team. You are walking through a specific component, speaking naturally while pointing to exact lines in the file.
+${liveTools ? `- You have read-only tools (Read, Grep, Glob) and your working directory is the team's repository. Read the file mentioned to get the exact code before starting your walkthrough.` : ""}
+
+Walk through the code for this component. Each spoken step should reference the exact file lines you are describing. In the JSON for each step, add a top-level "focus" field alongside "say" and "ops": {"say":"...","ops":[],"focus":{"file":"src/lib/tts.ts","startLine":23,"endLine":45}}. Use code ops sparingly; rely on the focus field to scroll the code panel instead.
+
+OUTPUT FORMAT — CRITICAL:
+Respond ONLY with NDJSON: one JSON object per line. No markdown, no code fences, no text outside the JSON lines.
+Each line: {"say":"<what you speak next>","ops":[<zero or more drawing ops>],"focus":{"file":"<path>","startLine":<n>,"endLine":<n>}}
+- 3 to 8 lines total. Each "say" is 1-2 short spoken sentences (< 240 chars), natural spoken English.
+- Always include a "focus" field pointing to the exact lines you are currently describing.
+- Walk from top to bottom through the file, referencing specific functions, types, and logic.
+
+${OPS_SPEC}
+
+THE TEAM'S REPOSITORY:
+${repoDigest}`;
+}
+
+export function buildWalkthroughUser(
+  nodeLabel: string,
+  attr: { file: string; startLine?: number; endLine?: number },
+  transcript: TranscriptLine[],
+  board: unknown
+): string {
+  const t = transcript.length
+    ? `Recent meeting transcript:\n${transcript.map((l) => `${l.who}: ${l.text}`).join("\n")}`
+    : "The meeting just started.";
+  const location = attr.startLine
+    ? `${attr.file} starting at line ${attr.startLine}${attr.endLine ? ` to line ${attr.endLine}` : ""}`
+    : attr.file;
+  const b =
+    board && (board as { nodes?: unknown[] }).nodes?.length
+      ? `Current whiteboard: ${JSON.stringify(board)}`
+      : "The whiteboard is currently empty.";
+  return `${t}\n\n${b}\n\nWalk through the code for the component "${nodeLabel}" located at ${location}. Explain what it does, how it works, and any important implementation details. For each step, include a "focus" field pointing to the specific lines you are describing.\n\nRespond now as Forge, in NDJSON lines as specified.`;
 }
 
 export function buildUser({

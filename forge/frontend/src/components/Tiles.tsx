@@ -14,6 +14,8 @@ export default function Tiles() {
   const agentStatus = useStore((s) => s.agentStatus);
   const remoteName = useStore((s) => s.remoteName);
   const remoteStream = useStore((s) => s.remoteStream);
+  const myName = useStore((s) => s.myName);
+  const listeningActive = useStore((s) => s.listeningActive);
 
   useEffect(() => {
     if (streamReady && videoRef.current) videoRef.current.srcObject = session.stream;
@@ -23,12 +25,19 @@ export default function Tiles() {
     if (peerRef.current && remoteStream) peerRef.current.srcObject = remoteStream;
   }, [remoteStream]);
 
+  const orbClass = [
+    "orb-wrap",
+    thinking ? "working" : "",
+    listeningActive && !thinking && !orbSpeaking && !handRaised ? "listening" : "",
+    orbSpeaking ? "speaking" : "",
+  ].filter(Boolean).join(" ");
+
   return (
     <div id="tiles" className={remoteName ? "trio" : ""}>
       <div className={"tile" + (youTalking ? " talking" : "") + (camOff ? " camoff" : "")} id="tile-you">
         <video id="cam" ref={videoRef} autoPlay playsInline muted />
         <div className="avatar">E</div>
-        <div className="nametag">You</div>
+        <div className="nametag">{myName || "You"} <span className="you-tag">(you)</span></div>
       </div>
       {remoteName && (
         <div className="tile" id="tile-peer">
@@ -37,7 +46,7 @@ export default function Tiles() {
         </div>
       )}
       <div className="tile agent" id="tile-agent">
-        <div className={"orb-wrap" + (thinking ? " working" : "")}>
+        <div className={orbClass}>
           <span className="halo h1" /><span className="halo h2" />
           <div className={"orb" + (orbSpeaking ? " speaking" : "")} id="orb" />
         </div>

@@ -3,18 +3,18 @@ import "dotenv/config";
 import express from "express";
 import type { Request, Response } from "express";
 import cors from "cors";
-import { existsSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { execFile } from "node:child_process";
+import { execFile, execFileSync, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import { buildDigest } from "./lib/repo.ts";
-import { respond, listen, setRepoContext } from "./lib/agent.ts";
-import { synthesize, ttsEnabled } from "./lib/tts.ts";
+import { respond, listen, setRepoContext, getRepoCwd, walkthrough } from "./lib/agent.ts";
+import { synthesize, synthesizeStream, ttsEnabled } from "./lib/tts.ts";
 import { llmMode } from "./lib/llm.ts";
 import { attachRoom } from "./lib/room.ts";
 import * as github from "./lib/github.ts";
-import type { AgentRequestBody, RepoMeta } from "./lib/types.ts";
+import type { AgentRequestBody, RepoMeta, WalkthroughRequestBody } from "./lib/types.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 5180);
@@ -100,6 +100,29 @@ app.post("/api/repo/load", async (req: Request, res: Response) => {
   }
 });
 
+app.post("/api/tts/stream", async (req: Request, res: Response) => {
+  const body = req.body as { text?: string } | undefined;
+  const text = String(body?.text || "").slice(0, 900);
+  if (!text) return res.status(400).json({ error: "no text" });
+  try {
+    const upstream = await synthesizeStream(text);
+    res.set("Content-Type", "audio/mpeg");
+    const reader = upstream.body!.getReader();
+    const pump = async (): Promise<void> => {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) { res.end(); return; }
+        res.write(Buffer.from(value));
+      }
+    };
+    res.on("close", () => reader.cancel());
+    await pump();
+  } catch (err) {
+    const status = (err as { status?: number }).status || 502;
+    res.status(status).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
 app.post("/api/tts", async (req: Request, res: Response) => {
   const body = req.body as { text?: string } | undefined;
   const text = String(body?.text || "").slice(0, 900);
@@ -113,6 +136,91 @@ app.post("/api/tts", async (req: Request, res: Response) => {
     res.status(status).json({ error: message });
   }
 });
+
+app.post("/api/agent/code", (req: Request, res: Response) => {
+  const body = req.body as { task?: string } | undefined;
+  const task = String(body?.task || "").trim();
+  if (!task) return res.status(400).json({ error: "no task" });
+  const cwd = getRepoCwd();
+  if (!cwd) return res.status(400).json({ error: "no repo loaded" });
+
+  res.writeHead(200, { "Content-Type": "application/x-ndjson; charset=utf-8", "Cache-Control": "no-cache" });
+  const send = (obj: Record<string, unknown>): void => { if (!res.writableEnded) res.write(JSON.stringify(obj) + "\n"); };
+
+  const systemPrompt = "You are Forge, an AI engineer. Make focused, safe code changes to accomplish the task. After changes, report which files you touched. Never run destructive shell commands.";
+  const child = spawn(
+    "claude",
+    ["-p", "--model", process.env.FORGE_MODEL || "sonnet",
+      "--max-turns", "12",
+      "--allowedTools", "Read,Grep,Glob,Edit,Write,Bash",
+      "--output-format", "stream-json",
+      "--include-partial-messages",
+      "--verbose"],
+    { cwd, env: { ...process.env }, stdio: ["pipe", "pipe", "pipe"] }
+  );
+  child.stdin!.write(`${systemPrompt}\n\nTask: ${task}`);
+  child.stdin!.end();
+
+  let lineBuf = "";
+  child.stdout!.on("data", (d: Buffer) => {
+    lineBuf += d.toString();
+    const lines = lineBuf.split("\n"); lineBuf = lines.pop() ?? "";
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      try {
+        const msg = JSON.parse(line) as Record<string, unknown>;
+        if (msg.type === "stream_event") {
+          const ev = msg.event as Record<string, unknown> | undefined;
+          if (ev?.type === "content_block_delta") {
+            const delta = ev.delta as Record<string, unknown> | undefined;
+            if (delta?.type === "text_delta") send({ type: "progress", text: delta.text });
+          } else if (ev?.type === "content_block_start") {
+            const cb = ev.content_block as Record<string, unknown> | undefined;
+            if (cb?.type === "tool_use") send({ type: "tool", name: cb.name, input: JSON.stringify(cb.input || {}) });
+          }
+        } else if (msg.type === "result") {
+          send({ type: "done", summary: String(msg.result || "").slice(0, 1000) });
+        }
+      } catch { /* non-JSON */ }
+    }
+  });
+  child.on("close", (code) => {
+    if (!res.writableEnded) { send({ type: "done", summary: `Process exited (${code})` }); res.end(); }
+  });
+  child.on("error", (err: Error) => { send({ type: "error", message: err.message }); res.end(); });
+  res.on("close", () => child.kill("SIGKILL"));
+});
+
+app.get("/api/repo/file", (req: Request, res: Response) => {
+  const filePath = String(req.query.path || "").trim();
+  const startLine = Math.max(1, parseInt(String(req.query.start || "1"), 10));
+  const endLine = parseInt(String(req.query.end || "0"), 10) || undefined;
+  const cwd = getRepoCwd();
+  if (!filePath || !cwd) return res.status(400).json({ error: "no path or repo" });
+  const abs = resolve(cwd, filePath);
+  // Security: path must stay inside the repo.
+  if (!abs.startsWith(resolve(cwd) + "/") && abs !== resolve(cwd)) return res.status(403).json({ error: "path escape" });
+  if (!existsSync(abs)) return res.status(404).json({ error: "not found" });
+  const allLines = readFileSync(abs, "utf8").split("\n");
+  const from = startLine - 1;
+  const to = endLine ? endLine : Math.min(allLines.length, from + 80);
+  const lines = allLines.slice(from, to);
+  let githubUrl: string | undefined;
+  try {
+    const remote = execFileSync("git", ["-C", cwd, "remote", "get-url", "origin"], { encoding: "utf8" }).trim();
+    const m = remote.match(/github\.com[:/]([\w.-]+\/[\w.-]+?)(\.git)?$/);
+    if (m) {
+      const branch = execFileSync("git", ["-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"], { encoding: "utf8" }).trim();
+      const rel = relative(cwd, abs).replace(/\\/g, "/");
+      githubUrl = `https://github.com/${m[1]}/blob/${branch}/${rel}#L${startLine}${endLine ? `-L${endLine}` : ""}`;
+    }
+  } catch { /* no git or no remote */ }
+  res.json({ path: filePath, startLine, lines, githubUrl });
+});
+
+app.post("/api/agent/walkthrough", (req: Request, res: Response) =>
+  walkthrough(req.body as WalkthroughRequestBody, res)
+);
 
 // Local dev convenience: one port serves everything. In a split deployment the
 // frontend is hosted statically and points at this API via config.js.

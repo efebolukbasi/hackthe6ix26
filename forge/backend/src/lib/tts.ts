@@ -56,3 +56,36 @@ export async function synthesize(text: string): Promise<Buffer> {
   }
   return buf;
 }
+
+/**
+ * Streaming TTS — calls the ElevenLabs streaming endpoint and returns the raw
+ * fetch Response so the caller can pipe `response.body` directly to the client.
+ * Throws a TtsError (with `.status`) on missing key or upstream error.
+ */
+export async function synthesizeStream(text: string): Promise<Response> {
+  const key = process.env.ELEVENLABS_API_KEY;
+  if (!key) {
+    const e: TtsError = new Error("no ElevenLabs key");
+    e.status = 503;
+    throw e;
+  }
+  const voice = process.env.ELEVENLABS_VOICE_ID || DEFAULT_VOICE;
+  const res = await fetch(
+    `https://api.elevenlabs.io/v1/text-to-speech/${voice}/stream?output_format=mp3_22050_32`,
+    {
+      method: "POST",
+      headers: { "xi-api-key": key, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        text,
+        model_id: MODEL,
+        voice_settings: { stability: 0.45, similarity_boost: 0.7, speed: 1.04 },
+      }),
+    }
+  );
+  if (!res.ok) {
+    const e: TtsError = new Error(`ElevenLabs stream ${res.status}: ${(await res.text()).slice(0, 200)}`);
+    e.status = res.status === 401 ? 503 : 502;
+    throw e;
+  }
+  return res;
+}
