@@ -1,7 +1,7 @@
 import { create } from "zustand";
 import type { Health, TranscriptLine } from "../types";
 
-export type Phase = "prejoin" | "room" | "ended";
+export type Phase = "landing" | "prejoin" | "room" | "ended";
 
 export interface Caption {
   speaker: string;
@@ -42,7 +42,7 @@ export interface ForgeState {
 }
 
 export const useStore = create<ForgeState>()(() => ({
-  phase: "prejoin",
+  phase: "landing",
   agentStatus: "listening",
   caption: { speaker: "", text: "", visible: false },
   transcript: [],
