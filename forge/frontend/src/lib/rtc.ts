@@ -6,6 +6,14 @@ import { ACCESS_TOKEN, API } from "../config";
 import { useStore } from "../state/store";
 import type { WhiteboardOp } from "../types";
 
+/** Repo-stage state carried in a board-sync so a late joiner sees the same file. */
+export interface StageSync {
+  file: string;
+  startLine?: number;
+  endLine?: number;
+  highlight?: { start: number; end: number };
+}
+
 export type CastEvent =
   | { k: "utter"; who: string; text: string }
   | { k: "agent-start" }
@@ -16,9 +24,10 @@ export type CastEvent =
   | { k: "hand"; raised: boolean; reason: string }
   | { k: "board-edit" }
   | { k: "board-move"; id: string; dx: number; dy: number }
-  | { k: "board-sync"; ops: WhiteboardOp[]; moves: Array<{ id: string; dx: number; dy: number }> }
+  | { k: "board-sync"; ops: WhiteboardOp[]; moves: Array<{ id: string; dx: number; dy: number }>; stage?: StageSync }
   | { k: "focus"; file: string; startLine: number; endLine: number }
-  | { k: "code-panel-open"; file: string; startLine?: number; endLine?: number; githubUrl?: string };
+  | { k: "code-panel-open"; file: string; startLine?: number; endLine?: number }
+  | { k: "code-panel-close" };
 
 interface ServerMsg {
   t: "welcome" | "peer-joined" | "peer-left" | "signal" | "cast" | "full";

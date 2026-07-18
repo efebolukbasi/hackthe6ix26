@@ -5,7 +5,7 @@
 // listen buffer + raise-hand logic. UI state is pushed into the zustand store.
 
 import { Whiteboard } from "./whiteboard";
-import { RoomLink, type CastEvent } from "./rtc";
+import { RoomLink, type CastEvent, type StageSync } from "./rtc";
 import { API, apiFetch } from "../config";
 import { useStore } from "../state/store";
 import type {
@@ -103,6 +103,12 @@ export class ForgeSession {
   // Board state is replayed to a participant who joins after Forge has drawn.
   private boardOps: WhiteboardOp[] = [];
   private boardMoves: Array<{ id: string; dx: number; dy: number }> = [];
+
+  // Shared repo stage: the file location currently on stage (null when the
+  // panel is closed) and a key of the last staged target. The key survives a
+  // close so a location the user dismissed doesn't immediately reopen.
+  private stage: { file: string; startLine?: number; endLine?: number } | null = null;
+  private stageKey: string | null = null;
 
   constructor() {
     // Demo/debug hook: feed an utterance as if it were heard through the mic
@@ -448,6 +454,10 @@ export class ForgeSession {
         this.chime(1);
       }
       this.wb?.enqueue(step.ops);
+      // Both sides play the same steps (locally / via the step cast), so each
+      // opens the shared repo stage from its own copy — no extra cast, which
+      // is also what makes open/open broadcast loops impossible.
+      this.autoStage(step.ops);
     }
     this.caption("Forge", step.say, true);
     this.transcript("Forge", step.say);
@@ -630,12 +640,22 @@ export class ForgeSession {
         this.wb?.enqueue(ev.ops);
         this.wb?.finishNow();
         for (const move of ev.moves) this.wb?.moveItem(move.id, move.dx, move.dy);
+        // Late joiner: bring the shared repo stage up to where the room is.
+        if (ev.stage) {
+          this.stageKey = this.keyFor(ev.stage);
+          void this.stageFile(ev.stage, { highlight: ev.stage.highlight ?? null });
+        }
         break;
       case "focus":
-        useStore.setState({ codePanelHighlight: { start: ev.startLine, end: ev.endLine } });
+        this.ensureFocus(ev.file, ev.startLine, ev.endLine);
         break;
       case "code-panel-open":
-        void this.loadCodePanel(ev.file, ev.startLine, ev.endLine, ev.githubUrl);
+        this.stageKey = this.keyFor(ev);
+        void this.stageFile({ file: ev.file, startLine: ev.startLine, endLine: ev.endLine });
+        break;
+      case "code-panel-close":
+        this.stage = null;
+        useStore.setState({ codePanelOpen: false });
         break;
     }
   }
@@ -787,8 +807,12 @@ export class ForgeSession {
 
   // ---------- controls (invoked by components) ----------
   private syncBoardToPeer(): void {
-    if (!this.boardOps.length) return;
-    this.room?.cast({ k: "board-sync", ops: this.boardOps, moves: this.boardMoves });
+    const s = useStore.getState();
+    const stage: StageSync | undefined = s.codePanelOpen && this.stage
+      ? { ...this.stage, highlight: s.codePanelHighlight ?? undefined }
+      : undefined;
+    if (!this.boardOps.length && !stage) return;
+    this.room?.cast({ k: "board-sync", ops: this.boardOps, moves: this.boardMoves, stage });
   }
 
   attachBoard(canvas: HTMLCanvasElement): Whiteboard {
@@ -865,53 +889,106 @@ export class ForgeSession {
     this.room?.cast({ k: "board-move", id, dx, dy });
   }
 
-  openCodePanel(attr: { file: string; startLine?: number; endLine?: number }, nodeLabel = "this component"): void {
-    const params = new URLSearchParams({ path: attr.file });
-    if (attr.startLine != null) params.set("start", String(attr.startLine));
-    if (attr.endLine != null) params.set("end", String(attr.endLine));
-    apiFetch(`${API}/api/repo/file?${params}`)
-      .then((r) => r.json())
-      .then((data: { path: string; startLine: number; lines: string[]; githubUrl?: string }) => {
-        useStore.setState({
-          codePanelOpen: true,
-          codePanelFile: data.path,
-          codePanelLines: data.lines,
-          codePanelStartLine: data.startLine,
-          codePanelGithubUrl: data.githubUrl ?? null,
-          codePanelHighlight: attr.startLine != null
-            ? { start: attr.startLine, end: attr.endLine ?? attr.startLine }
-            : null,
-        });
-        this.room?.cast({
-          k: "code-panel-open",
-          file: data.path,
-          startLine: data.startLine,
-          endLine: attr.endLine,
-          githubUrl: data.githubUrl,
-        });
-        // kick off the live walkthrough now that the panel is open
-        void this.runWalkthrough(nodeLabel, attr);
-      })
-      .catch(() => { /* silently ignore missing file endpoint */ });
+  // ---------- shared repo stage ----------
+  private keyFor(t: { file: string; startLine?: number; endLine?: number }): string {
+    return `${t.file}:${t.startLine ?? ""}:${t.endLine ?? ""}`;
   }
 
-  private async loadCodePanel(file: string, startLine?: number, endLine?: number, githubUrl?: string): Promise<void> {
-    const params = new URLSearchParams({ path: file });
-    if (startLine != null) params.set("start", String(startLine));
-    if (endLine != null) params.set("end", String(endLine));
+  /** Fetch a file window around the target and put it on the stage. Returns
+   * false (and changes nothing) when the file is missing or the backend is
+   * unreachable — a bad reference must never break the meeting. */
+  private async stageFile(
+    target: { file: string; startLine?: number; endLine?: number },
+    opts: { highlight?: { start: number; end: number } | null } = {}
+  ): Promise<boolean> {
+    const params = new URLSearchParams({ path: target.file });
+    // Pad the window so the referenced lines sit in context, not at the very top.
+    params.set("start", String(Math.max(1, (target.startLine ?? 1) - 12)));
+    if (target.startLine != null) params.set("end", String((target.endLine ?? target.startLine) + 24));
     try {
       const res = await apiFetch(`${API}/api/repo/file?${params}`);
-      if (!res.ok) return;
+      if (!res.ok) return false;
       const data = (await res.json()) as { path: string; startLine: number; lines: string[]; githubUrl?: string };
+      // The backend anchors the link to the padded fetch window — point it at
+      // the exact referenced lines instead.
+      const githubUrl = data.githubUrl && target.startLine != null
+        ? data.githubUrl.replace(/#L\d+(-L\d+)?$/, `#L${target.startLine}${target.endLine ? `-L${target.endLine}` : ""}`)
+        : data.githubUrl;
+      this.stage = target;
       useStore.setState({
         codePanelOpen: true,
         codePanelFile: data.path,
         codePanelLines: data.lines,
         codePanelStartLine: data.startLine,
-        codePanelGithubUrl: data.githubUrl ?? githubUrl ?? null,
-        codePanelHighlight: startLine != null ? { start: startLine, end: endLine ?? startLine } : null,
+        codePanelGithubUrl: githubUrl ?? null,
+        codePanelHighlight: opts.highlight !== undefined
+          ? opts.highlight
+          : target.startLine != null
+            ? { start: target.startLine, end: target.endLine ?? target.startLine }
+            : null,
       });
-    } catch { /* remote code view is best-effort */ }
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** The repo location a step's ops point at: a node/code attr (verified by
+   * the agent against the digest), or a code card's own file+line — the
+   * stageFile fetch is the existence check for those. */
+  private stageTargetFromOps(ops: WhiteboardOp[]): { file: string; startLine?: number; endLine?: number } | null {
+    for (let i = ops.length - 1; i >= 0; i--) {
+      const op = ops[i];
+      if ((op.op === "node" || op.op === "code") && op.attr?.file) return op.attr;
+      if (op.op === "code" && op.file && op.line != null) return { file: op.file, startLine: op.line };
+    }
+    return null;
+  }
+
+  /** Auto-open the shared stage when a step references repo code. Runs on both
+   * sides as each plays the step, so no cast is needed. The key check keeps a
+   * location the user closed from reopening on every mention. */
+  private autoStage(ops: WhiteboardOp[]): void {
+    const target = this.stageTargetFromOps(ops);
+    if (!target) return;
+    const key = this.keyFor(target);
+    if (key === this.stageKey) return;
+    this.stageKey = key;
+    void this.stageFile(target);
+  }
+
+  /** Walkthrough focus: highlight in place when the lines are already loaded,
+   * otherwise re-stage a window around them (including file switches). */
+  private ensureFocus(file: string, start: number, end: number): void {
+    const s = useStore.getState();
+    const sameFile = !file || s.codePanelFile === file;
+    const lastLoaded = s.codePanelStartLine + s.codePanelLines.length - 1;
+    if (s.codePanelOpen && sameFile && start >= s.codePanelStartLine && end <= lastLoaded) {
+      useStore.setState({ codePanelHighlight: { start, end } });
+      return;
+    }
+    const targetFile = file || s.codePanelFile;
+    if (!targetFile) return;
+    const target = { file: targetFile, startLine: start, endLine: end };
+    this.stageKey = this.keyFor(target);
+    void this.stageFile(target);
+  }
+
+  openCodePanel(attr: { file: string; startLine?: number; endLine?: number }, nodeLabel = "this component"): void {
+    this.stageKey = this.keyFor(attr);
+    void this.stageFile(attr).then((ok) => {
+      if (!ok) return; // missing file — no panel, no walkthrough, no cast
+      this.room?.cast({ k: "code-panel-open", file: attr.file, startLine: attr.startLine, endLine: attr.endLine });
+      // The walkthrough runs only here, on the side that clicked — the peer
+      // mirrors it through step/focus casts, so it never runs twice.
+      void this.runWalkthrough(nodeLabel, attr);
+    });
+  }
+
+  closeCodePanel(): void {
+    this.stage = null;
+    useStore.setState({ codePanelOpen: false });
+    this.room?.cast({ k: "code-panel-close" });
   }
 
   async runWalkthrough(nodeLabel: string, attr: { file: string; startLine?: number; endLine?: number }): Promise<void> {
@@ -945,8 +1022,8 @@ export class ForgeSession {
             if (msg.type === "step") {
               await this.playStep({ type: "step", say: msg.say ?? "", ops: msg.ops }, true);
             } else if (msg.type === "focus") {
-              const hl = { start: msg.startLine ?? 1, end: msg.endLine ?? 1 };
-              useStore.setState({ codePanelHighlight: hl });
+              const hl = { start: msg.startLine ?? 1, end: msg.endLine ?? msg.startLine ?? 1 };
+              this.ensureFocus(msg.file ?? "", hl.start, hl.end);
               this.room?.cast({ k: "focus", file: msg.file ?? "", startLine: hl.start, endLine: hl.end });
             }
           } catch { /* ignore parse errors */ }

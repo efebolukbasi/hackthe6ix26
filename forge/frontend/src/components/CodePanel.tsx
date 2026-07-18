@@ -1,4 +1,5 @@
 import { useEffect, useRef } from 'react';
+import { session } from '../lib/session';
 import { useStore } from '../state/store';
 
 export default function CodePanel() {
@@ -20,6 +21,7 @@ export default function CodePanel() {
   return (
     <aside id="code-panel">
       <div className="code-panel-head">
+        <span className="code-panel-badge">SHARED REPO</span>
         <span className="code-panel-file">{file}</span>
         <div className="code-panel-actions">
           {githubUrl && (
@@ -27,7 +29,7 @@ export default function CodePanel() {
               Open in GitHub ↗
             </a>
           )}
-          <button onClick={() => useStore.setState({ codePanelOpen: false })}>✕</button>
+          <button title="Close for everyone" onClick={() => session.closeCodePanel()}>✕</button>
         </div>
       </div>
       <div className="code-panel-body" ref={panelRef}>
