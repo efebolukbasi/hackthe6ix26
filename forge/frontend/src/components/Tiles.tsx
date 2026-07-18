@@ -2,6 +2,28 @@ import { useEffect, useRef } from "react";
 import { session } from "../lib/session";
 import { useStore } from "../state/store";
 
+/** Hover-revealed volume slider pinned to a tile's top-left corner. */
+function VolumeControl({ value, onChange, label }: { value: number; onChange: (v: number) => void; label: string }) {
+  return (
+    <div className="tile-volume" title={`${label} volume`}>
+      {value === 0 ? (
+        <svg viewBox="0 0 24 24"><path d="M16.5 12A4.5 4.5 0 0 0 14 7.97v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51A8.8 8.8 0 0 0 21 12a9 9 0 0 0-7-8.77v2.06A7 7 0 0 1 19 12zM4.27 3 3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25a6.9 6.9 0 0 1-2.25 1.2v2.06a9 9 0 0 0 3.69-1.81L19.73 21 21 19.73 4.27 3zM12 4 9.91 6.09 12 8.18V4z" /></svg>
+      ) : (
+        <svg viewBox="0 0 24 24"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3A4.5 4.5 0 0 0 14 7.97v8.05A4.5 4.5 0 0 0 16.5 12zM14 3.23v2.06a7 7 0 0 1 0 13.42v2.06a9 9 0 0 0 0-17.54z" /></svg>
+      )}
+      <input
+        type="range"
+        min={0}
+        max={1}
+        step={0.05}
+        value={value}
+        aria-label={`${label} volume`}
+        onChange={(e) => onChange(Number(e.target.value))}
+      />
+    </div>
+  );
+}
+
 export default function Tiles() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const peerRef = useRef<HTMLVideoElement>(null);
@@ -17,6 +39,8 @@ export default function Tiles() {
   const myName = useStore((s) => s.myName);
   const listeningActive = useStore((s) => s.listeningActive);
   const thinkingTrace = useStore((s) => s.thinkingTrace);
+  const forgeVolume = useStore((s) => s.forgeVolume);
+  const peerVolume = useStore((s) => s.peerVolume);
 
   useEffect(() => {
     if (streamReady && videoRef.current) videoRef.current.srcObject = session.stream;
@@ -25,6 +49,10 @@ export default function Tiles() {
   useEffect(() => {
     if (peerRef.current && remoteStream) peerRef.current.srcObject = remoteStream;
   }, [remoteStream]);
+
+  useEffect(() => {
+    if (peerRef.current) peerRef.current.volume = peerVolume;
+  }, [peerVolume, remoteStream]);
 
   const working = stage === "working";
   const handVisible = handRaised || stage === "ready";
@@ -47,6 +75,7 @@ export default function Tiles() {
         <div className="tile" id="tile-peer">
           <video id="peercam" ref={peerRef} autoPlay playsInline />
           <div className="nametag">{remoteName}</div>
+          <VolumeControl value={peerVolume} onChange={(v) => session.setPeerVolume(v)} label={remoteName} />
         </div>
       )}
       <div className="tile agent" id="tile-agent">
@@ -66,6 +95,7 @@ export default function Tiles() {
         <div className="nametag">Forge · AI Engineer</div>
         <div className="agent-status" id="agentstatus"><span className="status-dot" />{agentStatus}</div>
         {activity && <div className="agent-activity" title={activity}>{activity}</div>}
+        <VolumeControl value={forgeVolume} onChange={(v) => session.setForgeVolume(v)} label="Forge" />
       </div>
     </div>
   );

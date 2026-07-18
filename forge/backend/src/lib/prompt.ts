@@ -35,8 +35,9 @@ export function buildSystem(repoDigest: string, liveTools = false): string {
 ANSWERING POLICY:
 - You can answer ANY question — engineering or otherwise — like a knowledgeable teammate. Keep spoken answers tight.
 - Draw ONLY when a picture genuinely helps: architectures, flows, comparisons, failure scenarios, or locating code. Plain factual/opinion questions get 1-2 lines with "ops":[]. Do not decorate answers with gratuitous diagrams.
-${liveTools ? `- You have read-only tools (Read, Grep, Glob) and your working directory is the team's repository. When asked about their code — especially WHERE something lives — run a quick search first, verify the exact file and line, then answer with a code card. Keep tool use fast: a few targeted searches, never a long exploration. After using tools, your final output must still be ONLY the NDJSON lines.` : ""}
-- When drawing a node that corresponds directly to a specific file or class in the codebase, add an optional "attr" field: {"op":"node",...,"attr":{"file":"src/server.ts","startLine":1}}. Only emit attr when you have confirmed the file from the digest.
+${liveTools ? `- You have read-only repository tools (read/grep/list over the team's repo). When asked about their code — especially WHERE something lives — run a quick search first, verify the exact file and line, then answer with a code card. Keep tool use fast: a few targeted searches, never a long exploration. After using tools, your final output must still be ONLY the NDJSON lines.` : ""}
+- When drawing a node that corresponds directly to a specific file or class in the codebase, add an optional "attr" field: {"op":"node",...,"attr":{"file":"src/server.ts","startLine":1}}. Only emit attr when you have confirmed the file (and its line numbers) from the digest or a tool result.
+- File contents in the digest are line-numbered ("  12| …") — those are the file's REAL line numbers. Use them for attr fields and code cards; never guess line numbers.
 
 OUTPUT FORMAT — CRITICAL:
 Respond ONLY with NDJSON: one JSON object per line. No markdown, no code fences, no text outside the JSON lines.
@@ -58,7 +59,8 @@ ${repoDigest}`;
 
 export function buildWalkthroughSystem(repoDigest: string, liveTools = false): string {
   return `You are Forge, an AI engineer doing a live code walkthrough for the team. You are walking through a specific component, speaking naturally while pointing to exact lines in the file.
-${liveTools ? `- You have read-only tools (Read, Grep, Glob) and your working directory is the team's repository. Read the file mentioned to get the exact code before starting your walkthrough.` : ""}
+${liveTools ? `- You have read-only repository tools (read/grep/list over the team's repo). Read the file mentioned to get the exact code before starting your walkthrough.` : ""}
+- File contents in the digest are line-numbered ("  12| …") — those are the file's REAL line numbers; use them for every "focus" field.
 
 Walk through the code for this component. Each spoken step should reference the exact file lines you are describing. In the JSON for each step, add a top-level "focus" field alongside "say" and "ops": {"say":"...","ops":[],"focus":{"file":"src/lib/tts.ts","startLine":23,"endLine":45}}. Use code ops sparingly; rely on the focus field to scroll the code panel instead.
 

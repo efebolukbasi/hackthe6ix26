@@ -137,6 +137,30 @@ export type StreamMsg =
   | AgentFocusEvent
   | ProgressEvent;
 
+// ---------- Forge task registry ----------
+
+export type ForgeTaskKind = "answer" | "walkthrough" | "issue";
+
+export type ForgeTaskStatus =
+  | "queued"
+  | "working"
+  | "ready"
+  | "presenting"
+  | "done"
+  | "cancelled"
+  | "error";
+
+export interface ForgeTask {
+  id: string;
+  kind: ForgeTaskKind;
+  label: string;
+  status: ForgeTaskStatus;
+  /** tool-call / progress lines observed while the task runs */
+  trace: string[];
+  /** owned by this client — cancellable directly rather than via a cast */
+  mine: boolean;
+}
+
 // ---------- transcript / health ----------
 
 export interface TranscriptLine {

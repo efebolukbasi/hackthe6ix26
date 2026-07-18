@@ -4,7 +4,7 @@
 // across both participants.
 import { ACCESS_TOKEN, API } from "../config";
 import { useStore } from "../state/store";
-import type { WhiteboardOp } from "../types";
+import type { ForgeTask, WhiteboardOp } from "../types";
 
 /** Repo-stage state carried in a board-sync so a late joiner sees the same file. */
 export interface StageSync {
@@ -30,7 +30,11 @@ export type CastEvent =
   | { k: "board-sync"; ops: WhiteboardOp[]; moves: Array<{ id: string; dx: number; dy: number }>; stage?: StageSync }
   | { k: "focus"; file: string; startLine: number; endLine: number }
   | { k: "code-panel-open"; file: string; startLine?: number; endLine?: number }
-  | { k: "code-panel-close" };
+  | { k: "code-panel-close" }
+  // Task registry sync: owners upsert their tasks; a peer asks the owner to
+  // cancel one via task-cancel (only the owner can actually stop the work).
+  | { k: "task"; task: Omit<ForgeTask, "mine"> }
+  | { k: "task-cancel"; id: string };
 
 interface ServerMsg {
   t: "welcome" | "peer-joined" | "peer-left" | "signal" | "cast" | "full";

@@ -8,19 +8,19 @@ import type { RepoMeta } from "./types.ts";
 
 const execFileP = promisify(execFile);
 
-const SKIP_DIRS = new Set(["node_modules", ".git", "dist", "build", ".next", ".tts-cache", "coverage", ".vercel"]);
-const TEXT_EXT = new Set([".js", ".mjs", ".ts", ".tsx", ".jsx", ".py", ".html", ".css", ".md", ".json", ".yml", ".yaml", ".toml", ".sh", ".txt"]);
+const SKIP_DIRS = new Set(["node_modules", ".git", "dist", "build", ".next", ".tts-cache", "coverage", ".vercel", ".repo-cache"]);
+export const TEXT_EXT = new Set([".js", ".mjs", ".ts", ".tsx", ".jsx", ".py", ".html", ".css", ".md", ".json", ".yml", ".yaml", ".toml", ".sh", ".txt"]);
 
-const TOTAL_BUDGET = 90_000; // chars of file content in the digest
-const PER_FILE_CAP = 9_000;
+const TOTAL_BUDGET = 150_000; // chars of file content in the digest
+const PER_FILE_CAP = 12_000;
 
-interface FileEntry {
+export interface FileEntry {
   path: string;
   full: string;
   size: number;
 }
 
-function walk(root: string): FileEntry[] {
+export function walkFiles(root: string): FileEntry[] {
   const files: FileEntry[] = [];
   const visit = (dir: string) => {
     let entries;
@@ -72,8 +72,16 @@ async function git(repoPath: string, args: string[]): Promise<string> {
 
 const MAX_TREE_FILES = 500; // keep the digest's tree section sane for big repos
 
+// Prefix each line with its real line number so the agent can cite exact
+// locations (attr fields, code cards) straight from the digest.
+function numberLines(content: string): string {
+  const lines = content.split("\n");
+  const width = String(lines.length).length;
+  return lines.map((l, i) => `${String(i + 1).padStart(width)}| ${l}`).join("\n");
+}
+
 export async function buildDigest(repoPath: string): Promise<{ digest: string; meta: RepoMeta }> {
-  const files = walk(repoPath);
+  const files = walkFiles(repoPath);
   const tree =
     files.slice(0, MAX_TREE_FILES).map((f) => `${f.path} (${f.size}b)`).join("\n") +
     (files.length > MAX_TREE_FILES ? `\n…and ${files.length - MAX_TREE_FILES} more files` : "");
@@ -92,7 +100,12 @@ export async function buildDigest(repoPath: string): Promise<{ digest: string; m
     } catch {
       continue;
     }
-    if (content.length > PER_FILE_CAP) content = content.slice(0, PER_FILE_CAP) + "\n…(truncated)";
+    content = numberLines(content);
+    if (content.length > PER_FILE_CAP) {
+      // Truncate at a line boundary so the numbering stays honest.
+      const cut = content.lastIndexOf("\n", PER_FILE_CAP);
+      content = content.slice(0, cut > 0 ? cut : PER_FILE_CAP) + "\n…(truncated)";
+    }
     if (used + content.length > TOTAL_BUDGET) continue;
     used += content.length;
     chunks.push(`----- FILE: ${f.path} -----\n${content}`);
@@ -105,7 +118,7 @@ export async function buildDigest(repoPath: string): Promise<{ digest: string; m
     `Repository root: ${basename(repoPath)}${branch ? ` (branch ${branch})` : ""}`,
     `\n== FILE TREE ==\n${tree}`,
     log ? `\n== RECENT COMMITS ==\n${log}` : "",
-    `\n== FILE CONTENTS (prioritized, may be truncated) ==\n${chunks.join("\n\n")}`,
+    `\n== FILE CONTENTS (prioritized, may be truncated; each line is prefixed with its real line number) ==\n${chunks.join("\n\n")}`,
   ].join("\n");
 
   return {

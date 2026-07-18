@@ -1,6 +1,6 @@
 // The Forge brain: turns meeting context into streamed whiteboard steps.
 import type { Response } from "express";
-import { streamText, llmMode } from "./llm.ts";
+import { streamText } from "./llm.ts";
 import { buildSystem, buildUser, buildIssuePrompt, buildListenPrompt, buildWalkthroughSystem, buildWalkthroughUser } from "./prompt.ts";
 import type { AgentRequestBody, AgentStep, ListenResult, TranscriptLine, WhiteboardOp, WalkthroughRequestBody } from "./types.ts";
 
@@ -10,8 +10,9 @@ let REPO_CWD: string | undefined;
 export function setRepoContext(digest: string, repoPath?: string): void {
   REPO_CWD = repoPath;
   REPO_DIGEST = digest;
-  // Live tools only exist on the CLI path; the API path answers from the digest.
-  SYSTEM = buildSystem(digest, llmMode() === "cli" && !!repoPath);
+  // Both brain paths have live repo tools now (CLI: Read/Grep/Glob; API:
+  // read_file/grep/list_files executed locally by llm.ts).
+  SYSTEM = buildSystem(digest, !!repoPath);
 }
 export function getRepoCwd(): string | undefined {
   return REPO_CWD;
@@ -197,7 +198,7 @@ export async function walkthrough(
   );
 
   try {
-    const walkthroughSystem = buildWalkthroughSystem(REPO_DIGEST, llmMode() === "cli" && !!REPO_CWD);
+    const walkthroughSystem = buildWalkthroughSystem(REPO_DIGEST, !!REPO_CWD);
     await streamText({
       system: walkthroughSystem,
       prompt: buildWalkthroughUser(nodeLabel, attr, transcript, board),

@@ -1,5 +1,17 @@
 import { create } from "zustand";
-import type { Health, TranscriptLine } from "../types";
+import type { ForgeTask, Health, TranscriptLine } from "../types";
+
+// Volume prefs survive reloads. Number(null) is 0, so check presence first.
+function storedVolume(key: string): number {
+  try {
+    const raw = localStorage.getItem(key);
+    if (raw === null) return 1;
+    const v = Number(raw);
+    return Number.isFinite(v) ? Math.min(1, Math.max(0, v)) : 1;
+  } catch {
+    return 1;
+  }
+}
 
 export type Phase = "landing" | "prejoin" | "room" | "ended";
 
@@ -48,6 +60,12 @@ export interface ForgeState {
   remoteStream: MediaStream | null;
   /** thinking / tool trace lines shown in SidePanel */
   thinkingTrace: string[];
+  /** active/queued/recently-finished Forge tasks (answers, walkthroughs, issues) */
+  tasks: ForgeTask[];
+  /** playback volume for Forge's voice (0..1) */
+  forgeVolume: number;
+  /** playback volume for the remote peer (0..1) */
+  peerVolume: number;
   /** code panel state */
   codePanelOpen: boolean;
   codePanelFile: string | null;
@@ -81,6 +99,9 @@ export const useStore = create<ForgeState>()(() => ({
   remoteName: null,
   remoteStream: null,
   thinkingTrace: [],
+  tasks: [],
+  forgeVolume: storedVolume("forge-volume"),
+  peerVolume: storedVolume("forge-peer-volume"),
   codePanelOpen: false,
   codePanelFile: null,
   codePanelLines: [],

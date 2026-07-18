@@ -22,10 +22,12 @@ const PORT = Number(process.env.PORT || 5180);
 const execFileP = promisify(execFile);
 const REPO_CACHE = join(__dirname, "..", ".repo-cache");
 
+const GITHUB_URL_RE = /^https:\/\/github\.com\/([\w.-]+)\/([\w.-]+?)(\.git)?\/?$/;
+
 // A repo "source" is either a local path or a GitHub URL (shallow-cloned into
 // the cache; pulled on re-load). Returns the local path to index.
 async function ensureRepo(source: string): Promise<string> {
-  const m = source.match(/^https:\/\/github\.com\/([\w.-]+)\/([\w.-]+?)(\.git)?\/?$/);
+  const m = source.match(GITHUB_URL_RE);
   if (!m) return resolve(source);
   // Cache key includes the owner so acme/api and globex/api don't collide.
   const dir = join(REPO_CACHE, `${m[1]}__${m[2]}`);
@@ -66,6 +68,20 @@ app.use("/api", (req, res, next) => {
 });
 
 let repoMeta: RepoMeta = { name: "(indexing…)", fileCount: 0 };
+// owner/repo of the active repository — known from the load URL, or derived
+// from the checkout's git origin. Used for issue creation and GitHub links.
+let repoSlug: string | null = null;
+
+// Index a repo source and make it the active repo for the whole backend.
+async function loadRepo(source: string): Promise<RepoMeta> {
+  const path = await ensureRepo(source);
+  const m = source.match(GITHUB_URL_RE);
+  repoSlug = m ? `${m[1]}/${m[2]}` : await github.repoSlugFor(path);
+  const { digest, meta } = await buildDigest(path);
+  setRepoContext(digest, path);
+  repoMeta = meta;
+  return meta;
+}
 
 app.get("/api/health", (_req: Request, res: Response) => {
   res.json({ ok: true, llm: llmMode(), tts: ttsEnabled(), repo: repoMeta });
@@ -108,7 +124,7 @@ app.post("/api/github/issues", async (req: Request, res: Response) => {
   if (!title) title = "Meeting follow-up";
   if (!issueBody) issueBody = "Created from a Forge meeting.";
   try {
-    res.json(await github.createIssue(cwd, title, issueBody));
+    res.json(await github.createIssue(cwd, title, issueBody, repoSlug ?? undefined));
   } catch (err) {
     const e = err as { status?: number; message?: string };
     res.status(e.status || 502).json({ error: e.message || String(err) });
@@ -120,11 +136,8 @@ app.post("/api/repo/load", async (req: Request, res: Response) => {
   const source = String((req.body as { url?: string } | undefined)?.url || "").trim();
   if (!source) return res.status(400).json({ error: "no url" });
   try {
-    const path = await ensureRepo(source);
-    const { digest, meta } = await buildDigest(path);
-    setRepoContext(digest, path);
-    repoMeta = meta;
-    console.log(`repo switched → ${path} (${meta.fileCount} files)`);
+    const meta = await loadRepo(source);
+    console.log(`repo switched → ${meta.name} (${meta.fileCount} files)`);
     res.json({ ok: true, repo: meta });
   } catch (err) {
     res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
@@ -184,15 +197,14 @@ app.get("/api/repo/file", (req: Request, res: Response) => {
   const to = Math.min(allLines.length, endLine ? endLine : from + 80, from + 400);
   const lines = allLines.slice(from, to);
   let githubUrl: string | undefined;
-  try {
-    const remote = execFileSync("git", ["-C", cwd, "remote", "get-url", "origin"], { encoding: "utf8" }).trim();
-    const m = remote.match(/github\.com[:/]([\w.-]+\/[\w.-]+?)(\.git)?$/);
-    if (m) {
-      const branch = execFileSync("git", ["-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"], { encoding: "utf8" }).trim();
-      const rel = relative(cwd, abs).replace(/\\/g, "/");
-      githubUrl = `https://github.com/${m[1]}/blob/${branch}/${rel}#L${startLine}${endLine ? `-L${endLine}` : ""}`;
-    }
-  } catch { /* no git or no remote */ }
+  if (repoSlug) {
+    let branch = "main";
+    try {
+      branch = execFileSync("git", ["-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"], { encoding: "utf8" }).trim() || "main";
+    } catch { /* not a git checkout — assume default branch */ }
+    const rel = relative(cwd, abs).replace(/\\/g, "/");
+    githubUrl = `https://github.com/${repoSlug}/blob/${branch}/${rel}#L${startLine}${endLine ? `-L${endLine}` : ""}`;
+  }
   res.json({ path: filePath, startLine, lines, githubUrl });
 });
 
@@ -233,11 +245,8 @@ const httpServer = app.listen(PORT, async () => {
   console.log(`forge backend → http://localhost:${PORT}`);
   console.log(`  llm: ${llmMode()}${ttsEnabled() ? ", elevenlabs: on" : ", elevenlabs: OFF (browser TTS fallback)"}`);
   console.log(`  indexing repo: ${REPO_SOURCE}`);
-  const repoPath = await ensureRepo(REPO_SOURCE);
-  const { digest, meta } = await buildDigest(repoPath);
-  setRepoContext(digest, repoPath);
-  repoMeta = meta;
-  console.log(`  repo indexed: ${meta.fileCount} files, ${meta.includedFiles} in digest (${meta.chars} chars)`);
+  const meta = await loadRepo(REPO_SOURCE);
+  console.log(`  repo indexed: ${meta.fileCount} files, ${meta.includedFiles} in digest (${meta.chars} chars)${repoSlug ? ` · github: ${repoSlug}` : ""}`);
 });
 
 attachRoom(httpServer);

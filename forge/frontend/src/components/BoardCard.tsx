@@ -5,6 +5,18 @@ import type { Whiteboard } from "../lib/whiteboard";
 
 type Popup = { item: BoardItem; cx: number; cy: number } | null;
 
+type CodeTarget = { file: string; startLine?: number; endLine?: number };
+
+/** The repo location a board item points at: a node/code attr, or a code
+ * card's own file+line. Null for plain nodes with no attribution. */
+function codeTarget(item: BoardItem | null): CodeTarget | null {
+  if (!item) return null;
+  const op = item.op as { attr?: CodeTarget; file?: string; line?: number };
+  if (op.attr?.file) return op.attr;
+  if (item.type === "code" && op.file) return { file: op.file, startLine: op.line };
+  return null;
+}
+
 // One live gesture at a time: dragging a card, panning the paper, or a
 // two-finger pinch (which owns both pointers).
 type Gesture =
@@ -21,6 +33,34 @@ export default function BoardCard() {
   const [popup, setPopup] = useState<Popup>(null);
   const [zoomPct, setZoomPct] = useState(100);
   const [following, setFollowing] = useState(true);
+
+  // Hover "view code" button: positioned imperatively every frame so it stays
+  // glued to its node through camera glides; shown/hidden via a CSS class so
+  // the pop animation stays smooth.
+  const codeBtnRef = useRef<HTMLButtonElement>(null);
+  const hoverCodeRef = useRef<{ item: BoardItem; target: CodeTarget } | null>(null);
+  const hideCodeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const cancelCodeHide = () => {
+    if (hideCodeTimerRef.current) {
+      clearTimeout(hideCodeTimerRef.current);
+      hideCodeTimerRef.current = null;
+    }
+  };
+
+  // Grace period so the pointer can travel from the node onto the button.
+  const scheduleCodeHide = () => {
+    if (hideCodeTimerRef.current || !hoverCodeRef.current) return;
+    hideCodeTimerRef.current = setTimeout(() => {
+      hideCodeTimerRef.current = null;
+      hoverCodeRef.current = null;
+    }, 260);
+  };
+
+  const hideCodeNow = () => {
+    cancelCodeHide();
+    hoverCodeRef.current = null;
+  };
 
   // Element-local coords from client coords (offsetX is unreliable under CSS
   // transforms and for synthetic events).
@@ -49,6 +89,24 @@ export default function BoardCard() {
         const pct = Math.round(wb.camera.z * 100);
         if (pct !== lastPct) { lastPct = pct; setZoomPct(pct); }
         if (wb.follow !== lastFollow) { lastFollow = wb.follow; setFollowing(wb.follow); }
+        // Keep the hover code button pinned above its item's top edge.
+        const btn = codeBtnRef.current;
+        if (btn) {
+          const hov = hoverCodeRef.current;
+          if (hov?.item.bbox) {
+            const dx = hov.item.offset?.dx ?? 0;
+            const dy = hov.item.offset?.dy ?? 0;
+            const p = wb.camera.worldToScreen({
+              x: (hov.item.bbox.minX + hov.item.bbox.maxX) / 2 + dx,
+              y: hov.item.bbox.minY + dy,
+            });
+            btn.style.left = `${p.x}px`;
+            btn.style.top = `${p.y}px`;
+            btn.classList.add("show");
+          } else {
+            btn.classList.remove("show");
+          }
+        }
       };
       raf = requestAnimationFrame(loop);
     });
@@ -89,6 +147,7 @@ export default function BoardCard() {
     const wb = wbRef.current;
     if (!wb) return;
     setPopup(null);
+    hideCodeNow();
     const { x: ox, y: oy } = local(e.currentTarget, e.clientX, e.clientY);
     pointersRef.current.set(e.pointerId, { x: ox, y: oy });
     try { e.currentTarget.setPointerCapture(e.pointerId); } catch { /* pointer already gone */ }
@@ -170,6 +229,13 @@ export default function BoardCard() {
     const item = wb.hitTest(vx, vy);
     wb.setHover(item?.id ?? null);
     setCursor(item ? "pointer" : "grab");
+    const target = codeTarget(item);
+    if (item && target) {
+      cancelCodeHide();
+      hoverCodeRef.current = { item, target };
+    } else {
+      scheduleCodeHide();
+    }
   };
 
   const handlePointerUp = (e: React.PointerEvent<HTMLCanvasElement>) => {
@@ -202,6 +268,9 @@ export default function BoardCard() {
     if (pointersRef.current.size === 0) gestureRef.current = null;
     wbRef.current?.setLift(null);
     wbRef.current?.setHover(null);
+    // Grace period, not an instant hide — the pointer may be moving onto the
+    // hover code button, which sits outside the canvas element.
+    scheduleCodeHide();
     setCursor("grab");
   };
 
@@ -311,6 +380,20 @@ export default function BoardCard() {
           </button>
         </div>
       </div>
+      <button
+        ref={codeBtnRef}
+        className="code-peek"
+        onPointerEnter={cancelCodeHide}
+        onPointerLeave={scheduleCodeHide}
+        onClick={() => {
+          const hov = hoverCodeRef.current;
+          if (!hov) return;
+          hideCodeNow();
+          session.stageFromBoard(hov.target);
+        }}
+      >
+        <span className="code-peek-icon">{"</>"}</span> View code
+      </button>
       {popup && (
         <div
           className="node-popup"

@@ -5,6 +5,7 @@ import Captions from "./Captions";
 import ControlBar from "./ControlBar";
 import SidePanel from "./SidePanel";
 import CodePanel from "./CodePanel";
+import TaskRegistry from "./TaskRegistry";
 
 export default function Room() {
   const presenting = useStore((s) => s.presenting);
@@ -14,6 +15,7 @@ export default function Room() {
         <BoardCard />
         <Tiles />
       </div>
+      <TaskRegistry />
       <Captions />
       <ControlBar />
       <SidePanel />

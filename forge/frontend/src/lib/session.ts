@@ -10,12 +10,18 @@ import { API, apiFetch } from "../config";
 import { useStore, type ForgeStage } from "../state/store";
 import type {
   AgentStep,
+  ForgeTask,
+  ForgeTaskKind,
+  ForgeTaskStatus,
   Health,
   SpeechRecognitionLike,
   StreamMsg,
   TranscriptLine,
   WhiteboardOp,
 } from "../types";
+
+const TERMINAL_TASK = new Set<ForgeTaskStatus>(["done", "cancelled", "error"]);
+const TASK_PRUNE_MS = 6_000;
 
 const delay = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -98,20 +104,29 @@ export class ForgeSession {
   private joined = false;
 
   private room: RoomLink | null = null;
-  private pendingInterrupt: string | null = null;
+  private pendingInterrupt: { text: string; taskId: string } | null = null;
   private remoteAgentActive = false;
   private remoteChain: Promise<void> = Promise.resolve();
   private myName = "You";
+
+  // Task registry: ids are namespaced by a per-session uid so ownership
+  // survives name collisions across the two clients.
+  private sid = Math.random().toString(36).slice(2, 8);
+  private taskSeq = 0;
+  private activeTaskId: string | null = null;
+  private walkthroughTaskId: string | null = null;
+  private walkthroughAbort: AbortController | null = null;
+  private issueTaskId: string | null = null;
+  private issueAbort: AbortController | null = null;
+  private taskPruneTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
   // Board state is replayed to a participant who joins after Forge has drawn.
   private boardOps: WhiteboardOp[] = [];
   private boardMoves: Array<{ id: string; dx: number; dy: number }> = [];
 
   // Shared repo stage: the file location currently on stage (null when the
-  // panel is closed) and a key of the last staged target. The key survives a
-  // close so a location the user dismissed doesn't immediately reopen.
+  // panel is closed).
   private stage: { file: string; startLine?: number; endLine?: number } | null = null;
-  private stageKey: string | null = null;
 
   // Self-echo filter state: what Forge itself said recently, plus a short
   // window after TTS ends during which Chrome is still finalizing audio it
@@ -177,10 +192,98 @@ export class ForgeSession {
   }
 
   /** Append a line to the visible working trace and mirror it to the peer,
-   * so both participants can watch what Forge is doing while it works. */
-  private traceLine(line: string, cast = true): void {
+   * so both participants can watch what Forge is doing while it works. Also
+   * records the line on the owning task so the registry shows it. */
+  private traceLine(line: string, taskId: string | null = this.activeTaskId, cast = true): void {
     useStore.setState((s) => ({ thinkingTrace: [...s.thinkingTrace.slice(-11), line] }));
+    this.taskTrace(taskId, line);
     if (cast) this.room?.cast({ k: "trace", line });
+  }
+
+  // ---------- task registry ----------
+  // Every unit of Forge work (answer, walkthrough, issue) is a task both
+  // participants can see and cancel. Owners drive their tasks and cast
+  // upserts; a peer cancels someone else's task by asking the owner.
+
+  private upsertTask(task: ForgeTask, cast = true): void {
+    useStore.setState((s) => {
+      const i = s.tasks.findIndex((t) => t.id === task.id);
+      return { tasks: i >= 0 ? s.tasks.map((t, j) => (j === i ? task : t)) : [...s.tasks, task] };
+    });
+    if (cast && task.mine) {
+      const { mine: _mine, ...wire } = task;
+      this.room?.cast({ k: "task", task: wire });
+    }
+    if (TERMINAL_TASK.has(task.status)) this.scheduleTaskPrune(task.id);
+  }
+
+  private scheduleTaskPrune(id: string): void {
+    clearTimeout(this.taskPruneTimers.get(id));
+    this.taskPruneTimers.set(id, setTimeout(() => {
+      this.taskPruneTimers.delete(id);
+      useStore.setState((s) => ({ tasks: s.tasks.filter((t) => t.id !== id) }));
+    }, TASK_PRUNE_MS));
+  }
+
+  private newTask(kind: ForgeTaskKind, label: string, status: ForgeTaskStatus = "queued"): ForgeTask {
+    const task: ForgeTask = {
+      id: `${this.sid}-${++this.taskSeq}`,
+      kind,
+      label: label.trim().slice(0, 90) || "Forge task",
+      status,
+      trace: [],
+      mine: true,
+    };
+    this.upsertTask(task);
+    return task;
+  }
+
+  /** Update a live task; finished tasks stay finished (a late "done" must
+   * never resurrect a task someone cancelled). */
+  private setTask(id: string | null, patch: Partial<Pick<ForgeTask, "status" | "label">>): void {
+    if (!id) return;
+    const cur = useStore.getState().tasks.find((t) => t.id === id);
+    if (!cur || TERMINAL_TASK.has(cur.status)) return;
+    this.upsertTask({ ...cur, ...patch });
+  }
+
+  private taskTrace(id: string | null, line: string): void {
+    if (!id) return;
+    const cur = useStore.getState().tasks.find((t) => t.id === id);
+    if (!cur || TERMINAL_TASK.has(cur.status)) return;
+    this.upsertTask({ ...cur, trace: [...cur.trace.slice(-9), line] });
+  }
+
+  /** Cancel a task from the registry UI. Peer-owned tasks are cancelled by
+   * asking their owner; local ones stop the matching work directly. */
+  cancelTask(id: string): void {
+    const task = useStore.getState().tasks.find((t) => t.id === id);
+    if (!task || TERMINAL_TASK.has(task.status)) return;
+    if (!task.mine) {
+      this.room?.cast({ k: "task-cancel", id });
+      return;
+    }
+    if (this.pendingInterrupt?.taskId === id) {
+      this.pendingInterrupt = null;
+      this.setTask(id, { status: "cancelled" });
+      return;
+    }
+    if (this.activeTaskId === id) {
+      this.cancelAgent();
+      return;
+    }
+    if (this.walkthroughTaskId === id) {
+      this.walkthroughAbort?.abort();
+      if (!this.agentBusy && !this.remoteAgentActive) this.cancelSpeech();
+      this.setTask(id, { status: "cancelled" });
+      return;
+    }
+    if (this.issueTaskId === id) {
+      this.issueAbort?.abort();
+      this.setTask(id, { status: "cancelled" });
+      return;
+    }
+    this.setTask(id, { status: "cancelled" });
   }
 
   // ---------- self-echo filter ----------
@@ -240,6 +343,7 @@ export class ForgeSession {
       const v = this.pickVoice();
       if (v) u.voice = v;
       u.rate = 1.04;
+      u.volume = useStore.getState().forgeVolume;
       u.onend = done;
       u.onerror = done;
       speechSynthesis.speak(u);
@@ -252,6 +356,7 @@ export class ForgeSession {
     const ms = new MediaSource();
     const url = URL.createObjectURL(ms);
     const a = new Audio(url);
+    a.volume = useStore.getState().forgeVolume;
     this.currentAudio = a;
     const abortCtrl = new AbortController();
     this.currentTtsAbort = abortCtrl;
@@ -477,12 +582,18 @@ export class ForgeSession {
     this.readyRelease?.();
   }
 
-  private async runAgent({ question = "", invited = false, reason = "", interrupted = false }: { question?: string; invited?: boolean; reason?: string; interrupted?: boolean }): Promise<void> {
+  private async runAgent({ question = "", invited = false, reason = "", interrupted = false, taskId }: { question?: string; invited?: boolean; reason?: string; interrupted?: boolean; taskId?: string }): Promise<void> {
     if (this.agentBusy || this.remoteAgentActive) return;
     this.agentBusy = true;
     this.cancelled = false;
     this.lowerHand();
     useStore.setState({ listeningActive: false, thinkingTrace: [] });
+    // Adopt the queued task from an interrupt, or register a fresh one.
+    const existing = taskId ? useStore.getState().tasks.find((t) => t.id === taskId) : undefined;
+    const task = existing ?? this.newTask("answer", question || (invited ? "Share a raised-hand thought" : "Answer the team"));
+    if (TERMINAL_TASK.has(task.status)) { this.agentBusy = false; this.setListening(); return; } // cancelled while queued
+    this.activeTaskId = task.id;
+    this.setTask(task.id, { status: "working" });
     // Stage 1 — acknowledge receipt. The ack rides the agent-start cast so
     // BOTH participants hear the same acknowledgment, not just the asker.
     const ackMsg = this.ackFor(invited);
@@ -549,11 +660,13 @@ export class ForgeSession {
           // Stage 3 — ready: raise the hand, chime, and wait for a polite
           // gap (or an explicit "go ahead") before taking the floor.
           this.setStage("ready");
+          this.setTask(this.activeTaskId, { status: "ready" });
           this.chime(0.5);
           this.room?.cast({ k: "agent-ready" });
           await this.readyPause();
         }
         useStore.setState({ thinkingTrace: [] });
+        this.setTask(this.activeTaskId, { status: "presenting" });
         for (const step of preparedSteps) {
           if (this.cancelled) break;
           await this.playStep(step, true);
@@ -565,6 +678,7 @@ export class ForgeSession {
         await this.speak(line);
       }
     } catch {
+      this.setTask(this.activeTaskId, { status: this.cancelled ? "cancelled" : "error" });
       if (!this.cancelled) {
         const line = "I can't reach my backend brain right now — is the server still running?";
         this.caption("Forge", line, true);
@@ -572,6 +686,8 @@ export class ForgeSession {
         await this.speak(line);
       }
     } finally {
+      this.setTask(this.activeTaskId, { status: this.cancelled ? "cancelled" : "done" });
+      this.activeTaskId = null;
       this.room?.cast({ k: "agent-end" });
       useStore.setState({ thinkingTrace: [] });
       this.hideCaption();
@@ -582,7 +698,7 @@ export class ForgeSession {
       this.buffer = [];
       const next = this.pendingInterrupt;
       this.pendingInterrupt = null;
-      if (next) setTimeout(() => void this.runAgent({ question: next, interrupted: true }), 250);
+      if (next) setTimeout(() => void this.runAgent({ question: next.text, interrupted: true, taskId: next.taskId }), 250);
     }
   }
 
@@ -595,10 +711,8 @@ export class ForgeSession {
         this.chime(1);
       }
       this.wb?.enqueue(step.ops);
-      // Both sides play the same steps (locally / via the step cast), so each
-      // opens the shared repo stage from its own copy — no extra cast, which
-      // is also what makes open/open broadcast loops impossible.
-      this.autoStage(step.ops);
+      // Attributed nodes no longer auto-open the code stage — hovering a node
+      // reveals a "view code" button instead (BoardCard → stageFromBoard).
     }
     this.caption("Forge", step.say, true);
     this.transcript("Forge", step.say);
@@ -621,7 +735,8 @@ export class ForgeSession {
   // Barge-in: halt the current explanation, then re-run with the new request.
   // The board stays as-is so the follow-up can build on it.
   private interrupt(text: string): void {
-    this.pendingInterrupt = text;
+    const queued = this.newTask("answer", text);
+    this.pendingInterrupt = { text, taskId: queued.id };
     this.cancelled = true;
     this.agentAbort?.abort();
     this.cancelSpeech();
@@ -631,6 +746,12 @@ export class ForgeSession {
   cancelAgent(): void {
     this.room?.cast({ k: "cancel" });
     this.cancelled = true;
+    this.setTask(this.activeTaskId, { status: "cancelled" });
+    // A hard stop also drops whatever was queued behind the current run.
+    if (this.pendingInterrupt) {
+      this.setTask(this.pendingInterrupt.taskId, { status: "cancelled" });
+      this.pendingInterrupt = null;
+    }
     this.agentAbort?.abort();
     this.cancelSpeech();
     this.wb?.finishNow();
@@ -640,6 +761,10 @@ export class ForgeSession {
   }
 
   private async createGitHubIssue(command: string): Promise<void> {
+    const task = this.newTask("issue", `GitHub issue: ${command}`, "working");
+    this.issueTaskId = task.id;
+    const abort = new AbortController();
+    this.issueAbort = abort;
     const context = useStore.getState().transcript
       .filter((line) => line.who !== "Forge" && line.text !== command)
       .slice(-12);
@@ -647,14 +772,21 @@ export class ForgeSession {
       const res = await apiFetch(`${API}/api/github/issues`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        signal: abort.signal,
         body: JSON.stringify({ command, transcript: context }),
       });
       const out = (await res.json()) as { html_url?: string; number?: number; title?: string; error?: string };
       if (!res.ok || !out.html_url) throw new Error(out.error || "issue creation failed");
+      this.setTask(task.id, { status: "done", label: `Issue #${out.number}: ${out.title ?? ""}` });
       await this.playStep({ type: "step", say: `Created GitHub issue number ${out.number}: ${out.title}.`, ops: [] }, true);
     } catch (err) {
+      if (abort.signal.aborted) return; // cancelled from the registry — stay quiet
+      this.setTask(task.id, { status: "error" });
       const message = err instanceof Error ? err.message : "issue creation failed";
       await this.playStep({ type: "step", say: `I couldn't create that GitHub issue: ${message}.`, ops: [] }, true);
+    } finally {
+      this.issueTaskId = null;
+      this.issueAbort = null;
     }
   }
 
@@ -809,7 +941,6 @@ export class ForgeSession {
         for (const move of ev.moves) this.wb?.moveItem(move.id, move.dx, move.dy);
         // Late joiner: bring the shared repo stage up to where the room is.
         if (ev.stage) {
-          this.stageKey = this.keyFor(ev.stage);
           void this.stageFile(ev.stage, { highlight: ev.stage.highlight ?? null });
         }
         break;
@@ -817,13 +948,22 @@ export class ForgeSession {
         this.ensureFocus(ev.file, ev.startLine, ev.endLine);
         break;
       case "code-panel-open":
-        this.stageKey = this.keyFor(ev);
         void this.stageFile({ file: ev.file, startLine: ev.startLine, endLine: ev.endLine });
         break;
       case "code-panel-close":
         this.stage = null;
         useStore.setState({ codePanelOpen: false });
         break;
+      case "task":
+        // Peer's task upsert — mirror it (never re-cast someone else's task).
+        this.upsertTask({ ...ev.task, mine: false }, false);
+        break;
+      case "task-cancel": {
+        // Peer asks us to cancel one of OUR tasks.
+        const target = useStore.getState().tasks.find((t) => t.id === ev.id);
+        if (target?.mine) this.cancelTask(ev.id);
+        break;
+      }
     }
   }
 
@@ -840,6 +980,10 @@ export class ForgeSession {
   private chime(gain = 1): void {
     const ac = this.audioCtx;
     if (!ac) return;
+    // Chimes are Forge's sounds too — scale with (and mute at) its volume.
+    const vol = useStore.getState().forgeVolume;
+    if (vol <= 0.01) return;
+    gain *= vol;
     const t0 = ac.currentTime;
     [523.25, 783.99].forEach((f, i) => {
       const o = ac.createOscillator();
@@ -859,13 +1003,15 @@ export class ForgeSession {
   private listeningChime(): void {
     const ac = this.audioCtx;
     if (!ac) return;
+    const vol = useStore.getState().forgeVolume;
+    if (vol <= 0.01) return;
     const t0 = ac.currentTime;
     const o = ac.createOscillator();
     const g = ac.createGain();
     o.type = "sine";
     o.frequency.value = 880;
     g.gain.setValueAtTime(0.0001, t0);
-    g.gain.exponentialRampToValueAtTime(0.04, t0 + 0.01);
+    g.gain.exponentialRampToValueAtTime(0.04 * vol, t0 + 0.01);
     g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.15);
     o.connect(g).connect(ac.destination);
     o.start(t0);
@@ -1019,6 +1165,21 @@ export class ForgeSession {
     if (!ccOn) this.hideCaption();
   }
 
+  /** Forge's voice volume — applies to the playing line, future lines, and chimes. */
+  setForgeVolume(v: number): void {
+    const vol = Math.min(1, Math.max(0, v));
+    useStore.setState({ forgeVolume: vol });
+    try { localStorage.setItem("forge-volume", String(vol)); } catch { /* private mode */ }
+    if (this.currentAudio) this.currentAudio.volume = vol;
+  }
+
+  /** Remote peer's volume — Tiles applies it to the peer video element. */
+  setPeerVolume(v: number): void {
+    const vol = Math.min(1, Math.max(0, v));
+    useStore.setState({ peerVolume: vol });
+    try { localStorage.setItem("forge-peer-volume", String(vol)); } catch { /* private mode */ }
+  }
+
   togglePanel(): void {
     useStore.setState((s) => ({ panelOpen: !s.panelOpen }));
   }
@@ -1065,10 +1226,6 @@ export class ForgeSession {
   }
 
   // ---------- shared repo stage ----------
-  private keyFor(t: { file: string; startLine?: number; endLine?: number }): string {
-    return `${t.file}:${t.startLine ?? ""}:${t.endLine ?? ""}`;
-  }
-
   /** Fetch a file window around the target and put it on the stage. Returns
    * false (and changes nothing) when the file is missing or the backend is
    * unreachable — a bad reference must never break the meeting. */
@@ -1108,28 +1265,13 @@ export class ForgeSession {
     }
   }
 
-  /** The repo location a step's ops point at: a node/code attr (verified by
-   * the agent against the digest), or a code card's own file+line — the
-   * stageFile fetch is the existence check for those. */
-  private stageTargetFromOps(ops: WhiteboardOp[]): { file: string; startLine?: number; endLine?: number } | null {
-    for (let i = ops.length - 1; i >= 0; i--) {
-      const op = ops[i];
-      if ((op.op === "node" || op.op === "code") && op.attr?.file) return op.attr;
-      if (op.op === "code" && op.file && op.line != null) return { file: op.file, startLine: op.line };
-    }
-    return null;
-  }
-
-  /** Auto-open the shared stage when a step references repo code. Runs on both
-   * sides as each plays the step, so no cast is needed. The key check keeps a
-   * location the user closed from reopening on every mention. */
-  private autoStage(ops: WhiteboardOp[]): void {
-    const target = this.stageTargetFromOps(ops);
-    if (!target) return;
-    const key = this.keyFor(target);
-    if (key === this.stageKey) return;
-    this.stageKey = key;
-    void this.stageFile(target);
+  /** Open the shared code stage for a board item (the hover "view code"
+   * button) — stages the file for both participants, no spoken walkthrough. */
+  stageFromBoard(target: { file: string; startLine?: number; endLine?: number }): void {
+    void this.stageFile(target).then((ok) => {
+      if (!ok) return; // missing file — leave the meeting undisturbed
+      this.room?.cast({ k: "code-panel-open", file: target.file, startLine: target.startLine, endLine: target.endLine });
+    });
   }
 
   /** Walkthrough focus: highlight in place when the lines are already loaded,
@@ -1144,13 +1286,10 @@ export class ForgeSession {
     }
     const targetFile = file || s.codePanelFile;
     if (!targetFile) return;
-    const target = { file: targetFile, startLine: start, endLine: end };
-    this.stageKey = this.keyFor(target);
-    void this.stageFile(target);
+    void this.stageFile({ file: targetFile, startLine: start, endLine: end });
   }
 
   openCodePanel(attr: { file: string; startLine?: number; endLine?: number }, nodeLabel = "this component"): void {
-    this.stageKey = this.keyFor(attr);
     void this.stageFile(attr).then((ok) => {
       if (!ok) return; // missing file — no panel, no walkthrough, no cast
       this.room?.cast({ k: "code-panel-open", file: attr.file, startLine: attr.startLine, endLine: attr.endLine });
@@ -1168,6 +1307,10 @@ export class ForgeSession {
 
   async runWalkthrough(nodeLabel: string, attr: { file: string; startLine?: number; endLine?: number }): Promise<void> {
     const board = this.wb ? this.wb.summary() : { title: null, nodes: [], arrows: [] };
+    const task = this.newTask("walkthrough", `Walk through ${nodeLabel}`, "working");
+    this.walkthroughTaskId = task.id;
+    const abort = new AbortController();
+    this.walkthroughAbort = abort;
     // A walkthrough is agent work too — show the working stage and tool
     // activity instead of silently sitting in "listening" while Claude reads.
     const wasIdle = !this.agentBusy && !this.remoteAgentActive;
@@ -1179,6 +1322,7 @@ export class ForgeSession {
       const res = await apiFetch(`${API}/api/agent/walkthrough`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        signal: abort.signal,
         body: JSON.stringify({
           nodeId: nodeLabel,
           nodeLabel,
@@ -1202,9 +1346,10 @@ export class ForgeSession {
           try {
             const msg = JSON.parse(line) as { type: string; say?: string; ops?: AgentStep["ops"]; file?: string; startLine?: number; endLine?: number; name?: string; input?: string };
             if (msg.type === "tool") {
-              this.traceLine(`🔍 ${msg.name ?? "tool"}: ${(msg.input ?? "").slice(0, 80)}`);
+              this.traceLine(`🔍 ${msg.name ?? "tool"}: ${(msg.input ?? "").slice(0, 80)}`, task.id);
             } else if (msg.type === "step") {
               useStore.setState({ thinkingTrace: [] });
+              this.setTask(task.id, { status: "presenting" });
               await this.playStep({ type: "step", say: msg.say ?? "", ops: msg.ops }, true);
             } else if (msg.type === "focus") {
               const hl = { start: msg.startLine ?? 1, end: msg.endLine ?? msg.startLine ?? 1 };
@@ -1215,6 +1360,9 @@ export class ForgeSession {
         }
       }
     } catch { /* silently fail — walkthrough is best-effort */ } finally {
+      this.setTask(task.id, { status: abort.signal.aborted ? "cancelled" : "done" });
+      this.walkthroughTaskId = null;
+      this.walkthroughAbort = null;
       if (wasIdle && !this.agentBusy && !this.remoteAgentActive) {
         useStore.setState({ thinkingTrace: [] });
         this.setListening();
