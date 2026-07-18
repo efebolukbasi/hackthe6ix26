@@ -9,28 +9,32 @@ can actually follow.
 
 ```
 forge/
-  backend/    Node + Express API — the brain, the voice, the repo knowledge
-    server.js         routes + static hosting of ../frontend for local dev
-    lib/repo.js       repo indexer → digest injected into the system prompt
-    lib/prompt.js     persona + whiteboard-op schema prompts
-    lib/llm.js        Claude access: ANTHROPIC_API_KEY (API) or `claude` CLI login
-    lib/agent.js      /api/agent — streams NDJSON steps {say, ops[]}; /api/listen
-    lib/tts.js        /api/tts — ElevenLabs proxy + disk cache (503 → browser TTS)
-  frontend/   Static meet-style web app (no build step)
-    index.html        pre-join → call UI (tiles, captions, controls, chat panel)
-    app.js            agent loop, speech recognition, raise-hand, voice playback
-    whiteboard.js     hand-drawn canvas engine; animates ops stroke-by-stroke
-    config.js         window.FORGE_API — point a static deploy at a remote backend
+  backend/    Express + TypeScript API (Node 24 native TS — no build step)
+    src/server.ts       routes + static hosting of ../frontend/dist
+    src/lib/repo.ts     repo indexer → digest injected into the system prompt
+    src/lib/prompt.ts   persona + whiteboard-op schema prompts
+    src/lib/llm.ts      Claude access: ANTHROPIC_API_KEY (API) or `claude` CLI login
+    src/lib/agent.ts    /api/agent — streams NDJSON steps {say, ops[]}; /api/listen
+    src/lib/tts.ts      /api/tts — ElevenLabs proxy + disk cache (503 → browser TTS)
+    src/lib/types.ts    shared types (WhiteboardOp union, AgentStep, …)
+  frontend/   Vite + React 18 + TypeScript
+    src/lib/whiteboard.ts   hand-drawn canvas engine; animates ops stroke-by-stroke
+    src/lib/session.ts      ForgeSession — mic/speech/TTS/agent-stream/raise-hand logic
+    src/state/store.ts      zustand UI state
+    src/components/         PreJoin · Room · BoardCard · Tiles · Captions · ControlBar · SidePanel · Ended
 ```
 
 ## Run it
 
 ```bash
-cd forge/backend
-cp .env.example .env       # paste ELEVENLABS_API_KEY (optional but 🔥 for demos)
-npm install
-npm start                  # → http://localhost:5180  (serves the frontend too)
+# from the repo root
+npm --prefix forge/backend install
+npm --prefix forge/frontend install
+npm start        # builds the frontend, starts the backend → http://localhost:5180
 ```
+
+Development (hot reload): `npm run dev:backend` + `npm run dev:frontend`
+(Vite on :5173 proxies /api → :5180). Optional voice: `cp forge/backend/.env.example forge/backend/.env` and paste `ELEVENLABS_API_KEY`.
 
 Open http://localhost:5180 in **Chrome**, allow mic/cam, Join.
 

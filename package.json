@@ -1,0 +1,12 @@
+{
+  "name": "forge-monorepo",
+  "private": true,
+  "description": "Forge — AI engineering teammate that joins your meetings. See forge/README.md",
+  "scripts": {
+    "dev:backend": "npm --prefix forge/backend run dev",
+    "dev:frontend": "npm --prefix forge/frontend run dev",
+    "build": "npm --prefix forge/frontend run build",
+    "typecheck": "npm --prefix forge/backend run typecheck",
+    "start": "npm --prefix forge/frontend run build && npm --prefix forge/backend start"
+  }
+}
