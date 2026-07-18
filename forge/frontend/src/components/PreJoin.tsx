@@ -25,15 +25,15 @@ export default function PreJoin() {
           <div className="preview-tag">You</div>
         </div>
         <p className="prejoin-note"><span className="dot" /> <strong>Forge</strong>, your AI engineering teammate, is already in the call</p>
-        <input
-          className="name-input"
-          placeholder="Your name"
-          maxLength={24}
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-          onKeyDown={(e) => { if (e.key === "Enter") void session.join(name); }}
-        />
-        <div>
+        <div className="join-group">
+          <input
+            className="name-input"
+            placeholder="Your name"
+            maxLength={24}
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") void session.join(name); }}
+          />
           <button id="joinbtn" onClick={() => void session.join(name)}>Join now</button>
         </div>
         <p className="prejoin-hint">{hint}</p>

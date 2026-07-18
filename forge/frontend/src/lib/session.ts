@@ -18,7 +18,22 @@ import type {
 
 const delay = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
-const WAKE = /\b(forge|forge's|archie)\b/i;
+// Direct-address detection: Forge speaks only when spoken TO — its name at
+// the start of the utterance (optionally after a lead-in like "hey"), or as a
+// vocative tag at the end ("what do you think, Forge?"). Casual mid-sentence
+// mentions ("the forge repo is big") must NOT trigger it.
+const LEAD_IN = "(?:hey|hi|ok|okay|so|well|listen)";
+const NAME = "(?:forge|archie)";
+const ADDRESS_START = new RegExp(`^\\s*(?:${LEAD_IN}[\\s,]+)?${NAME}\\b[\\s,]*`, "i");
+const ADDRESS_END = new RegExp(`(?:,\\s*(?:right\\s*)?|\\bright\\s*,?\\s*)${NAME}[\\s?!.,]*$`, "i");
+
+const isAddressed = (text: string): boolean => ADDRESS_START.test(text) || ADDRESS_END.test(text);
+
+// Remove the address prefix / vocative tag so Claude gets the clean question.
+function stripAddress(text: string): string {
+  return text.replace(ADDRESS_START, "").replace(ADDRESS_END, "").trim();
+}
+
 const INVITE = /\b(go ahead|go for it|take it away|what do you think|your thoughts|tell us|share it|yes forge|sure forge|floor is yours)\b/i;
 const STOP = /\b(stop presenting|back to (the )?grid|that'?s enough|stop talking|be quiet|thanks,? forge|thank you,? forge)\b/i;
 const CLEAR = /\b((clear|wipe) the board|start over|clean slate)\b/i;
@@ -224,8 +239,8 @@ export class ForgeSession {
   private async listenCheck(): Promise<void> {
     if (this.agentBusy || this.handRaised || this.ttsSpeaking) return;
     const chars = this.buffer.reduce((n, l) => n + l.text.length, 0);
-    if (chars < 40) return;
-    if (Date.now() - this.lastListenAt < 12_000) { this.scheduleListenCheck(); return; }
+    if (chars < 80) return;
+    if (Date.now() - this.lastListenAt < 20_000) { this.scheduleListenCheck(); return; }
     this.lastListenAt = Date.now();
     const batch = this.buffer.slice(-10);
     try {
@@ -378,16 +393,17 @@ export class ForgeSession {
       void this.speak("Board's clean.");
       return;
     }
-    if (source === "typed" || WAKE.test(text)) {
-      if (this.agentBusy) { this.interrupt(text); return; }
+    if (source === "typed" || isAddressed(text)) {
+      const question = source === "typed" ? text : stripAddress(text) || text;
+      if (this.agentBusy) { this.interrupt(question); return; }
       if (this.remoteAgentActive) {
         // Stop the mirrored run on both ends, then take over with the new ask.
         this.room?.cast({ k: "cancel" });
         this.onCast({ k: "cancel" });
-        setTimeout(() => void this.runAgent({ question: text, interrupted: true }), 300);
+        setTimeout(() => void this.runAgent({ question, interrupted: true }), 300);
         return;
       }
-      void this.runAgent({ question: text });
+      void this.runAgent({ question });
       return;
     }
     if (this.handRaised && INVITE.test(text)) {

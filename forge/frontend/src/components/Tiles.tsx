@@ -37,11 +37,17 @@ export default function Tiles() {
         </div>
       )}
       <div className="tile agent" id="tile-agent">
-        <div className={"orb" + (orbSpeaking ? " speaking" : "")} id="orb" />
+        <div className={"orb-wrap" + (thinking ? " working" : "")}>
+          <span className="halo h1" /><span className="halo h2" />
+          <div className={"orb" + (orbSpeaking ? " speaking" : "")} id="orb" />
+        </div>
         <div className={"thinking" + (thinking ? "" : " hidden")} id="thinking"><span /><span /><span /></div>
-        <button className={"hand" + (handRaised ? "" : " hidden")} id="hand" title="Let Forge speak" onClick={() => session.handClick()}>✋</button>
+        <button className={"hand" + (handRaised ? "" : " hidden")} id="hand" title="Let Forge speak" onClick={() => session.handClick()}>
+          <span className="hand-emoji">✋</span>
+          <span className="hand-label">Forge has a thought — <strong>invite</strong></span>
+        </button>
         <div className="nametag">Forge · AI Engineer</div>
-        <div className="agent-status" id="agentstatus">{agentStatus}</div>
+        <div className="agent-status" id="agentstatus"><span className="status-dot" />{agentStatus}</div>
       </div>
     </div>
   );

@@ -57,12 +57,15 @@ Open http://localhost:5180 in **Chrome**, allow mic/cam, Join.
 
 ## Using it in a meeting
 
-- Say **"Forge, …"** (or "Archie") or type in the chat panel → it answers, and if a
-  diagram helps, it takes the stage and sketches while it talks.
+- **Forge only speaks when spoken to.** Address it directly — **"Forge, …"**
+  (or "Hey Archie, …", or a trailing "… what do you think, Forge?") — or type in
+  the chat panel → it answers, and if a diagram helps, it takes the stage and
+  sketches while it talks. Casual mentions of "forge" mid-sentence don't wake it.
 - Ask follow-ups ("what if the auth server goes down?") → it annotates the
   **existing** board: crosses out boxes, fades dead paths, circles survivors.
-- Just talk amongst yourselves → it listens passively and **raises its hand ✋**
-  when it has something valuable (e.g. you claim Redis pub/sub is durable).
+- Just talk amongst yourselves → it listens the whole time but never blurts out —
+  it **raises its hand ✋** only for genuinely high-value moments (an unanswered
+  question, a factual error about your repo, a risky call with a missed tradeoff).
   Say "go ahead" or click the hand to let it speak.
 - **Interrupt it**: say "Forge, actually…" (or type) mid-presentation — it stops,
   adjusts, and continues from the board it already drew. "stop presenting" /
@@ -97,4 +100,3 @@ Node process (needs outbound HTTPS + optionally a `claude` login); CORS is open.
 
 - Chips in the chat panel are pre-baked killer questions, including
   **"Forge, how does this project itself work?"** — the self-explaining demo.
-- The `poc/` folder keeps the original scripted proof-of-concept for reference.
