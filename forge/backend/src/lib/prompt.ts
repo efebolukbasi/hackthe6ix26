@@ -125,6 +125,21 @@ export function buildUser({
   return `${t}\n\n${b}\n\n${q}\n\nRespond now as Forge, in NDJSON lines as specified.`;
 }
 
+// Claude writes the actual issue — the frontend only detects the request.
+export function buildIssuePrompt(command: string, transcript: TranscriptLine[]): string {
+  const t = transcript.length
+    ? `Recent meeting transcript:\n${transcript.map((l) => `${l.who}: ${l.text}`).join("\n")}`
+    : "No transcript context available.";
+  return `${t}
+
+A teammate in the meeting just asked you to create a GitHub issue by saying: "${command}"
+
+Write the issue they asked for. The subject comes from their request; use the transcript only for supporting detail. Do not invent requirements that were not discussed.
+
+Reply with ONLY one JSON object, no other text:
+{"title": "<specific, imperative, under 80 characters>", "body": "<GitHub markdown: 1-2 sentence summary, then bullets with relevant details from the discussion. End with: _Filed by Forge from a meeting._>"}`;
+}
+
 export function buildListenPrompt(transcript: TranscriptLine[]): string {
   return `You are Forge, an AI engineer silently listening in a team meeting. Your default is to STAY SILENT: you never blurt out — when you have something worth adding, you raise your hand and wait to be invited. Lean heavily toward not raising: small talk, status updates, banter, and anything the team is handling fine on their own all get {"raise": false}. Only raise your hand for a genuinely high-value moment: a question was asked aloud that nobody answered, someone stated something factually wrong about the codebase, a risky design decision is landing with a missed tradeoff, or the team is visibly stuck going in circles. If you are unsure, do not raise.
 

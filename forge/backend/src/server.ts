@@ -10,12 +10,12 @@ import { fileURLToPath } from "node:url";
 import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
 import { buildDigest } from "./lib/repo.ts";
-import { respond, listen, setRepoContext, getRepoCwd, walkthrough } from "./lib/agent.ts";
+import { respond, listen, setRepoContext, getRepoCwd, walkthrough, draftIssue } from "./lib/agent.ts";
 import { synthesize, synthesizeStream, ttsEnabled } from "./lib/tts.ts";
 import { llmMode } from "./lib/llm.ts";
 import { attachRoom } from "./lib/room.ts";
 import * as github from "./lib/github.ts";
-import type { AgentRequestBody, RepoMeta, WalkthroughRequestBody } from "./lib/types.ts";
+import type { AgentRequestBody, RepoMeta, TranscriptLine, WalkthroughRequestBody } from "./lib/types.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 5180);
@@ -158,11 +158,23 @@ app.get("/api/github/callback", async (req: Request, res: Response) => {
 });
 
 app.post("/api/github/issues", async (req: Request, res: Response) => {
-  const body = req.body as { title?: string; body?: string } | undefined;
+  const body = req.body as { title?: string; body?: string; command?: string; transcript?: TranscriptLine[] } | undefined;
   const cwd = getRepoCwd();
   if (!cwd) return res.status(400).json({ error: "no repo loaded" });
-  const title = String(body?.title || "Meeting follow-up").trim();
-  const issueBody = String(body?.body || "Created from a Forge meeting.").trim();
+  let title = String(body?.title || "").trim();
+  let issueBody = String(body?.body || "").trim();
+  // When the frontend passes the raw spoken command, Claude writes the issue.
+  if (body?.command) {
+    try {
+      const draft = await draftIssue(String(body.command), Array.isArray(body.transcript) ? body.transcript : []);
+      title = draft.title;
+      issueBody = draft.body;
+    } catch (err) {
+      console.error("issue draft failed, using fallback:", err instanceof Error ? err.message : String(err));
+    }
+  }
+  if (!title) title = "Meeting follow-up";
+  if (!issueBody) issueBody = "Created from a Forge meeting.";
   try {
     res.json(await github.createIssue(cwd, title, issueBody, githubSessionToken(req)));
   } catch (err) {

@@ -1,8 +1,8 @@
 // The Forge brain: turns meeting context into streamed whiteboard steps.
 import type { Response } from "express";
 import { streamText, llmMode } from "./llm.ts";
-import { buildSystem, buildUser, buildListenPrompt, buildWalkthroughSystem, buildWalkthroughUser } from "./prompt.ts";
-import type { AgentRequestBody, AgentStep, ListenResult, WhiteboardOp, WalkthroughRequestBody } from "./types.ts";
+import { buildSystem, buildUser, buildIssuePrompt, buildListenPrompt, buildWalkthroughSystem, buildWalkthroughUser } from "./prompt.ts";
+import type { AgentRequestBody, AgentStep, ListenResult, TranscriptLine, WhiteboardOp, WalkthroughRequestBody } from "./types.ts";
 
 let SYSTEM = "";
 let REPO_DIGEST = "";
@@ -15,6 +15,26 @@ export function setRepoContext(digest: string, repoPath?: string): void {
 }
 export function getRepoCwd(): string | undefined {
   return REPO_CWD;
+}
+
+// Claude drafts a GitHub issue from the spoken request and meeting context.
+export async function draftIssue(command: string, transcript: TranscriptLine[]): Promise<{ title: string; body: string }> {
+  const text = await streamText({
+    system: "You write clear, actionable GitHub issues for an engineering team.",
+    prompt: buildIssuePrompt(command, transcript),
+    model: process.env.FORGE_MODEL || "sonnet",
+    maxTokens: 800,
+  });
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start < 0 || end <= start) throw new Error("issue draft returned no JSON");
+  const parsed = JSON.parse(text.slice(start, end + 1)) as { title?: unknown; body?: unknown };
+  const title = String(parsed.title || "").trim();
+  if (!title) throw new Error("issue draft missing title");
+  return {
+    title: title.slice(0, 180),
+    body: String(parsed.body || "").trim() || "Created from a Forge meeting.",
+  };
 }
 
 const KNOWN_OPS = new Set(["clear", "title", "node", "arrow", "note", "circle", "cross", "fade", "code"]);
