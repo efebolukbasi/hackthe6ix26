@@ -59,7 +59,7 @@ export default function BoardCard() {
         session.onBoardEdit();
         drag.moved = true;
       }
-      if (drag.item.id) wb.moveItem(drag.item.id, dvx, dvy);
+      if (drag.item.id) session.moveBoardItem(drag.item.id, dvx, dvy);
       drag.lastVX = vx;
       drag.lastVY = vy;
     }

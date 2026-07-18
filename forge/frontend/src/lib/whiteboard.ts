@@ -202,6 +202,20 @@ export class Whiteboard {
     if (!item.offset) item.offset = { dx: 0, dy: 0 };
     item.offset.dx += dx;
     item.offset.dy += dy;
+
+    // Keep annotations attached to the card they describe. Arrows are
+    // regenerated below from the cards' current positions.
+    for (const related of this.items) {
+      if (related.target !== id) continue;
+      if (!related.offset) related.offset = { dx: 0, dy: 0 };
+      related.offset.dx += dx;
+      related.offset.dy += dy;
+    }
+    for (const arrow of this.items) {
+      if (arrow.type !== "arrow") continue;
+      const op = arrow.op as ArrowOp;
+      if (op.from === id || op.to === id) arrow.strokes = this.plan(op).strokes;
+    }
   }
 
   // Compact board state for the agent prompt (what's currently drawn).
@@ -288,7 +302,17 @@ export class Whiteboard {
     }
 
     else if (op.op === "arrow") {
-      const a = this.nodes[op.from]?.meta, b = this.nodes[op.to]?.meta;
+      const fromItem = this.nodes[op.from], toItem = this.nodes[op.to];
+      const a = fromItem?.meta && {
+        ...fromItem.meta,
+        x: fromItem.meta.x + (fromItem.offset?.dx ?? 0),
+        y: fromItem.meta.y + (fromItem.offset?.dy ?? 0),
+      };
+      const b = toItem?.meta && {
+        ...toItem.meta,
+        x: toItem.meta.x + (toItem.offset?.dx ?? 0),
+        y: toItem.meta.y + (toItem.offset?.dy ?? 0),
+      };
       if (!a || !b) return item;
       const p0 = rectEdgePoint(b, a), p1 = rectEdgePoint(a, b);
       const dx = p1.x - p0.x, dy = p1.y - p0.y;
@@ -340,6 +364,7 @@ export class Whiteboard {
     else if (op.op === "circle") {
       const t = this.nodes[op.target]?.meta;
       if (!t) return item;
+      item.target = op.target;
       S.push(this._pathStroke(ellipsePts(t.x, t.y, t.w / 2 + 22, t.h / 2 + 18), { color: op.color || "#e8a13c", width: 3.2, amp: 2 }));
     }
 

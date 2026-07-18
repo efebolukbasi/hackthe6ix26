@@ -642,7 +642,10 @@ export class ForgeSession {
         this.isSpeaker = !ev.isSpeaker;
         break;
       case "board-edit":
-        this.cancelAgent();
+        this.cancelForBoardEdit();
+        break;
+      case "board-move":
+        this.wb?.moveItem(ev.id, ev.dx, ev.dy);
         break;
       case "focus":
         useStore.setState({ codePanelHighlight: { start: ev.startLine, end: ev.endLine } });
@@ -848,9 +851,23 @@ export class ForgeSession {
   }
 
   // ---------- board edit + code panel (Phase 6c) ----------
+  private cancelForBoardEdit(): void {
+    this.cancelled = true;
+    this.agentAbort?.abort();
+    this.cancelSpeech();
+    this.wb?.finishNow();
+    this.setListening();
+    useStore.setState({ thinkingTrace: [] });
+  }
+
   onBoardEdit(): void {
-    this.cancelAgent();
+    this.cancelForBoardEdit();
     this.room?.cast({ k: "board-edit" });
+  }
+
+  moveBoardItem(id: string, dx: number, dy: number): void {
+    this.wb?.moveItem(id, dx, dy);
+    this.room?.cast({ k: "board-move", id, dx, dy });
   }
 
   openCodePanel(attr: { file: string; startLine?: number; endLine?: number }, nodeLabel = "this component"): void {
