@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 // (lib -> src -> backend) lands at forge/backend/.tts-cache, matching the
 // original lib/tts.js which was one level up from forge/backend/lib.
 const CACHE_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "..", ".tts-cache");
-const DEFAULT_VOICE = "pNInz6obpgDQGcFmaJgB"; // Adam
+const DEFAULT_VOICE = "DXFkLCBUTmvXpp2QwZjA"; // Forge's selected ElevenLabs voice
 const MODEL = "eleven_flash_v2_5"; // fastest + half-price credits
 
 export function ttsEnabled(): boolean {
