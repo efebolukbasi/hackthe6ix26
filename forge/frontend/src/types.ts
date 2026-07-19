@@ -180,6 +180,8 @@ export interface TranscriptLine {
 export interface Health {
   ok: boolean;
   llm: string;
+  /** active brain model ("haiku" | "sonnet") */
+  model?: string;
   tts: boolean;
   repo?: { name?: string; [key: string]: unknown };
 }

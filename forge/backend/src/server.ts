@@ -12,7 +12,7 @@ import { promisify } from "node:util";
 import { buildDigest } from "./lib/repo.ts";
 import { respond, listen, setRepoContext, getRepoCwd, getRepoSlug, walkthrough, createIssueFlow, implementIssueFlow } from "./lib/agent.ts";
 import { synthesize, synthesizeStream, ttsEnabled } from "./lib/tts.ts";
-import { llmMode } from "./lib/llm.ts";
+import { activeModelName, llmMode, setActiveModel } from "./lib/llm.ts";
 import { attachRoom } from "./lib/room.ts";
 import * as github from "./lib/github.ts";
 import type { AgentRequestBody, RepoMeta, TranscriptLine, WalkthroughRequestBody } from "./lib/types.ts";
@@ -84,7 +84,16 @@ async function loadRepo(source: string): Promise<RepoMeta> {
 }
 
 app.get("/api/health", (_req: Request, res: Response) => {
-  res.json({ ok: true, llm: llmMode(), tts: ttsEnabled(), repo: repoMeta });
+  res.json({ ok: true, llm: llmMode(), model: activeModelName(), tts: ttsEnabled(), repo: repoMeta });
+});
+
+// Session-wide brain switch (the discreet Haiku/Sonnet toggle in the UI).
+app.post("/api/model", (req: Request, res: Response) => {
+  const model = (req.body as { model?: string } | undefined)?.model;
+  if (model !== "haiku" && model !== "sonnet") return res.status(400).json({ error: "model must be haiku or sonnet" });
+  setActiveModel(model);
+  console.log(`brain model → ${model}`);
+  res.json({ ok: true, model });
 });
 
 app.post("/api/agent", (req: Request, res: Response) => respond(req.body as AgentRequestBody, res));

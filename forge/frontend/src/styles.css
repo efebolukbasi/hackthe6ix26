@@ -449,6 +449,17 @@ button:active { transform: scale(0.96); }
   text-transform: uppercase; letter-spacing: 0.8px;
 }
 
+/* Discreet brain toggle (Haiku/Sonnet) — a quiet letter next to the pill. */
+.model-chip {
+  width: 22px; height: 22px; border-radius: 7px; border: 1px solid var(--stroke-soft);
+  background: transparent; color: var(--muted); cursor: pointer;
+  font: 600 10.5px "Space Grotesk", sans-serif; letter-spacing: 0.5px;
+  display: inline-flex; align-items: center; justify-content: center;
+  margin-right: 8px; opacity: 0.55; transition: opacity 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+.model-chip:hover { opacity: 1; }
+.model-chip.sonnet { color: var(--ember-hi); border-color: rgba(255, 138, 80, 0.35); opacity: 0.85; }
+
 /* ————— bottom bar: floating glass dock ————— */
 #bar { height: 92px; flex: none; display: flex; align-items: center; padding: 0 26px; }
 .bar-left { flex: 1; display: flex; align-items: center; gap: 12px; }

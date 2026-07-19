@@ -12,10 +12,22 @@ import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { extname, relative, resolve, sep } from "node:path";
 import { REPO_TOOL_DEFS, runRepoTool } from "./repoTools.ts";
 
-// Forge keeps exploration quick and predictable: every request uses Haiku.
-// There is intentionally no per-request model switch here.
-const HAIKU_MODEL = "claude-haiku-4-5-20251001";
-const CLI_MODEL = "haiku";
+// Default brain is Haiku (fast, predictable); a discreet UI toggle can bump
+// the session to Sonnet for deeper answers. The listen classifier always
+// stays on Haiku regardless — it runs constantly in the background.
+export type ForgeModel = "haiku" | "sonnet";
+const API_MODELS: Record<ForgeModel, string> = {
+  haiku: "claude-haiku-4-5-20251001",
+  sonnet: "claude-sonnet-5",
+};
+let activeModel: ForgeModel = "haiku";
+
+export function setActiveModel(model: ForgeModel): void {
+  activeModel = model;
+}
+export function activeModelName(): ForgeModel {
+  return activeModel;
+}
 
 let apiDisabledReason: string | null = null;
 
@@ -59,6 +71,8 @@ interface StreamTextOptions {
   cwd?: string;
   extraTools?: ExtraTools;
   maxTurns?: number;
+  /** Pin a model for this call; omit to follow the session toggle. */
+  model?: ForgeModel;
 }
 
 // Streams text; calls onDelta(chunk) as text arrives. Resolves with full text.
@@ -73,10 +87,12 @@ export async function streamText({
   cwd,
   extraTools,
   maxTurns = 8,
+  model,
 }: StreamTextOptions): Promise<string> {
+  const chosen = model ?? activeModel;
   if (llmMode() === "api") {
     try {
-      return await apiStream({ system, prompt, maxTokens, onDelta, onTool, signal, tools, cwd, extraTools, maxTurns });
+      return await apiStream({ system, prompt, maxTokens, onDelta, onTool, signal, tools, cwd, extraTools, maxTurns, model: chosen });
     } catch (err) {
       if (signal?.aborted || !isApiAccessError(err)) throw err;
       disableApi(err);
@@ -84,7 +100,7 @@ export async function streamText({
   }
   // CLI path: read-only repo tools via Claude Code's own Read/Grep/Glob.
   // Caller-supplied extra tools (GitHub reads) are API-only and skipped here.
-  return cliStream({ system, prompt, onDelta, onTool, signal, maxTurns, tools: tools && cwd ? "read" : false, cwd });
+  return cliStream({ system, prompt, onDelta, onTool, signal, maxTurns, tools: tools && cwd ? "read" : false, cwd, model: chosen });
 }
 
 // ---------- headless claude CLI path ----------
@@ -99,11 +115,12 @@ interface CliStreamOptions {
   /** "read" = Read/Grep/Glob in cwd; "write" adds Edit/Write (worktree only). */
   tools: false | "read" | "write";
   cwd?: string;
+  model?: ForgeModel;
 }
 
-function cliStream({ system, prompt, onDelta, onTool, signal, maxTurns, tools, cwd }: CliStreamOptions): Promise<string> {
+function cliStream({ system, prompt, onDelta, onTool, signal, maxTurns, tools, cwd, model }: CliStreamOptions): Promise<string> {
   return new Promise((resolvePromise, reject) => {
-    const args = ["-p", "--model", CLI_MODEL];
+    const args = ["-p", "--model", model ?? activeModel];
     if (tools && cwd) {
       const allowed = tools === "write" ? "Read,Grep,Glob,Edit,Write" : "Read,Grep,Glob";
       args.push("--max-turns", String(Math.max(maxTurns, tools === "write" ? 16 : 8)), "--allowedTools", allowed);
@@ -187,6 +204,7 @@ interface ApiStreamOptions {
   cwd?: string;
   extraTools?: ExtraTools;
   maxTurns: number;
+  model: ForgeModel;
 }
 
 type TextBlock = { type: "text"; text: string };
@@ -266,7 +284,7 @@ async function apiTurn(
   return { blocks: ordered, stopReason };
 }
 
-async function apiStream({ system, prompt, maxTokens, onDelta, onTool, signal, tools, cwd, extraTools, maxTurns }: ApiStreamOptions): Promise<string> {
+async function apiStream({ system, prompt, maxTokens, onDelta, onTool, signal, tools, cwd, extraTools, maxTurns, model }: ApiStreamOptions): Promise<string> {
   const repoToolsOn = !!(tools && cwd);
   const toolDefs: ToolDef[] = [
     ...(repoToolsOn ? (REPO_TOOL_DEFS as ToolDef[]) : []),
@@ -283,7 +301,7 @@ async function apiStream({ system, prompt, maxTokens, onDelta, onTool, signal, t
     const lastTurn = turn === maxTurns - 1;
     const { blocks, stopReason } = await apiTurn(
       {
-        model: HAIKU_MODEL,
+        model: API_MODELS[model],
         max_tokens: maxTokens,
         stream: true,
         system,
@@ -486,7 +504,7 @@ async function apiCodingAgent(request: CodingAgentRequest): Promise<string> {
   for (let turn = 0; turn < MAX_TURNS; turn++) {
     const { blocks, stopReason } = await apiTurn(
       {
-        model: HAIKU_MODEL,
+        model: API_MODELS[activeModel],
         max_tokens: 4000,
         stream: true,
         system: codingSystem(request.repoDigest),

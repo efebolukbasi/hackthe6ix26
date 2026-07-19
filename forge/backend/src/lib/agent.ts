@@ -401,6 +401,7 @@ export async function listen(
       system: "You are a concise meeting-assistant classifier.",
       prompt: buildListenPrompt(transcript),
       maxTokens: 200,
+      model: "haiku", // the passive classifier never follows the Sonnet toggle
     });
     const m = text.match(/\{[\s\S]*\}/);
     if (!m) return { raise: false, reason: "" };

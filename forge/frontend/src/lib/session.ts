@@ -1317,9 +1317,10 @@ export class ForgeSession {
       this.health = (await res.json()) as Health;
       useStore.setState({
         health: this.health,
+        ...(this.health.model === "haiku" || this.health.model === "sonnet" ? { model: this.health.model } : {}),
         pill: {
           cls: "ok",
-          title: `backend ok · brain: ${this.health.llm} · voice: ${this.health.tts ? "ElevenLabs" : "browser"} · repo: ${this.health.repo?.name}`,
+          title: `backend ok · brain: ${this.health.llm}/${this.health.model ?? "haiku"} · voice: ${this.health.tts ? "ElevenLabs" : "browser"} · repo: ${this.health.repo?.name}`,
         },
       });
     } catch {
@@ -1416,6 +1417,18 @@ export class ForgeSession {
     const ccOn = !useStore.getState().ccOn;
     useStore.setState({ ccOn });
     if (!ccOn) this.hideCaption();
+  }
+
+  /** The discreet brain toggle: switches the whole session between Haiku
+   * (fast) and Sonnet (deeper) on the backend. */
+  setModel(model: "haiku" | "sonnet"): void {
+    void apiFetch(`${API}/api/model`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model }),
+    }).then((res) => {
+      if (res.ok) useStore.setState({ model });
+    }).catch(() => { /* backend unreachable — pill already says so */ });
   }
 
   /** Forge's voice volume — applies to the playing line, future lines, and chimes. */

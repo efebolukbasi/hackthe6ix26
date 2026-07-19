@@ -62,6 +62,8 @@ export interface ForgeState {
   thinkingTrace: string[];
   /** active/queued/recently-finished Forge tasks (answers and issues) */
   tasks: ForgeTask[];
+  /** active brain model (the discreet Haiku/Sonnet toggle) */
+  model: "haiku" | "sonnet";
   /** playback volume for Forge's voice (0..1) */
   forgeVolume: number;
   /** playback volume for the remote peer (0..1) */
@@ -100,6 +102,7 @@ export const useStore = create<ForgeState>()(() => ({
   remoteStream: null,
   thinkingTrace: [],
   tasks: [],
+  model: "haiku",
   forgeVolume: storedVolume("forge-volume"),
   peerVolume: storedVolume("forge-peer-volume"),
   codePanelOpen: false,
