@@ -39,6 +39,8 @@ export interface ArrowOp {
   id?: string;
   label?: string;
   bow?: number;
+  /** collision-checked label anchor chosen by the layout engine */
+  labelPos?: { x: number; y: number };
 }
 
 export interface NoteOp {
@@ -144,7 +146,7 @@ export type StreamMsg =
 
 // ---------- Forge task registry ----------
 
-export type ForgeTaskKind = "answer" | "issue";
+export type ForgeTaskKind = "answer" | "issue" | "pr";
 
 export type ForgeTaskStatus =
   | "queued"

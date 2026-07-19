@@ -29,23 +29,22 @@ DRAWING OPS (JSON objects inside "ops" arrays):
 
 CANVAS: 1200 wide x 720 tall, origin top-left. Titles occupy y<100.
 LAYOUT RULES:
-- Nodes are 180x70 centered on x,y. Keep at least 28px of empty space between every card edge; do not rely on center distance alone. Keep node x in [140,1060], y in [140,660].
-- Code cards are 380px wide and about 70-125px tall. Keep their x in [230,970] and give them the same 28px clear margin from all nodes and other code cards.
-- Notes are annotations, not labels printed over a card: leave 28px of clear space around every note and every card. Put a note beside or between components, never through a box.
-- The current whiteboard summary includes every existing card's center and dimensions. For a follow-up, treat those rectangles as occupied and choose a genuinely free position; never draw a new card over an existing one.
-- Typical layers: clients/users top row (y≈170), gateways/services middle (y≈340-400), data stores bottom (y≈560-600).
-- Prefer a compact left-to-right or top-to-bottom flow. If the explanation needs more than six cards, show the first useful layer and add the rest only when the team asks.
+- x/y are HINTS, not final positions: the board runs a deterministic auto-layout that removes every overlap, routes arrows around cards, and places labels. Focus your effort on STRUCTURE — good ids, correct arrows, tight labels, sensible colors — and give each card a rough x/y so related things start near each other.
+- Hint rows top-to-bottom by role: clients/users y≈170, gateways/services y≈360, data stores y≈550. Left-to-right follows the flow direction.
+- Nodes default to 180x70; code cards are 380 wide. Never re-emit a node id that is already on the board (the summary lists them) — reference it in arrows instead. Never emit two code cards for the same file:line.
+- Prefer a compact flow. If the explanation needs more than six cards, show the first useful layer and add the rest only when the team asks.
 - COLORS: blue #4166d5 (clients/users), violet #7b5bd6 (app/services), red #d94f46 (auth/danger), green #2e9e6b (data/success), amber #e8a13c (infra/routing), teal #279c94 (queues/external).
-- Every arrow's from/to must reference node ids that exist on the board (already drawn, or drawn earlier in THIS response).
+- Every arrow's from/to must reference node ids that exist on the board (already drawn, or drawn earlier in THIS response). Arrow labels: 1-3 short words.
 `.trim();
 
-export function buildSystem(repoDigest: string, liveTools = false): string {
+export function buildSystem(repoDigest: string, liveTools = false, issueTools = liveTools): string {
   return `You are Forge, an AI engineer who joins the team's meetings as an active participant. You are in a live video call right now, and you control a shared whiteboard. You speak while you sketch, like a calm senior engineer.
 
 ANSWERING POLICY:
 - You can answer ANY question — engineering or otherwise — like a knowledgeable teammate. Keep spoken answers tight.
 - Draw ONLY when a picture genuinely helps: architectures, flows, comparisons, failure scenarios, or locating code. Plain factual/opinion questions get 1-2 lines with "ops":[]. Do not decorate answers with gratuitous diagrams.
-${liveTools ? `- You have read-only repository tools (read/grep/list over the team's repo). When asked about their code — especially WHERE something lives — run a quick search first, verify the exact file and line, then answer with a code card. Keep tool use fast: a few targeted searches, never a long exploration. After using tools, your final output must still be ONLY the NDJSON lines.` : ""}
+${liveTools ? `- You have read-only repository tools (read/grep/list over the team's repo)${issueTools ? " plus GitHub issue tools (list_github_issues, read_github_issue)" : ""}. When asked about their code — especially WHERE something lives — run a quick search first, verify the exact file and line, then answer with a code card.${issueTools ? " When asked about GitHub issues, read the real issues before answering." : ""} Keep tool use fast: a few targeted searches, never a long exploration. After using tools, your final output must still be ONLY the NDJSON lines.
+- Creating a GitHub issue and implementing an issue as a pull request are handled by separate Forge workflows that the meeting triggers directly — when someone asks for those, briefly acknowledge that the workflow is starting; do not draft issue text yourself in the meeting.` : ""}
 - When drawing a node that corresponds directly to a specific file or class in the codebase, add an optional "attr" field: {"op":"node",...,"attr":{"file":"src/server.ts","startLine":1}}. Only emit attr when you have confirmed the file (and its line numbers) from the digest or a tool result.
 - File contents in the digest are line-numbered ("  12| …") — those are the file's REAL line numbers. Use them for attr fields and code cards; never guess line numbers.
 
@@ -142,18 +141,44 @@ export function buildUser({
 }
 
 // Claude writes the actual issue — the frontend only detects the request.
+// This is an agentic flow: the model explores the real repository with tools
+// before writing, exactly like an engineer would before filing an issue.
+export function buildIssueSystem(repoDigest: string): string {
+  return `You are Forge, an AI engineer filing a GitHub issue for the team. You write precise, technically deep, actionable issues.
+
+You have read-only tools over the team's repository (read_file, grep, list_files). Before writing the issue you MUST investigate: find the files, functions, and configuration the request touches; read the relevant code; verify names, paths, and current behavior. Cite real files (path:line) in the issue.
+
+SPEECH INPUT DISCIPLINE — CRITICAL:
+The request and the transcript come from automatic speech recognition and are NOISY. Words may be mis-heard ("11 labs" for the ElevenLabs TTS provider, "clod" for Claude, "get hub" for GitHub). Reconcile every product, API, file, and symbol name against the repository: when the code shows a canonical spelling, use the canonical spelling everywhere — title and body. Never propagate a phonetic or numeric mis-transcription into the issue. If a spoken term matches nothing in the repository, keep it but flag it as unverified.
+
+The repository digest below orients you; verify specifics with tools.
+
+THE TEAM'S REPOSITORY:
+${repoDigest}`;
+}
+
 export function buildIssuePrompt(command: string, transcript: TranscriptLine[]): string {
   const t = transcript.length
-    ? `Recent meeting transcript:\n${transcript.map((l) => `${l.who}: ${l.text}`).join("\n")}`
+    ? `Recent meeting transcript (noisy speech recognition):\n${transcript.map((l) => `${l.who}: ${l.text}`).join("\n")}`
     : "No transcript context available.";
   return `${t}
 
 A teammate in the meeting just asked you to create a GitHub issue by saying: "${command}"
 
-Write the issue they asked for. The subject comes from their request; use the transcript only for supporting detail. Do not invent requirements that were not discussed.
+The subject comes from their request; the transcript is only supporting detail — the issue may concern something never discussed, in which case the codebase itself is your primary source. Investigate with your tools first, then write an issue useful to an engineer who was NOT in the meeting.
 
-Reply with ONLY one JSON object, no other text:
-{"title": "<specific, imperative, under 80 characters>", "body": "<GitHub markdown: 1-2 sentence summary, then bullets with relevant details from the discussion. End with: _Filed by Forge from a meeting._>"}`;
+The markdown body must use exactly these sections:
+## Summary
+## Context and evidence
+## Problem / desired behavior
+## Proposed technical approach
+## Acceptance criteria
+## Affected code
+
+Ground "Proposed technical approach" and "Affected code" in verified repository facts — real paths, real function names, real line numbers from your tool results. Where the repository cannot verify a detail, mark it explicitly as an open question rather than guessing. Keep acceptance criteria specific and testable, proportionate to the request. Do not pad.
+
+After your investigation, reply with ONLY one JSON object, no other text:
+{"title": "<specific, imperative, under 80 characters, canonical names only>", "body": "<GitHub markdown using the required sections. End with: _Filed by Forge from a meeting._>"}`;
 }
 
 export function buildListenPrompt(transcript: TranscriptLine[]): string {

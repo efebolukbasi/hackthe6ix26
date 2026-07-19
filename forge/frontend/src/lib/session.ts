@@ -5,6 +5,7 @@
 // listen buffer + raise-hand logic. UI state is pushed into the zustand store.
 
 import { Whiteboard } from "./whiteboard";
+import { layoutSteps } from "./layout";
 import { RoomLink, type CastEvent, type StageSync } from "./rtc";
 import { API, apiFetch } from "../config";
 import { useStore, type ForgeStage } from "../state/store";
@@ -45,27 +46,49 @@ function stripAddress(text: string): string {
 }
 
 const INVITE = /\b(go ahead|go for it|take it away|what do you think|your thoughts|tell us|share it|yes forge|sure forge|floor is yours|let's hear it)\b/i;
+// Explicit stop phrases work anywhere in an utterance, any time.
 const STOP = /\b(stop presenting|back to (the )?grid|that'?s enough|stop talking|be quiet|thanks,? forge|thank you,? forge)\b/i;
+// Bare barge-in words ("stop", "wait", "hold on") count only as a WHOLE
+// utterance — "we should stop using X" must never cut Forge off — and only
+// while Forge is actually talking or working (see isStopCommand callers).
+const BARE_STOP = /^\s*(?:(?:hey|ok|okay)[\s,]+)?(?:forge[\s,]+)?(?:stop|wait|hold on|hang on|pause|quiet|shut up|enough)[\s!.,]*$/i;
 const CLEAR = /\b((clear|wipe) the board|start over|clean slate)\b/i;
-const ISSUE_REQUEST_PHRASES = [
-  "create a github issue",
-  "create an github issue",
-  "create new github issue",
-  "create a new github issue",
-  "open a github issue",
-  "open an github issue",
-  "open new github issue",
-  "open a new github issue",
-  "file a github issue",
-  "file an github issue",
-  "file new github issue",
-  "file a new github issue",
-] as const;
+/** "cancel everything" also flushes the queued asks, not just the live run. */
+const CANCEL_ALL = /\b(cancel everything|stop everything|never ?mind|forget it|drop (it|everything))\b/i;
 
-const isIssueRequest = (text: string): boolean => {
-  const normalized = text.toLowerCase();
-  return ISSUE_REQUEST_PHRASES.some((phrase) => normalized.includes(phrase));
+// "create/open/file/make/raise/add/log … (github) issue" — imperative verb
+// required so questions about issues ("why did the issue get created twice?")
+// never trigger a new one.
+const ISSUE_CREATE = /\b(?:create|open|file|make|raise|add|log)\b[\s\w']{0,40}?\b(?:github\s+)?issue\b/i;
+const isIssueRequest = (text: string): boolean =>
+  ISSUE_CREATE.test(text) && !/^\s*(?:who|what|why|when|where|how|did|is|was|were|should|could|can|do|does)\b/i.test(text);
+
+// "work on / implement / fix / pick up … issue (number) 3" — plus "that
+// issue" / "the issue you just created" resolving to the most recent one.
+const WORD_NUMBERS: Record<string, number> = {
+  one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8,
+  nine: 9, ten: 10, eleven: 11, twelve: 12, thirteen: 13, fourteen: 14,
+  fifteen: 15, sixteen: 16, seventeen: 17, eighteen: 18, nineteen: 19, twenty: 20,
 };
+const IMPLEMENT_VERB = /\b(?:work on|implement|fix|take on|tackle|pick up|handle|resolve|address|start on|build|do)\b/i;
+const IMPLEMENT_PR = /\b(?:open|make|create|raise)\b[\s\w']{0,24}?\b(?:pull request|pr)\b[\s\w']{0,24}?\bissue\b/i;
+const ISSUE_NUMBER = /\bissue\s+(?:number\s+)?(?:#\s*)?(\d{1,5}|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty)\b/i;
+const ISSUE_LAST = /\b(?:that|this|the last|the latest|the new)\s+issue\b|\bissue\s+(?:you|we)\s+just\b/i;
+
+/** Extract the implement-issue intent, if this utterance is one. */
+function parseImplementRequest(text: string, lastIssueNumber: number | null): number | null {
+  if (!(IMPLEMENT_VERB.test(text) || IMPLEMENT_PR.test(text))) return null;
+  if (!/\bissue\b/i.test(text)) return null;
+  if (/^\s*(?:who|what|why|when|where|how|did|is|was|were|should|could|can)\b/i.test(text)) return null;
+  const m = ISSUE_NUMBER.exec(text);
+  if (m) {
+    const raw = m[1].toLowerCase();
+    const n = /^\d+$/.test(raw) ? parseInt(raw, 10) : WORD_NUMBERS[raw];
+    if (Number.isInteger(n) && n >= 1) return n;
+  }
+  if (ISSUE_LAST.test(text) && lastIssueNumber) return lastIssueNumber;
+  return null;
+}
 
 export const CHIPS = [
   "Forge, how does this project itself work?",
@@ -89,6 +112,10 @@ export class ForgeSession {
 
   private currentAudio: HTMLAudioElement | null = null;
   private currentTtsAbort: AbortController | null = null;
+  /** Settles the in-flight ElevenLabs playback promise on barge-in — a paused
+   * audio element never fires "ended", which would leave the speech chain
+   * (and the whole run's cleanup) hanging until the watchdog. */
+  private currentTtsFinish: (() => void) | null = null;
   private agentAbort: AbortController | null = null;
 
   private health: Health = { ok: false, tts: false, llm: "?", repo: { name: "your repo" } };
@@ -104,7 +131,8 @@ export class ForgeSession {
   private joined = false;
 
   private room: RoomLink | null = null;
-  private pendingInterrupt: { text: string; taskId: string } | null = null;
+  /** FIFO of asks made while Forge was busy — they run in order afterwards. */
+  private askQueue: Array<{ text: string; taskId: string }> = [];
   private remoteAgentActive = false;
   private remoteChain: Promise<void> = Promise.resolve();
   private myName = "You";
@@ -115,8 +143,15 @@ export class ForgeSession {
   private taskSeq = 0;
   private activeTaskId: string | null = null;
   private walkthroughAbort: AbortController | null = null;
-  private issueTaskId: string | null = null;
-  private issueAbort: AbortController | null = null;
+  /** Abort controllers for background flows (issue / PR), keyed by task id. */
+  private flowAborts = new Map<string, AbortController>();
+  /** Serialize background GitHub flows so they never race each other. */
+  private flowChain: Promise<void> = Promise.resolve();
+  /** Recently started issue commands (normalized) — drops rapid duplicates. */
+  private recentIssueCommands: Array<{ norm: string; at: number }> = [];
+  private lastIssueNumber: number | null = null;
+  /** Last final voice transcript — Chrome re-fires finals across restarts. */
+  private lastVoiceFinal: { norm: string; at: number } | null = null;
   private taskPruneTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
   // Board state is replayed to a participant who joins after Forge has drawn.
@@ -261,8 +296,9 @@ export class ForgeSession {
       this.room?.cast({ k: "task-cancel", id });
       return;
     }
-    if (this.pendingInterrupt?.taskId === id) {
-      this.pendingInterrupt = null;
+    const queued = this.askQueue.findIndex((q) => q.taskId === id);
+    if (queued >= 0) {
+      this.askQueue.splice(queued, 1);
       this.setTask(id, { status: "cancelled" });
       return;
     }
@@ -270,11 +306,8 @@ export class ForgeSession {
       this.cancelAgent();
       return;
     }
-    if (this.issueTaskId === id) {
-      this.issueAbort?.abort();
-      this.setTask(id, { status: "cancelled" });
-      return;
-    }
+    const flow = this.flowAborts.get(id);
+    if (flow) flow.abort();
     this.setTask(id, { status: "cancelled" });
   }
 
@@ -360,6 +393,7 @@ export class ForgeSession {
         clearTimeout(watchdog);
         resolve();
       };
+      this.currentTtsFinish = finish;
       const fail = (err: unknown) => {
         if (settled) return;
         settled = true;
@@ -418,6 +452,7 @@ export class ForgeSession {
       URL.revokeObjectURL(url);
       this.currentAudio = null;
       this.currentTtsAbort = null;
+      this.currentTtsFinish = null;
     });
   }
 
@@ -452,6 +487,7 @@ export class ForgeSession {
     speechSynthesis.cancel();
     this.currentTtsAbort?.abort();
     if (this.currentAudio) { try { this.currentAudio.pause(); } catch { /* noop */ } this.currentAudio = null; }
+    this.currentTtsFinish?.(); // settle the playback promise NOW, not at the watchdog
   }
 
   // ---------- speech recognition ----------
@@ -467,25 +503,44 @@ export class ForgeSession {
         const res = e.results[i];
         if (res.isFinal) {
           const text = res[0].transcript.trim();
-          // Keep recognition alive while Forge speaks so a participant can
+          if (!text) continue;
+          // Chrome re-fires already-final results across engine restarts —
+          // an identical final within a couple of seconds is the same speech.
+          const norm = normalizeSpeech(text);
+          const now = Date.now();
+          if (this.lastVoiceFinal && this.lastVoiceFinal.norm === norm && now - this.lastVoiceFinal.at < 2500) continue;
+          this.lastVoiceFinal = { norm, at: now };
+          // Recognition stays alive while Forge speaks so a participant can
           // barge in. During TTS — and the tail window right after, while
           // Chrome finalizes what it heard during playback — only explicit
-          // control phrases are accepted, to avoid treating Forge's own
-          // narration as meeting speech.
-          if (text && (!this.inTtsTail() || isAddressed(text) || STOP.test(text))) {
+          // control speech is accepted (addressed asks and stop commands), to
+          // avoid treating Forge's own narration as meeting speech.
+          if (!this.inTtsTail() || isAddressed(text) || this.isStopCommand(text)) {
             this.handleUtterance(text, "voice");
           }
         }
       }
     };
+    // ALWAYS restart while the mic is on — including mid-TTS. Chrome ends
+    // recognition on its own every so often; refusing to restart during
+    // playback used to leave Forge deaf (and uninterruptable) for the rest of
+    // a long answer.
     r.onend = () => {
-      if (this.recogWanted && !this.ttsSpeaking) setTimeout(() => { try { r.start(); } catch { /* already started */ } }, 250);
+      if (this.recogWanted) setTimeout(() => { try { r.start(); } catch { /* already started */ } }, 250);
     };
     return r;
   }
 
+  /** True when this utterance means "cut it out": explicit stop phrases
+   * anywhere, or a bare "stop"/"wait"-style word while Forge is active. */
+  private isStopCommand(text: string): boolean {
+    if (STOP.test(text)) return true;
+    const forgeActive = this.agentBusy || this.remoteAgentActive || this.ttsSpeaking || useStore.getState().presenting;
+    return forgeActive && BARE_STOP.test(text);
+  }
+
   private startRecog(): void {
-    if (!this.recog || !this.recogWanted || this.ttsSpeaking) return;
+    if (!this.recog || !this.recogWanted) return;
     try { this.recog.start(); } catch { /* already started */ }
   }
 
@@ -547,13 +602,16 @@ export class ForgeSession {
     return acks[Math.floor(Math.random() * acks.length)];
   }
 
-  /** Hold a prepared answer until the team explicitly gives Forge the floor. */
-  private readyPause(): Promise<void> {
+  /** Hold a prepared answer until the team gives Forge the floor — but never
+   * forever: after a polite wait it starts on its own. An indefinitely-held
+   * "ready" would block the whole ask queue behind a missed chime. */
+  private readyPause(maxWaitMs = 15_000): Promise<void> {
     return new Promise((resolve) => {
       let released = false;
       this.readyRelease = () => { released = true; };
+      const deadline = Date.now() + maxWaitMs;
       const tick = () => {
-        if (this.cancelled || released) {
+        if (this.cancelled || released || Date.now() >= deadline) {
           this.readyRelease = null;
           resolve();
           return;
@@ -653,7 +711,11 @@ export class ForgeSession {
         }
         useStore.setState({ thinkingTrace: [] });
         this.setTask(this.activeTaskId, { status: "presenting" });
-        for (const step of preparedSteps) {
+        // Auto-layout the whole answer against the live board: the model's
+        // coordinates are hints; this pass removes every overlap before
+        // anything is drawn (and before ops are cast to the peer).
+        const laidOut = this.wb ? layoutSteps(this.wb.layoutState(), preparedSteps) : preparedSteps;
+        for (const step of laidOut) {
           if (this.cancelled) break;
           await this.playStep(step, true);
         }
@@ -682,10 +744,22 @@ export class ForgeSession {
       this.setListening();
       this.agentAbort = null;
       this.buffer = [];
-      const next = this.pendingInterrupt;
-      this.pendingInterrupt = null;
-      if (next) setTimeout(() => void this.runAgent({ question: next.text, interrupted: true, taskId: next.taskId }), 250);
+      this.drainAskQueue(250);
     }
+  }
+
+  /** Run the next queued ask once Forge is free. Queued asks that arrived
+   * mid-presentation run with interrupted context when that run was cut off. */
+  private drainAskQueue(delayMs = 250): void {
+    if (!this.askQueue.length) return;
+    setTimeout(() => {
+      if (this.agentBusy || this.remoteAgentActive) return; // something else took the floor
+      const next = this.askQueue.shift();
+      if (!next) return;
+      const task = useStore.getState().tasks.find((t) => t.id === next.taskId);
+      if (task && TERMINAL_TASK.has(task.status)) { this.drainAskQueue(50); return; }
+      void this.runAgent({ question: next.text, interrupted: this.cancelled, taskId: next.taskId });
+    }, delayMs);
   }
 
   private async playStep(step: AgentStep, broadcast = false): Promise<void> {
@@ -718,25 +792,24 @@ export class ForgeSession {
     });
   }
 
-  // Barge-in: halt the current explanation, then re-run with the new request.
-  // The board stays as-is so the follow-up can build on it.
-  private interrupt(text: string): void {
-    const queued = this.newTask("answer", text);
-    this.pendingInterrupt = { text, taskId: queued.id };
-    this.cancelled = true;
-    this.agentAbort?.abort();
-    this.cancelSpeech();
-    this.wb?.finishNow();
+  /** An ask that arrives while Forge holds the floor joins the queue and runs
+   * right after — the current presentation is NOT killed. ("stop" kills it.) */
+  private queueAsk(text: string): void {
+    const task = this.newTask("answer", text);
+    this.askQueue.push({ text, taskId: task.id });
+    this.chime(0.25);
+    this.caption("Forge", `Queued for after this: “${text.slice(0, 70)}”`);
   }
 
-  cancelAgent(): void {
+  /** Stop the current run. Queued asks survive by default — they were
+   * explicit requests; `flushQueue` (\"cancel everything\") drops them too. */
+  cancelAgent(flushQueue = false): void {
     this.room?.cast({ k: "cancel" });
     this.cancelled = true;
     this.setTask(this.activeTaskId, { status: "cancelled" });
-    // A hard stop also drops whatever was queued behind the current run.
-    if (this.pendingInterrupt) {
-      this.setTask(this.pendingInterrupt.taskId, { status: "cancelled" });
-      this.pendingInterrupt = null;
+    if (flushQueue) {
+      for (const queued of this.askQueue) this.setTask(queued.taskId, { status: "cancelled" });
+      this.askQueue = [];
     }
     this.agentAbort?.abort();
     this.walkthroughAbort?.abort();
@@ -745,49 +818,169 @@ export class ForgeSession {
     this.exitPresenting();
     this.setListening();
     useStore.setState({ thinkingTrace: [] });
+    this.drainAskQueue(600);
   }
 
-  private async createGitHubIssue(command: string): Promise<void> {
+  // ---------- background GitHub flows (issue creation, issue → PR) ----------
+  // These never hold the floor: they run alongside answers/presentations,
+  // reporting progress through the task registry and speaking only their
+  // start and outcome.
+
+  /** Read a streamed NDJSON response, invoking onMsg per parsed line. */
+  private async readNdjson(res: Response, onMsg: (msg: Record<string, unknown>) => void): Promise<void> {
+    const reader = res.body!.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      const lines = buf.split("\n");
+      buf = lines.pop() ?? "";
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try { onMsg(JSON.parse(line) as Record<string, unknown>); } catch { /* junk line */ }
+      }
+    }
+  }
+
+  private async speakLine(text: string): Promise<void> {
+    this.caption("Forge", text, true);
+    this.transcript("Forge", text);
+    this.room?.cast({ k: "step", say: text, ops: [] });
+    await this.speak(text);
+  }
+
+  /** Start issue creation unless an equivalent command is already in flight
+   * (repeated speech finals, an impatient re-ask seconds later). */
+  private startIssueFlow(command: string): void {
+    const norm = normalizeSpeech(command);
+    const now = Date.now();
+    this.recentIssueCommands = this.recentIssueCommands.filter((c) => now - c.at < 30_000);
+    const tokens = new Set(norm.split(" "));
+    for (const recent of this.recentIssueCommands) {
+      const other = new Set(recent.norm.split(" "));
+      let overlap = 0;
+      for (const t of tokens) if (other.has(t)) overlap++;
+      if (overlap / new Set([...tokens, ...other]).size >= 0.6) return; // same intent, already running
+    }
+    this.recentIssueCommands.push({ norm, at: now });
+    this.flowChain = this.flowChain.then(() => this.runIssueFlow(command)).catch(() => {});
+  }
+
+  private async runIssueFlow(command: string): Promise<void> {
     const task = this.newTask("issue", `GitHub issue: ${command}`, "working");
-    this.issueTaskId = task.id;
     const abort = new AbortController();
-    this.issueAbort = abort;
+    this.flowAborts.set(task.id, abort);
     const context = useStore.getState().transcript
       .filter((line) => line.who !== "Forge" && line.text !== command)
       .slice(-12);
+    void this.speakLine("On it — I'll dig through the repo and file that issue. Give me a minute.");
     try {
       const res = await apiFetch(`${API}/api/github/issues`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         signal: abort.signal,
-        body: JSON.stringify({ command, transcript: context }),
+        body: JSON.stringify({ command, transcript: context, idempotencyKey: crypto.randomUUID().replace(/-/g, "") }),
       });
-      const out = (await res.json()) as { html_url?: string; number?: number; title?: string; error?: string };
-      if (!res.ok || !out.html_url) throw new Error(out.error || "issue creation failed");
-      this.setTask(task.id, { status: "done", label: `Issue #${out.number}: ${out.title ?? ""}` });
-      await this.playStep({ type: "step", say: `Created GitHub issue number ${out.number}: ${out.title}.`, ops: [] }, true);
+      if (!res.ok || !res.body) throw new Error(`issue flow ${res.status}`);
+      let issue: { html_url?: string; number?: number; title?: string; duplicate?: boolean } | null = null;
+      let errorMsg: string | null = null;
+      await this.readNdjson(res, (msg) => {
+        if (msg.type === "progress") this.taskTrace(task.id, String(msg.text ?? ""));
+        else if (msg.type === "tool") this.taskTrace(task.id, `🔍 ${msg.name}: ${String(msg.input ?? "").slice(0, 80)}`);
+        else if (msg.type === "issue") issue = msg as typeof issue;
+        else if (msg.type === "error") errorMsg = String(msg.message ?? "issue creation failed");
+      });
+      if (!issue) throw new Error(errorMsg ?? "issue creation failed");
+      const done: { html_url?: string; number?: number; title?: string; duplicate?: boolean } = issue;
+      this.lastIssueNumber = done.number ?? this.lastIssueNumber;
+      this.setTask(task.id, { status: "done", label: `Issue #${done.number}: ${done.title ?? ""}` });
+      // Careful: this line is heard by the mic. It must NOT contain a literal
+      // trigger phrase ("work on issue N") or Forge can command itself.
+      await this.speakLine(
+        done.duplicate
+          ? `Heads up — issue number ${done.number} already covers that: ${done.title}. I didn't file a duplicate.`
+          : `Filed GitHub issue number ${done.number}: ${done.title}. I can pick it up and open a pull request whenever you ask.`
+      );
     } catch (err) {
       if (abort.signal.aborted) return; // cancelled from the registry — stay quiet
       this.setTask(task.id, { status: "error" });
       const message = err instanceof Error ? err.message : "issue creation failed";
-      await this.playStep({ type: "step", say: `I couldn't create that GitHub issue: ${message}.`, ops: [] }, true);
+      await this.speakLine(`I couldn't create that GitHub issue: ${message}.`);
     } finally {
-      this.issueTaskId = null;
-      this.issueAbort = null;
+      this.flowAborts.delete(task.id);
+    }
+  }
+
+  /** "Work on issue N": Forge reads the issue, implements it in an isolated
+   * worktree on the backend, validates, then opens a pull request. */
+  private startImplementFlow(number: number): void {
+    const already = useStore.getState().tasks.some(
+      (t) => t.kind === "pr" && !TERMINAL_TASK.has(t.status) && t.label.includes(`issue ${number}`)
+    );
+    if (already) return;
+    this.flowChain = this.flowChain.then(() => this.runImplementFlow(number)).catch(() => {});
+  }
+
+  private async runImplementFlow(number: number): Promise<void> {
+    const task = this.newTask("pr", `Pull request for issue ${number}`, "working");
+    const abort = new AbortController();
+    this.flowAborts.set(task.id, abort);
+    void this.speakLine(`On it — I'll read issue ${number}, implement it, and open a pull request. This can take a few minutes; watch the task panel.`);
+    try {
+      const res = await apiFetch(`${API}/api/github/issues/${number}/implement`, {
+        method: "POST",
+        signal: abort.signal,
+      });
+      if (!res.ok || !res.body) throw new Error(`implement flow ${res.status}`);
+      let pr: { html_url?: string; number?: number; branch?: string; created?: boolean } | null = null;
+      let errorMsg: string | null = null;
+      await this.readNdjson(res, (msg) => {
+        if (msg.type === "progress") this.taskTrace(task.id, String(msg.text ?? ""));
+        else if (msg.type === "tool") this.taskTrace(task.id, `🛠 ${msg.name}: ${String(msg.input ?? "").slice(0, 80)}`);
+        else if (msg.type === "pr") pr = msg as typeof pr;
+        else if (msg.type === "error") errorMsg = String(msg.message ?? "implementation failed");
+      });
+      if (!pr) throw new Error(errorMsg ?? "implementation failed");
+      const done: { html_url?: string; number?: number; branch?: string; created?: boolean } = pr;
+      this.setTask(task.id, { status: "done", label: `PR #${done.number} for issue ${number}` });
+      await this.speakLine(
+        done.created
+          ? `Done — pull request number ${done.number} is open for issue ${number}, on branch ${done.branch}. It passed validation; take a look when you get a chance.`
+          : `Issue ${number} already has an open Forge pull request — number ${done.number}.`
+      );
+    } catch (err) {
+      if (abort.signal.aborted) return;
+      this.setTask(task.id, { status: "error" });
+      const message = err instanceof Error ? err.message : "implementation failed";
+      await this.speakLine(`I couldn't finish a pull request for issue ${number}: ${message}.`);
+    } finally {
+      this.flowAborts.delete(task.id);
     }
   }
 
   // ---------- utterance routing ----------
   handleUtterance(text: string, source: UtteranceSource): void {
     // Forge hearing itself must never enter the meeting record as a human
-    // utterance. STOP is exempt so "stop talking" always works, even mid-echo.
-    if (source === "voice" && !STOP.test(text) && this.isSelfEcho(text)) return;
+    // utterance. Stop commands are exempt so "stop talking" always works,
+    // even mid-echo.
+    if (source === "voice" && !this.isStopCommand(text) && this.isSelfEcho(text)) return;
     this.transcript(this.myName, text);
     this.room?.cast({ k: "utter", who: this.myName, text });
 
-    if (STOP.test(text)) {
+    if (CANCEL_ALL.test(text)) {
+      this.cancelAgent(true);
+      this.caption("Forge", "Dropped everything — back to you.");
+      void this.speak("Dropped everything — back to you.");
+      return;
+    }
+    if (this.isStopCommand(text)) {
+      // Barge-in: kill the live explanation instantly; queued asks survive
+      // and start after a beat (cancelAgent drains the queue).
+      const wasActive = this.agentBusy || this.remoteAgentActive || this.ttsSpeaking;
       this.cancelAgent();
-      if (!this.agentBusy) { this.caption("Forge", "Sure — back to you."); void this.speak("Sure — back to you."); }
+      if (!wasActive) { this.caption("Forge", "Sure — back to you."); void this.speak("Sure — back to you."); }
       return;
     }
     if (CLEAR.test(text)) {
@@ -800,8 +993,14 @@ export class ForgeSession {
       void this.speak("Board's clean.");
       return;
     }
+    // "work on issue 3" — runs in the background; never holds the floor.
+    const implementNumber = parseImplementRequest(text, this.lastIssueNumber);
+    if (implementNumber !== null) {
+      this.startImplementFlow(implementNumber);
+      return;
+    }
     if (isIssueRequest(text)) {
-      void this.createGitHubIssue(text);
+      this.startIssueFlow(text);
       return;
     }
 
@@ -813,17 +1012,10 @@ export class ForgeSession {
 
     if (source === "typed" || isAddressed(text)) {
       const question = source === "typed" ? text : stripAddress(text) || text;
-      if (this.agentBusy) { this.interrupt(question); return; }
-      if (this.remoteAgentActive) {
-        // 1f: Stop mirrored run immediately and take over with the new ask.
-        this.room?.cast({ k: "cancel" });
-        this.remoteAgentActive = false;
-        this.cancelled = true;
-        this.cancelSpeech();
-        this.wb?.finishNow();
-        this.exitPresenting();
-        this.setListening();
-        void this.runAgent({ question, interrupted: true });
+      if (this.agentBusy || this.remoteAgentActive) {
+        // Forge is mid-answer (ours or the peer's): don't kill it — queue the
+        // new ask to run right after. "stop" is the explicit interrupt.
+        this.queueAsk(question);
         return;
       }
       void this.runAgent({ question });
@@ -888,6 +1080,8 @@ export class ForgeSession {
             this.remoteAgentActive = false;
             this.hideCaption();
             this.setListening();
+            // Anything we queued while the peer's run held the floor goes now.
+            this.drainAskQueue(400);
           })
           .catch(() => {});
         break;
@@ -900,6 +1094,7 @@ export class ForgeSession {
         this.exitPresenting();
         this.setListening();
         useStore.setState({ thinkingTrace: [] });
+        this.drainAskQueue(600);
         break;
       case "board-clear":
         this.wb?.clear();

@@ -6,6 +6,7 @@
 // takes over with pan/zoom, and a Fit action hands control back.
 
 import { Camera, type Bounds } from "./camera";
+import type { LayoutBoardState, LayoutCard } from "./layout";
 import type {
   ArrowOp,
   BoardArrowSummary,
@@ -261,6 +262,47 @@ export class Whiteboard {
         arrow.bbox = fresh.bbox;
       }
     }
+  }
+
+  /** Snapshot of rendered geometry for the auto-layout engine: cards with
+   * their live positions (offsets applied), note rects, arrows and their
+   * drawn polylines, and whether a title occupies the top strip. */
+  layoutState(): LayoutBoardState {
+    const ringed = new Set(
+      this.items.filter((i) => i.type === "circle" && i.target).map((i) => i.target as string)
+    );
+    const cards: LayoutCard[] = [];
+    for (const item of Object.values(this.nodes)) {
+      const m = item.meta;
+      if (!m || !item.id) continue;
+      const card: LayoutCard = {
+        id: item.id,
+        x: m.x + (item.offset?.dx ?? 0),
+        y: m.y + (item.offset?.dy ?? 0),
+        w: m.w,
+        h: m.h,
+      };
+      if (ringed.has(item.id)) card.ringed = true;
+      if (item.type === "code") {
+        const op = item.op as CodeOp;
+        card.codeKey = `${op.file}:${op.line ?? ""}`;
+      }
+      cards.push(card);
+    }
+    const notes = this.items
+      .filter((i) => i.type === "note" && i.bbox)
+      .map((i) => {
+        const b = i.bbox!;
+        const dx = i.offset?.dx ?? 0, dy = i.offset?.dy ?? 0;
+        return { x: (b.minX + b.maxX) / 2 + dx, y: (b.minY + b.maxY) / 2 + dy, w: b.maxX - b.minX, h: b.maxY - b.minY };
+      });
+    const arrows = this.items
+      .filter((i) => i.type === "arrow")
+      .map((i) => ({ from: (i.op as ArrowOp).from, to: (i.op as ArrowOp).to }));
+    const arrowPaths = this.items
+      .filter((i) => i.type === "arrow" && i.strokes[0]?.kind === "path")
+      .map((i) => (i.strokes[0] as PathStroke).pts);
+    return { cards, notes, arrows, arrowPaths, hasTitle: this.items.some((i) => i.type === "title") };
   }
 
   // Compact board state for the agent prompt (what's currently drawn).
@@ -520,9 +562,14 @@ export class Whiteboard {
       ];
       S.push(this._pathStroke(head, { width: 2.4, amp: 0.8 }));
       if (op.label) {
-        const mid = curve[Math.floor(curve.length / 2)];
-        const off = (op.bow ?? 1) >= 0 ? -16 : 20;
-        S.push(this._textStroke(op.label, mid.x + (-dy / len) * off * 0.4, mid.y + off * 0.8, {
+        // The layout engine picks a collision-checked spot (labelPos); fall
+        // back to the old midpoint guess for ops that bypassed layout.
+        const pos = op.labelPos ?? (() => {
+          const mid = curve[Math.floor(curve.length / 2)];
+          const off = (op.bow ?? 1) >= 0 ? -16 : 20;
+          return { x: mid.x + (-dy / len) * off * 0.4, y: mid.y + off * 0.8 };
+        })();
+        S.push(this._textStroke(op.label, pos.x, pos.y, {
           font: '17px "Patrick Hand"', color: "#4a5462", halo: true,
         }));
       }
@@ -585,11 +632,36 @@ export class Whiteboard {
     return item;
   }
 
+  /** Remove an item (and, for cards, the rings/crosses decorating it). */
+  private removeItem(item: BoardItem): void {
+    const decorated = item.id
+      ? this.items.filter((i) => (i.type === "circle" || i.type === "cross") && i.target === item.id)
+      : [];
+    const gone = new Set([item, ...decorated]);
+    this.items = this.items.filter((i) => !gone.has(i));
+    if (item.id) {
+      if (this.byId[item.id] === item) delete this.byId[item.id];
+      if (this.nodes[item.id] === item) delete this.nodes[item.id];
+    }
+  }
+
   private _complete(item: BoardItem): void {
     item.bornClock = this.clock;
     this.items.push(item);
     if (item.id) this.byId[item.id] = item;
-    if (item.type === "node" || item.type === "code") this.nodes[item.id as string] = item;
+    if (item.type === "node" || item.type === "code") {
+      this.nodes[item.id as string] = item;
+      // A replaced card may sit somewhere new — re-aim arrows touching it.
+      for (const arrow of this.items) {
+        if (arrow.type !== "arrow") continue;
+        const op = arrow.op as ArrowOp;
+        if (op.from === item.id || op.to === item.id) {
+          const fresh = this.plan(op);
+          arrow.strokes = fresh.strokes;
+          arrow.bbox = fresh.bbox;
+        }
+      }
+    }
     if (item.type === "cross" && item.target && this.nodes[item.target]) this.nodes[item.target].meta!.dead = true;
   }
 
@@ -607,6 +679,14 @@ export class Whiteboard {
         if (op.op === "fade") {
           for (const id of op.ids) if (this.byId[id]) this.byId[id].faded = true;
           continue;
+        }
+        // Re-emitted content replaces its predecessor instead of drawing on
+        // top of it: same-id cards and the (single) board title.
+        if ((op.op === "node" || op.op === "code") && op.id && this.byId[op.id]) {
+          this.removeItem(this.byId[op.id]);
+        } else if (op.op === "title") {
+          const oldTitle = this.items.find((i) => i.type === "title");
+          if (oldTitle) this.removeItem(oldTitle);
         }
         this.current = { item: this.plan(this.resolvePlacement(op)), si: 0, prog: 0 };
       }

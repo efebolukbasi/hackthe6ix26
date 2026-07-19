@@ -1,28 +1,77 @@
 // The Forge brain: turns meeting context into streamed whiteboard steps.
 import type { Response } from "express";
-import { streamText } from "./llm.ts";
-import { buildSystem, buildUser, buildIssuePrompt, buildListenPrompt, buildWalkthroughSystem, buildWalkthroughUser } from "./prompt.ts";
+import { llmMode, streamText, type ExtraTools } from "./llm.ts";
+import { buildSystem, buildUser, buildIssueSystem, buildIssuePrompt, buildListenPrompt, buildWalkthroughSystem, buildWalkthroughUser } from "./prompt.ts";
+import * as github from "./github.ts";
+import { implementIssue, type PullRequestResult } from "./implement.ts";
 import type { AgentRequestBody, AgentStep, ListenResult, TranscriptLine, WhiteboardOp, WalkthroughRequestBody } from "./types.ts";
 
-let SYSTEM = "";
 let REPO_DIGEST = "";
 let REPO_CWD: string | undefined;
-export function setRepoContext(digest: string, repoPath?: string): void {
+let REPO_SLUG: string | undefined;
+export function setRepoContext(digest: string, repoPath?: string, slug?: string | null): void {
   REPO_CWD = repoPath;
+  REPO_SLUG = slug ?? undefined;
   REPO_DIGEST = digest;
-  // The API path has live read-only repo tools executed locally by llm.ts.
-  SYSTEM = buildSystem(digest, !!repoPath);
 }
 export function getRepoCwd(): string | undefined {
   return REPO_CWD;
 }
+export function getRepoSlug(): string | undefined {
+  return REPO_SLUG;
+}
 
-// Claude drafts a GitHub issue from the spoken request and meeting context.
-export async function draftIssue(command: string, transcript: TranscriptLine[]): Promise<{ title: string; body: string }> {
+/** GitHub issue read tools for the meeting/walkthrough agents — lets Forge
+ * answer "what issues are open?" against the real tracker. */
+function issueTools(): ExtraTools | undefined {
+  if (!REPO_CWD) return undefined;
+  const cwd = REPO_CWD;
+  return {
+    defs: [
+      {
+        name: "list_github_issues",
+        description: "List the active repository's GitHub issues (number, title, state). Optional state filter: open (default), closed, or all.",
+        input_schema: { type: "object", properties: { state: { type: "string", enum: ["open", "closed", "all"] } } },
+      },
+      {
+        name: "read_github_issue",
+        description: "Read one GitHub issue's title and full body by number.",
+        input_schema: { type: "object", properties: { number: { type: "integer" } }, required: ["number"] },
+      },
+    ],
+    run: async (name, input) => {
+      if (name === "list_github_issues") {
+        const state = input.state === "closed" || input.state === "all" ? input.state : "open";
+        const issues = await github.listIssues(cwd, REPO_SLUG, state);
+        if (!issues.length) return `no ${state} issues`;
+        return issues
+          .map((i) => `#${i.number} [${i.state}] ${i.title} (updated ${i.updated_at.slice(0, 10)})`)
+          .join("\n");
+      }
+      if (name === "read_github_issue") {
+        const issue = await github.getIssue(cwd, Number(input.number), REPO_SLUG);
+        return `#${issue.number} [${issue.state}] ${issue.title}\n\n${(issue.body || "(no body)").slice(0, 4000)}`;
+      }
+      return `error: unknown tool ${name}`;
+    },
+  };
+}
+
+// Claude drafts a GitHub issue from the spoken request, the meeting context,
+// and — critically — its own exploration of the repository.
+export async function draftIssue(
+  command: string,
+  transcript: TranscriptLine[],
+  onTool?: (name: string, input: string) => void
+): Promise<{ title: string; body: string }> {
   const text = await streamText({
-    system: "You write clear, actionable GitHub issues for an engineering team.",
+    system: buildIssueSystem(REPO_DIGEST),
     prompt: buildIssuePrompt(command, transcript),
-    maxTokens: 800,
+    maxTokens: 3500,
+    maxTurns: 12,
+    tools: true,
+    cwd: REPO_CWD,
+    onTool,
   });
   const start = text.indexOf("{");
   const end = text.lastIndexOf("}");
@@ -34,6 +83,89 @@ export async function draftIssue(command: string, transcript: TranscriptLine[]):
     title: title.slice(0, 180),
     body: String(parsed.body || "").trim() || "Created from a Forge meeting.",
   };
+}
+
+/** NDJSON event writer shared by the long-running GitHub flows. */
+function ndjsonWriter(res: Response): { send: (obj: Record<string, unknown>) => void; end: () => void } {
+  res.writeHead(200, {
+    "Content-Type": "application/x-ndjson; charset=utf-8",
+    "Cache-Control": "no-cache",
+    "X-Accel-Buffering": "no",
+  });
+  return {
+    send: (obj) => { if (!res.writableEnded) res.write(JSON.stringify(obj) + "\n"); },
+    end: () => { if (!res.writableEnded) res.end(); },
+  };
+}
+
+/**
+ * Streamed issue creation: research progress → the created (or reused) issue.
+ * Events: {type:"progress",text} {type:"tool",name,input}
+ *         {type:"issue", html_url, number, title, created, duplicate}
+ *         {type:"error",message} — always terminated by {type:"done"}.
+ */
+export async function createIssueFlow(
+  body: { command?: string; title?: string; body?: string; transcript?: TranscriptLine[]; idempotencyKey?: string },
+  res: Response,
+  log: Pick<Console, "error"> = console
+): Promise<void> {
+  const { send, end } = ndjsonWriter(res);
+  try {
+    if (!REPO_CWD) throw Object.assign(new Error("no repo loaded"), { status: 400 });
+    let title = String(body.title || "").trim();
+    let issueBody = String(body.body || "").trim();
+    if (body.command) {
+      send({ type: "progress", text: "researching the repo before writing the issue" });
+      try {
+        const draft = await draftIssue(
+          String(body.command),
+          Array.isArray(body.transcript) ? body.transcript : [],
+          (name, input) => send({ type: "tool", name, input: input.slice(0, 120) })
+        );
+        title = draft.title;
+        issueBody = draft.body;
+      } catch (err) {
+        log.error("issue draft failed, using fallback:", err instanceof Error ? err.message : String(err));
+      }
+    }
+    if (!title) title = "Meeting follow-up";
+    if (!issueBody) issueBody = "Created from a Forge meeting.";
+    send({ type: "progress", text: "filing the issue on GitHub" });
+    const issue = await github.createOrReuseIssue(REPO_CWD, title, issueBody, REPO_SLUG, body.idempotencyKey);
+    send({ type: "issue", ...issue });
+  } catch (err) {
+    send({ type: "error", message: err instanceof Error ? err.message : String(err) });
+  } finally {
+    send({ type: "done" });
+    end();
+  }
+}
+
+/**
+ * Streamed issue implementation: worktree progress → the opened (or reused) PR.
+ * Events: {type:"progress",text} {type:"tool",name,input}
+ *         {type:"pr", html_url, number, title, branch, created, summary}
+ *         {type:"error",message} — always terminated by {type:"done"}.
+ */
+export async function implementIssueFlow(number: number, res: Response, log: Pick<Console, "error"> = console): Promise<void> {
+  const { send, end } = ndjsonWriter(res);
+  const abort = new AbortController();
+  res.on("close", () => abort.abort());
+  try {
+    if (!REPO_CWD) throw Object.assign(new Error("no repo loaded"), { status: 400 });
+    const pr: PullRequestResult = await implementIssue(REPO_CWD, number, REPO_DIGEST, REPO_SLUG, {
+      onPhase: (text) => send({ type: "progress", text }),
+      onTool: (name, input) => send({ type: "tool", name, input: input.slice(0, 120) }),
+      signal: abort.signal,
+    });
+    send({ type: "pr", ...pr });
+  } catch (err) {
+    log.error("implement flow failed:", err instanceof Error ? err.message : String(err));
+    send({ type: "error", message: err instanceof Error ? err.message : String(err) });
+  } finally {
+    send({ type: "done" });
+    end();
+  }
 }
 
 const KNOWN_OPS = new Set(["clear", "title", "node", "arrow", "note", "circle", "cross", "fade", "code"]);
@@ -119,14 +251,17 @@ export async function respond(
   const parser = makeLineParser((step) => send({ type: "step", ...step }));
 
   try {
+    // Built per call: the tool roster differs between the API and CLI brains,
+    // and the mode can flip mid-process (API billing failure → CLI fallback).
     const fullText = await streamText({
-      system: SYSTEM,
+      system: buildSystem(REPO_DIGEST, !!REPO_CWD, llmMode() === "api"),
       prompt: buildUser({ question, transcript, board, invited, reason, interrupted }),
       onDelta: (t: string) => parser.push(t),
       onTool: (name, input) => send({ type: "tool", name, input }),
       signal: abort.signal,
       tools: true,
       cwd: REPO_CWD,
+      extraTools: issueTools(),
     });
     const n = parser.flush();
     if (n === 0) {

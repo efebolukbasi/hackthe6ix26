@@ -10,7 +10,7 @@ import { fileURLToPath } from "node:url";
 import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
 import { buildDigest } from "./lib/repo.ts";
-import { respond, listen, setRepoContext, getRepoCwd, walkthrough, draftIssue } from "./lib/agent.ts";
+import { respond, listen, setRepoContext, getRepoCwd, getRepoSlug, walkthrough, createIssueFlow, implementIssueFlow } from "./lib/agent.ts";
 import { synthesize, synthesizeStream, ttsEnabled } from "./lib/tts.ts";
 import { llmMode } from "./lib/llm.ts";
 import { attachRoom } from "./lib/room.ts";
@@ -78,7 +78,7 @@ async function loadRepo(source: string): Promise<RepoMeta> {
   const m = source.match(GITHUB_URL_RE);
   repoSlug = m ? `${m[1]}/${m[2]}` : (await github.repoSlugFor(path)) || github.configuredRepoSlug();
   const { digest, meta } = await buildDigest(path);
-  setRepoContext(digest, path);
+  setRepoContext(digest, path, repoSlug);
   repoMeta = meta;
   return meta;
 }
@@ -105,30 +105,48 @@ app.get("/api/github/repos", async (req: Request, res: Response) => {
   }
 });
 
-app.post("/api/github/issues", async (req: Request, res: Response) => {
-  const body = req.body as { title?: string; body?: string; command?: string; transcript?: TranscriptLine[] } | undefined;
+// Streamed NDJSON: research progress → the created (or reused) issue.
+// When the frontend passes the raw spoken command, Claude explores the repo
+// with tools and writes the issue; a dedupe layer guarantees one issue per
+// intent even across retries and repeated speech finals.
+app.post("/api/github/issues", (req: Request, res: Response) =>
+  createIssueFlow(req.body as { command?: string; title?: string; body?: string; transcript?: TranscriptLine[]; idempotencyKey?: string } ?? {}, res)
+);
+
+/** Read the active repository's GitHub issues without exposing its token. */
+app.get("/api/github/issues", async (req: Request, res: Response) => {
   const cwd = getRepoCwd();
   if (!cwd) return res.status(400).json({ error: "no repo loaded" });
-  let title = String(body?.title || "").trim();
-  let issueBody = String(body?.body || "").trim();
-  // When the frontend passes the raw spoken command, Claude writes the issue.
-  if (body?.command) {
-    try {
-      const draft = await draftIssue(String(body.command), Array.isArray(body.transcript) ? body.transcript : []);
-      title = draft.title;
-      issueBody = draft.body;
-    } catch (err) {
-      console.error("issue draft failed, using fallback:", err instanceof Error ? err.message : String(err));
-    }
-  }
-  if (!title) title = "Meeting follow-up";
-  if (!issueBody) issueBody = "Created from a Forge meeting.";
+  const state = req.query.state === "closed" || req.query.state === "all" ? req.query.state : "open";
   try {
-    res.json(await github.createIssue(cwd, title, issueBody, repoSlug ?? undefined));
+    res.json(await github.listIssues(cwd, getRepoSlug(), state));
   } catch (err) {
     const e = err as { status?: number; message?: string };
     res.status(e.status || 502).json({ error: e.message || String(err) });
   }
+});
+
+app.get("/api/github/issues/:number", async (req: Request, res: Response) => {
+  const cwd = getRepoCwd();
+  const number = Number(req.params.number);
+  if (!cwd) return res.status(400).json({ error: "no repo loaded" });
+  if (!Number.isInteger(number) || number < 1) return res.status(400).json({ error: "invalid issue number" });
+  try {
+    res.json(await github.getIssue(cwd, number, getRepoSlug()));
+  } catch (err) {
+    const e = err as { status?: number; message?: string };
+    res.status(e.status || 502).json({ error: e.message || String(err) });
+  }
+});
+
+/**
+ * Streamed NDJSON: reads the issue, implements it in an isolated worktree,
+ * validates, pushes forge/issue-<n>-* and opens a pull request.
+ */
+app.post("/api/github/issues/:number/implement", (req: Request, res: Response) => {
+  const number = Number(req.params.number);
+  if (!Number.isInteger(number) || number < 1) return res.status(400).json({ error: "invalid issue number" });
+  return implementIssueFlow(number, res);
 });
 
 // Point Forge at a different repo mid-meeting: local path or GitHub URL.
