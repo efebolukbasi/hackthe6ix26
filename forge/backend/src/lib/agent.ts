@@ -171,14 +171,29 @@ export async function implementIssueFlow(number: number, res: Response, log: Pic
 const KNOWN_OPS = new Set(["clear", "title", "node", "arrow", "note", "circle", "cross", "fade", "code"]);
 
 /** "say" is spoken aloud and shown as a caption — markdown markers, stray
- * backslashes, and code ticks must never reach either surface. */
+ * backslashes, code ticks, and leaked JSON/op fragments must never reach
+ * either surface. Returns "" when nothing speakable remains (step dropped). */
 function cleanSay(text: string): string {
-  return text
+  let s = text
+    .replace(/```[\s\S]*?```/g, " ")
     .replace(/\*\*|__|~~|`/g, "")
     .replace(/(^|\s)[*_#>-]\s+/g, "$1")
-    .replace(/\\+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+    .replace(/\\+/g, " ");
+  // A derailed model can nest op JSON inside "say" — scrub the fragments.
+  if (/[{}[\]]|"\s*:/.test(s)) {
+    s = s
+      .replace(/[{}[\]"]+/g, " ")
+      .replace(/\b(op|id|from|to|label|say|ops|bow|color|attr|file|line|text|sub|target|ids|x|y|w|h)\s*:\s*/gi, " ");
+  }
+  s = s.replace(/\s+/g, " ").trim();
+  if (s.length > 300) {
+    const cut = s.slice(0, 300);
+    s = cut.slice(0, Math.max(cut.lastIndexOf(". "), cut.lastIndexOf("! "), cut.lastIndexOf("? "), 240) + 1).trim() || cut;
+  }
+  // If what's left barely resembles language, drop the step entirely.
+  const letters = (s.match(/[a-z]/gi) || []).length;
+  if (s.length < 2 || letters / Math.max(1, s.length) < 0.55) return "";
+  return s;
 }
 
 function sanitizeStep(obj: unknown): AgentStep | null {
@@ -280,9 +295,15 @@ export async function respond(
     if (n === 0) {
       // The model answered in prose instead of NDJSON (common for casual
       // questions) — speak the prose itself rather than apologizing.
-      const plain = fullText
-        .replace(/```[\s\S]*?```/g, " ")
-        .replace(/\{[\s\S]*?\}/g, " ")
+      log.error("agent answered in prose, salvaging. First 200 chars:", fullText.slice(0, 200));
+      let plain = fullText.replace(/```[\s\S]*?```/g, " ");
+      // Strip JSON innermost-first so NESTED braces (ops inside steps) go too;
+      // the old single non-greedy pass left fragments that got spoken aloud.
+      for (let pass = 0; pass < 8 && /\{[^{}]*\}/.test(plain); pass++) {
+        plain = plain.replace(/\{[^{}]*\}/g, " ");
+      }
+      plain = plain
+        .replace(/[{}[\]"]/g, " ")
         .replace(/[*_#`>|]/g, "")
         .replace(/\s+/g, " ")
         .trim();

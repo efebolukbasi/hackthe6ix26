@@ -388,10 +388,15 @@ export class ForgeSession {
     this.currentTtsAbort = abortCtrl;
     return new Promise<void>((resolve, reject) => {
       let settled = false;
+      // Single-voice invariant: however this line ends — naturally, watchdog,
+      // stream failure — the audio element must STOP before the next line (or
+      // the browser-TTS fallback) starts, or two voices overlap as gibberish.
+      const stopAudio = () => { try { a.pause(); } catch { /* noop */ } };
       const finish = () => {
         if (settled) return;
         settled = true;
         clearTimeout(watchdog);
+        stopAudio();
         resolve();
       };
       this.currentTtsFinish = finish;
@@ -399,6 +404,7 @@ export class ForgeSession {
         if (settled) return;
         settled = true;
         clearTimeout(watchdog);
+        stopAudio();
         if (abortCtrl.signal.aborted) resolve();
         else reject(err instanceof Error ? err : new Error(String(err)));
       };
