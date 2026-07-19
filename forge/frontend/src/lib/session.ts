@@ -1303,11 +1303,23 @@ export class ForgeSession {
     }
   }
 
+  // Secret demo shortcut: pressing "0" anywhere in the room (any participant)
+  // makes Forge deliver its scripted hello to the whole call. Ignored while
+  // typing in the chat panel or any other text field.
+  private onDemoKey = (e: KeyboardEvent): void => {
+    if (e.key !== "0" || e.repeat) return;
+    if (useStore.getState().phase !== "room") return;
+    const target = e.target as HTMLElement | null;
+    if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable)) return;
+    void this.speakLine("Hello hack the six, I'm Forge and I am here with Adam, and Efe, my creators!");
+  };
+
   async join(name?: string): Promise<void> {
     if (this.joined) return; // Join button is once-guarded
     this.joined = true;
     this.myName = (name || "").trim() || "You";
     useStore.setState({ phase: "room", myName: this.myName });
+    window.addEventListener("keydown", this.onDemoKey);
 
     this.audioCtx = new AudioContext();
     this.startMeter();
@@ -1606,6 +1618,7 @@ export class ForgeSession {
   }
 
   end(): void {
+    window.removeEventListener("keydown", this.onDemoKey);
     this.room?.close();
     this.room = null;
     this.recogWanted = false;
