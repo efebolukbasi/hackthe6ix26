@@ -289,6 +289,42 @@ function layoutSegment(prior: LayoutBoardState | null, entries: Entry[]): Layout
     ...s.arrows,
     ...newArrows.map((a) => ({ from: a.op.from, to: a.op.to })),
   ];
+  // DAG-ify before layering: a cycle (A→B plus B→A is common model output)
+  // would otherwise make its members ratchet each other downward on every
+  // relaxation sweep until they all hit MAX_LAYER — one giant row thousands
+  // of px below the rest of the diagram. Back-edges still DRAW as arrows;
+  // they just don't constrain rows.
+  const nodeOrder = [...pinned, ...graphNew.map((g) => g.op.id)];
+  const adjacency = new Map<string, Array<{ to: string; index: number }>>();
+  allEdges.forEach((edge, index) => {
+    if (!adjacency.has(edge.from)) adjacency.set(edge.from, []);
+    adjacency.get(edge.from)!.push({ to: edge.to, index });
+  });
+  const backEdges = new Set<number>();
+  const dfsState = new Map<string, 1 | 2>(); // 1 = on stack, 2 = done
+  for (const rootId of nodeOrder) {
+    if (dfsState.has(rootId)) continue;
+    const stack: Array<{ id: string; next: number }> = [{ id: rootId, next: 0 }];
+    dfsState.set(rootId, 1);
+    while (stack.length) {
+      const frame = stack[stack.length - 1];
+      const out = adjacency.get(frame.id) ?? [];
+      if (frame.next >= out.length) {
+        dfsState.set(frame.id, 2);
+        stack.pop();
+        continue;
+      }
+      const edge = out[frame.next++];
+      const state = dfsState.get(edge.to);
+      if (state === 1) backEdges.add(edge.index);       // closes a cycle
+      else if (state === undefined) {
+        dfsState.set(edge.to, 1);
+        stack.push({ id: edge.to, next: 0 });
+      }
+    }
+  }
+  const forwardEdges = allEdges.filter((_, index) => !backEdges.has(index));
+
   const layer = new Map<string, number>();
   for (const id of pinned) {
     const c = s.cards.get(id)!;
@@ -300,18 +336,20 @@ function layoutSegment(prior: LayoutBoardState | null, entries: Entry[]): Layout
     const h = hintLayer(g.op.y);
     if (h !== null) layer.set(g.op.id, h);
   }
-  // Seed unhinted roots (no incoming edges) at the top row so the flow can
-  // cascade downward even when the model gave no usable coordinates.
-  const hasIncoming = new Set(allEdges.map((e) => e.to));
+  // Seed unhinted roots (no incoming forward edges) at the top row so the
+  // flow can cascade downward even when the model gave no usable coordinates.
+  const hasIncoming = new Set(forwardEdges.map((e) => e.to));
   for (const g of graphNew) {
     if (!layer.has(g.op.id) && !hasIncoming.has(g.op.id)) layer.set(g.op.id, 0);
   }
-  // Longest-path relaxation: children sit below parents. Pinned cards never move.
+  // Longest-path relaxation over the DAG: children sit below parents (the
+  // longest forward chain bounds the depth, so this terminates naturally —
+  // MAX_LAYER stays as a pure backstop). Pinned cards never move.
   const relax = () => {
     let changed = true;
-    for (let guard = 0; changed && guard < 24; guard++) {
+    for (let guard = 0; changed && guard < nodeOrder.length + 2; guard++) {
       changed = false;
-      for (const edge of allEdges) {
+      for (const edge of forwardEdges) {
         if (pinned.has(edge.to)) continue;
         const lu = layer.get(edge.from);
         if (lu === undefined) continue;
@@ -322,8 +360,7 @@ function layoutSegment(prior: LayoutBoardState | null, entries: Entry[]): Layout
     }
   };
   relax();
-  // Stragglers (cycle members, isolated cards): default to row 1, then let
-  // their children settle below them.
+  // Stragglers (isolated cards): default to row 1, then let children settle.
   for (const g of graphNew) if (!layer.has(g.op.id)) layer.set(g.op.id, 1);
   relax();
 
