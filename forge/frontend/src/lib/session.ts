@@ -467,10 +467,21 @@ export class ForgeSession {
     return run;
   }
 
-  /** Pronunciation fixes applied ONLY to the audio path — captions and the
-   * transcript keep the real spelling. "Efe" is pronounced "F-e". */
+  /** Pronunciation + cleanup applied ONLY to the audio path — captions and
+   * the transcript keep the real spelling. */
   private ttsText(text: string): string {
-    return text.replace(/\bEfe\b/gi, "F-e");
+    return text
+      .replace(/\bEfe\b/gi, "F-e")
+      .replace(/\bVite\b/gi, "veet")
+      .replace(/\bNDJSON\b/gi, "N D jason")
+      .replace(/\bAPIs\b/gi, "A P Is")
+      .replace(/\bAPI\b/gi, "A P I")
+      // "read/grep/list" speaks as a list, not "slash"
+      .replace(/(\w) ?\/ ?(?=\w)/g, "$1, ")
+      // markdown/markup residue and stray escapes never reach the voice
+      .replace(/[\\*_`#|~<>]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
   }
 
   private async speakNow(text: string): Promise<void> {

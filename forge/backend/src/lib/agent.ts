@@ -170,13 +170,26 @@ export async function implementIssueFlow(number: number, res: Response, log: Pic
 
 const KNOWN_OPS = new Set(["clear", "title", "node", "arrow", "note", "circle", "cross", "fade", "code"]);
 
+/** "say" is spoken aloud and shown as a caption — markdown markers, stray
+ * backslashes, and code ticks must never reach either surface. */
+function cleanSay(text: string): string {
+  return text
+    .replace(/\*\*|__|~~|`/g, "")
+    .replace(/(^|\s)[*_#>-]\s+/g, "$1")
+    .replace(/\\+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function sanitizeStep(obj: unknown): AgentStep | null {
   const candidate = obj as { say?: unknown; ops?: unknown } | null | undefined;
   if (!candidate || typeof candidate.say !== "string" || !candidate.say.trim()) return null;
   const ops: WhiteboardOp[] = Array.isArray(candidate.ops)
     ? candidate.ops.filter((o: { op?: unknown }) => o && KNOWN_OPS.has(o.op as string))
     : [];
-  return { say: candidate.say.trim(), ops };
+  const say = cleanSay(candidate.say);
+  if (!say) return null;
+  return { say, ops };
 }
 
 // Pulls complete JSON lines out of accumulated streamed text, also extracting
