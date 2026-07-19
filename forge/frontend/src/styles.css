@@ -437,6 +437,13 @@ button:active { transform: scale(0.96); }
   transition: opacity 0.25s ease, transform 0.25s ease;
 }
 #captions.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+/* While a diagram is on stage, keep the caption low-profile — the follow
+ * camera also reserves this bottom band so drawings never sit under it. */
+#room.presenting #captions {
+  max-width: min(620px, 46vw); bottom: 102px;
+  font-size: 14.5px; line-height: 1.45; padding: 8px 15px;
+  background: rgba(9, 9, 8, 0.62);
+}
 #cap-speaker {
   color: var(--ember-hi); font-weight: 600; font-size: 13px; margin-right: 10px;
   text-transform: uppercase; letter-spacing: 0.8px;

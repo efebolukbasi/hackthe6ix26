@@ -42,13 +42,16 @@ export class Camera {
     this.tx = this.x; this.ty = this.y; this.tz = this.z;
   }
 
-  /** Glide so `bounds` (world) fits a viewport of vw×vh css px with padding. */
-  fitBounds(b: Bounds, vw: number, vh: number, pad = 70, maxZ = 1.15): void {
+  /** Glide so `bounds` (world) fits a viewport of vw×vh css px with padding.
+   * `padBottom` reserves extra space at the bottom (e.g. the caption band) so
+   * fitted content never hides under overlays. */
+  fitBounds(b: Bounds, vw: number, vh: number, pad = 70, maxZ = 1.15, padBottom = pad): void {
     const bw = Math.max(1, b.maxX - b.minX), bh = Math.max(1, b.maxY - b.minY);
-    const z = Math.min(maxZ, Math.max(MIN_Z, Math.min((vw - pad * 2) / bw, (vh - pad * 2) / bh)));
+    const z = Math.min(maxZ, Math.max(MIN_Z, Math.min((vw - pad * 2) / bw, (vh - pad - padBottom) / bh)));
     this.tz = z;
     this.tx = (vw / z - bw) / 2 - b.minX;
-    this.ty = (vh / z - bh) / 2 - b.minY;
+    // Center the content within the strip above the reserved bottom band.
+    this.ty = (pad + (vh - pad - padBottom - bh * z) / 2) / z - b.minY;
   }
 
   /** Glide until the world point sits at the viewport center (minimap jump). */

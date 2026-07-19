@@ -39,8 +39,10 @@ export interface ArrowOp {
   id?: string;
   label?: string;
   bow?: number;
-  /** collision-checked label anchor chosen by the layout engine */
-  labelPos?: { x: number; y: number };
+  /** Collision-checked label anchor chosen by the layout engine, stored
+   * RELATIVE to the curve midpoint so the label rides along when an endpoint
+   * card is dragged and the arrow re-plans. */
+  labelOffset?: { dx: number; dy: number };
 }
 
 export interface NoteOp {
@@ -221,9 +223,10 @@ declare global {
   interface Window {
     /** Optional backend origin override (split deploys). Empty/unset = same origin. */
     FORGE_API?: string;
-    /** Demo/debug hooks: feed an utterance as if heard through the mic, draw
-     * a sample board without the backend, or grab the live whiteboard. */
-    forge?: { hear: (text: string) => void; demo: () => void; board: () => unknown };
+    /** Demo/debug hooks: feed an utterance (or live interim text) as if heard
+     * through the mic, draw a sample board without the backend, or grab the
+     * live whiteboard. */
+    forge?: { hear: (text: string) => void; interim: (text: string) => void; demo: () => void; board: () => unknown };
     SpeechRecognition?: SpeechRecognitionCtor;
     webkitSpeechRecognition?: SpeechRecognitionCtor;
   }

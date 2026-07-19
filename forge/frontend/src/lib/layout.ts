@@ -431,7 +431,10 @@ function layoutSegment(prior: LayoutBoardState | null, entries: Entry[]): Layout
     const candidates = [...tried, 0, 30, -30, 60, -60, 100, -100, 150, -150, 210, -210];
     let best: { bow: number; path: Pt[]; score: number } | null = null;
     for (const bow of candidates) {
-      const path = arrowCurve(cardObstacle(from), cardObstacle(to), bow);
+      // Plain endpoint rects, exactly like the whiteboard will draw it — the
+      // stored path (and the label offsets derived from it) must match the
+      // rendered curve. Rings are avoided via the obstacle checks below.
+      const path = arrowCurve(from, to, bow);
       let score = Math.abs(bow) * 0.02;
       for (const p of path) {
         for (const c of s.cards.values()) {
@@ -548,7 +551,10 @@ function layoutSegment(prior: LayoutBoardState | null, entries: Entry[]): Layout
       }
     }
     if (best.score < Infinity) {
-      a.e.op = { ...(a.e.op as ArrowOp), labelPos: { x: best.x, y: best.y } };
+      // Store the anchor relative to the curve midpoint: when an endpoint is
+      // dragged later, the re-planned arrow carries its label along.
+      const mid = path[Math.floor(path.length / 2)];
+      a.e.op = { ...(a.e.op as ArrowOp), labelOffset: { dx: Math.round(best.x - mid.x), dy: Math.round(best.y - mid.y) } };
       s.labelRects.push({ x: best.x, y: best.y, w, h });
     }
   }

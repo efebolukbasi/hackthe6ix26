@@ -177,6 +177,7 @@ export class ForgeSession {
     // this")), and draw a sample board with no backend (window.forge.demo()).
     window.forge = {
       hear: (text: string) => this.handleUtterance(text, "voice"),
+      interim: (text: string) => this.showInterim(text),
       demo: () => this.demoBoard(),
       board: () => this.wb,
     };
@@ -499,11 +500,13 @@ export class ForgeSession {
     r.interimResults = true;
     r.lang = "en-US";
     r.onresult = (e) => {
+      let interim = "";
       for (let i = e.resultIndex; i < e.results.length; i++) {
         const res = e.results[i];
         if (res.isFinal) {
           const text = res[0].transcript.trim();
           if (!text) continue;
+          this.clearInterim();
           // Chrome re-fires already-final results across engine restarts —
           // an identical final within a couple of seconds is the same speech.
           const norm = normalizeSpeech(text);
@@ -518,8 +521,11 @@ export class ForgeSession {
           if (!this.inTtsTail() || isAddressed(text) || this.isStopCommand(text)) {
             this.handleUtterance(text, "voice");
           }
+        } else {
+          interim += res[0].transcript;
         }
       }
+      if (interim.trim()) this.showInterim(interim.trim());
     };
     // ALWAYS restart while the mic is on — including mid-TTS. Chrome ends
     // recognition on its own every so often; refusing to restart during
@@ -529,6 +535,31 @@ export class ForgeSession {
       if (this.recogWanted) setTimeout(() => { try { r.start(); } catch { /* already started */ } }, 250);
     };
     return r;
+  }
+
+  // ---------- live "Forge is hearing you" feedback ----------
+  // Finals arrive seconds after you stop talking; without interim feedback,
+  // saying "Forge, …" feels like talking to a wall. As soon as the live
+  // (unfinalized) transcript addresses Forge, a caption mirrors it back.
+  private interimAddressed = false;
+  private interimTimer: ReturnType<typeof setTimeout> | undefined;
+
+  private showInterim(text: string): void {
+    if (!useStore.getState().ccOn) return;
+    if (!this.interimAddressed && !isAddressed(text)) return;
+    this.interimAddressed = true;
+    useStore.setState({ caption: { speaker: `${this.myName} → Forge`, text: `${text} …`, visible: true } });
+    clearTimeout(this.capTimer); // don't let an old caption timer hide us
+    clearTimeout(this.interimTimer);
+    // If the engine never finalizes (mic cut, long pause), fade the mirror.
+    this.interimTimer = setTimeout(() => this.clearInterim(true), 5000);
+  }
+
+  private clearInterim(hide = false): void {
+    if (!this.interimAddressed) return;
+    this.interimAddressed = false;
+    clearTimeout(this.interimTimer);
+    if (hide) this.hideCaption();
   }
 
   /** True when this utterance means "cut it out": explicit stop phrases

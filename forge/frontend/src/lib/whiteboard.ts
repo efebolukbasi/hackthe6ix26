@@ -562,13 +562,16 @@ export class Whiteboard {
       ];
       S.push(this._pathStroke(head, { width: 2.4, amp: 0.8 }));
       if (op.label) {
-        // The layout engine picks a collision-checked spot (labelPos); fall
-        // back to the old midpoint guess for ops that bypassed layout.
-        const pos = op.labelPos ?? (() => {
-          const mid = curve[Math.floor(curve.length / 2)];
-          const off = (op.bow ?? 1) >= 0 ? -16 : 20;
-          return { x: mid.x + (-dy / len) * off * 0.4, y: mid.y + off * 0.8 };
-        })();
+        // The layout engine picks a collision-checked offset from the curve
+        // midpoint, so the label follows the arrow when endpoints move; ops
+        // that bypassed layout fall back to the old midpoint guess.
+        const mid = curve[Math.floor(curve.length / 2)];
+        const pos = op.labelOffset
+          ? { x: mid.x + op.labelOffset.dx, y: mid.y + op.labelOffset.dy }
+          : (() => {
+              const off = (op.bow ?? 1) >= 0 ? -16 : 20;
+              return { x: mid.x + (-dy / len) * off * 0.4, y: mid.y + off * 0.8 };
+            })();
         S.push(this._textStroke(op.label, pos.x, pos.y, {
           font: '17px "Patrick Hand"', color: "#4a5462", halo: true,
         }));
@@ -734,14 +737,16 @@ export class Whiteboard {
     if (this.trail.length && this.trail[0].t < cutoff) this.trail = this.trail.filter((p) => p.t >= cutoff);
   }
 
-  /** Auto-frame the drawing (never tighter than a comfortable reading size). */
+  /** Auto-frame the drawing (never tighter than a comfortable reading size).
+   * Extra bottom padding keeps the fitted diagram above the caption overlay,
+   * so Forge's spoken captions never sit on top of nodes or arrows. */
   private followContent(cw: number, ch: number): void {
     let b = this.contentBounds();
     if (!b) b = { minX: 0, minY: 0, maxX: VW, maxY: VH };
     const minW = 720, minH = 450;
     const cx = (b.minX + b.maxX) / 2, cy = (b.minY + b.maxY) / 2;
     const w = Math.max(b.maxX - b.minX, minW), h = Math.max(b.maxY - b.minY, minH);
-    this.camera.fitBounds({ minX: cx - w / 2, minY: cy - h / 2, maxX: cx + w / 2, maxY: cy + h / 2 }, cw, ch, 72, 1.05);
+    this.camera.fitBounds({ minX: cx - w / 2, minY: cy - h / 2, maxX: cx + w / 2, maxY: cy + h / 2 }, cw, ch, 72, 1.05, 190);
   }
 
   // --- rendering ---
