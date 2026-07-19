@@ -467,16 +467,24 @@ export class ForgeSession {
     return run;
   }
 
+  /** Pronunciation fixes applied ONLY to the audio path — captions and the
+   * transcript keep the real spelling. "Efe" is pronounced "F-e". */
+  private ttsText(text: string): string {
+    return text.replace(/\bEfe\b/gi, "F-e");
+  }
+
   private async speakNow(text: string): Promise<void> {
     if (this.cancelled && this.agentBusy) return; // skip queued lines after a barge-in
+    const spoken = this.ttsText(text);
     this.noteForgeLine(text); // remember it BEFORE the mic can hear it
+    if (spoken !== text) this.noteForgeLine(spoken); // echo filter hears the spoken form
     this.ttsSpeaking = true;
     useStore.setState({ orbSpeaking: true, listeningActive: false });
     try {
       if (!this.health.tts || this.cancelled) throw new Error("tts off");
-      await this.elevenSpeak(text);
+      await this.elevenSpeak(spoken);
     } catch {
-      if (!this.cancelled) await this.browserSpeak(text);
+      if (!this.cancelled) await this.browserSpeak(spoken);
     }
     this.ttsSpeaking = false;
     this.ttsTailUntil = Date.now() + 2_000;
