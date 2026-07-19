@@ -29,7 +29,9 @@ export async function synthesize(text: string): Promise<Buffer> {
   }
 
   const voice = process.env.ELEVENLABS_VOICE_ID || DEFAULT_VOICE;
-  const hash = createHash("sha1").update(`${voice}|${MODEL}|${text}`).digest("hex");
+  // Language is part of the cache key: entries synthesized before the
+  // language was pinned may be auto-detected wrong and must not replay.
+  const hash = createHash("sha1").update(`${voice}|${MODEL}|en|${text}`).digest("hex");
   const cached = join(CACHE_DIR, `${hash}.mp3`);
   if (existsSync(cached)) return readFileSync(cached);
 
@@ -39,6 +41,9 @@ export async function synthesize(text: string): Promise<Buffer> {
     body: JSON.stringify({
       text,
       model_id: MODEL,
+      // Flash v2.5 auto-detects language per request; odd tokens (NDJSON,
+      // paths) can flip it and English comes out as foreign-phoneme babble.
+      language_code: "en",
       voice_settings: { stability: 0.45, similarity_boost: 0.7, speed: 1.04 },
     }),
   });
@@ -78,6 +83,7 @@ export async function synthesizeStream(text: string): Promise<Response> {
       body: JSON.stringify({
         text,
         model_id: MODEL,
+        language_code: "en",
         voice_settings: { stability: 0.45, similarity_boost: 0.7, speed: 1.04 },
       }),
     }

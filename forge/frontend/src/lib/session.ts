@@ -368,6 +368,9 @@ export class ForgeSession {
       const u = new SpeechSynthesisUtterance(text);
       const v = this.pickVoice();
       if (v) u.voice = v;
+      // Voices load async and can be empty on first use — pin the language so
+      // the fallback never speaks through a non-English system default voice.
+      u.lang = v?.lang || "en-US";
       u.rate = 1.04;
       u.volume = useStore.getState().forgeVolume;
       u.onend = done;
