@@ -70,6 +70,18 @@ Open http://localhost:5180 in **Chrome**, allow mic/cam, Join.
 - It answers non-technical questions too, in plain speech — diagrams only appear
   when they genuinely help.
 
+### Voice commands
+
+Forge understands these spoken commands in a meeting:
+
+- **"Forge, …"** — Address Forge directly to wake it up and ask a question. Also works with "Hey Archie, …" or trailing "… what do you think, Forge?" to trigger a response.
+- **"go ahead"** — Give Forge the floor when it has raised its hand ✋.
+- **"stop"**, **"wait"**, **"hold on"**, **"stop talking"** — Interrupt Forge mid-explanation and it will halt immediately.
+- **"cancel everything"** — Drop all queued asks and abort any in-progress tasks.
+- **"clear the board"** — Wipe the whiteboard and start fresh.
+- **"create a github issue about …"** — Ask Forge to file a new GitHub issue based on the conversation context.
+- **"work on issue 7"** (or any number) — Instruct Forge to implement a specific GitHub issue as a pull request.
+
 ## Two-person calls (P2P)
 
 Forge calls now hold **two humans + Forge**. Audio/video flows browser-to-browser
