@@ -160,6 +160,10 @@ function cliStream({ system, prompt, onDelta, onTool, signal, maxTurns, tools, c
     let sawDelta = false;
     let lineBuf = "";
     let stderr = "";
+    // Tool inputs stream as input_json_delta AFTER the block starts — fire
+    // onTool at block stop so the trace shows the real arguments, not "{}".
+    const toolNames = new Map<number, string>();
+    const toolJson = new Map<number, string>();
 
     child.stdout!.on("data", (d: Buffer) => {
       lineBuf += d.toString();
@@ -175,8 +179,15 @@ function cliStream({ system, prompt, onDelta, onTool, signal, maxTurns, tools, c
               sawDelta = true;
               full += ev.delta.text;
               onDelta(ev.delta.text);
-            } else if (onTool && ev?.type === "content_block_start" && ev.content_block?.type === "tool_use") {
-              onTool(String(ev.content_block.name || ""), JSON.stringify(ev.content_block.input || {}));
+            } else if (ev?.type === "content_block_start" && ev.content_block?.type === "tool_use") {
+              toolNames.set(ev.index, String(ev.content_block.name || ""));
+              toolJson.set(ev.index, "");
+            } else if (ev?.type === "content_block_delta" && ev.delta?.type === "input_json_delta" && toolNames.has(ev.index)) {
+              toolJson.set(ev.index, (toolJson.get(ev.index) ?? "") + String(ev.delta.partial_json ?? ""));
+            } else if (ev?.type === "content_block_stop" && toolNames.has(ev.index)) {
+              onTool?.(toolNames.get(ev.index)!, toolJson.get(ev.index) || "{}");
+              toolNames.delete(ev.index);
+              toolJson.delete(ev.index);
             }
           } else if (msg.type === "result" && typeof msg.result === "string" && !sawDelta) {
             full = msg.result;
@@ -219,7 +230,12 @@ interface ApiStreamOptions {
 
 type TextBlock = { type: "text"; text: string };
 type ToolUseBlock = { type: "tool_use"; id: string; name: string; input: Record<string, unknown> };
-type ContentBlock = TextBlock | ToolUseBlock;
+// Adaptive-thinking models (Sonnet 5) emit thinking blocks; they must be
+// echoed back VERBATIM on the next turn of a tool loop or the API can reject
+// the follow-up. We capture them but never surface their text.
+type ThinkingBlock = { type: "thinking"; thinking: string; signature?: string };
+type RedactedThinkingBlock = { type: "redacted_thinking"; data: string };
+type ContentBlock = TextBlock | ToolUseBlock | ThinkingBlock | RedactedThinkingBlock;
 
 /** One streamed assistant turn: text deltas go to onDelta as they arrive;
  * tool_use blocks are assembled from input_json_delta events. */
@@ -266,6 +282,14 @@ async function apiTurn(
             partialJson.set(ev.index, "");
           } else if (cb?.type === "text") {
             blocks.set(ev.index, { type: "text", text: "" });
+          } else if (cb?.type === "thinking") {
+            blocks.set(ev.index, { type: "thinking", thinking: "" });
+            // Surface the silent phase: without this, Sonnet looks stalled
+            // while it reasons (Haiku rarely thinks, so its trace fills with
+            // tool lines instead).
+            onTool?.("thinking", "reasoning it through");
+          } else if (cb?.type === "redacted_thinking") {
+            blocks.set(ev.index, { type: "redacted_thinking", data: String(cb.data ?? "") });
           }
         } else if (ev.type === "content_block_delta") {
           if (ev.delta?.type === "text_delta") {
@@ -274,6 +298,12 @@ async function apiTurn(
             onDelta(ev.delta.text);
           } else if (ev.delta?.type === "input_json_delta") {
             partialJson.set(ev.index, (partialJson.get(ev.index) ?? "") + ev.delta.partial_json);
+          } else if (ev.delta?.type === "thinking_delta") {
+            const block = blocks.get(ev.index);
+            if (block?.type === "thinking") block.thinking += String(ev.delta.thinking ?? "");
+          } else if (ev.delta?.type === "signature_delta") {
+            const block = blocks.get(ev.index);
+            if (block?.type === "thinking") block.signature = String(ev.delta.signature ?? "");
           }
         } else if (ev.type === "content_block_stop") {
           const block = blocks.get(ev.index);
