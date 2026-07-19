@@ -29,6 +29,16 @@ export function activeModelName(): ForgeModel {
   return activeModel;
 }
 
+/** Request-body fragment for a model. Sonnet 5 runs at low effort — it keeps
+ * live-meeting latency and token spend down while staying well above Haiku
+ * (Haiku 4.5 rejects the effort parameter, so it gets none). */
+function modelParams(model: ForgeModel): Record<string, unknown> {
+  return {
+    model: API_MODELS[model],
+    ...(model === "sonnet" ? { output_config: { effort: "low" } } : {}),
+  };
+}
+
 let apiDisabledReason: string | null = null;
 
 export function llmMode(): "api" | "cli" {
@@ -301,7 +311,7 @@ async function apiStream({ system, prompt, maxTokens, onDelta, onTool, signal, t
     const lastTurn = turn === maxTurns - 1;
     const { blocks, stopReason } = await apiTurn(
       {
-        model: API_MODELS[model],
+        ...modelParams(model),
         max_tokens: maxTokens,
         stream: true,
         system,
@@ -504,7 +514,7 @@ async function apiCodingAgent(request: CodingAgentRequest): Promise<string> {
   for (let turn = 0; turn < MAX_TURNS; turn++) {
     const { blocks, stopReason } = await apiTurn(
       {
-        model: API_MODELS[activeModel],
+        ...modelParams(activeModel),
         max_tokens: 4000,
         stream: true,
         system: codingSystem(request.repoDigest),
