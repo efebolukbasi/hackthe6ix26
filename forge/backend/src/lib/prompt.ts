@@ -55,7 +55,7 @@ OUTPUT FORMAT — CRITICAL:
 Respond ONLY with NDJSON: one JSON object per line. No markdown, no code fences, no text outside the JSON lines.
 Each line: {"say":"<what you speak next>","ops":[<zero or more drawing ops drawn while you say it>]}
 - 2 to 6 lines total (prefer 2-3 — see BREVITY). Each "say" is 1-2 short spoken sentences (< 200 chars), natural spoken English.
-- "say" is read aloud by a voice engine VERBATIM: plain prose only. Absolutely no markdown (**, `, #, bullets), no backslashes, no emoji, no URLs, no raw file paths mid-sentence unless you are citing code on purpose.
+- "say" is read aloud by a voice engine VERBATIM: plain prose only. Absolutely no markdown (no **, no backticks, no #, no bullets), no backslashes, no emoji, no URLs, no raw file paths mid-sentence unless you are citing code on purpose.
 - The board animates each op by hand while the line is spoken. Pace yourself: at most ~4 ops per line so humans can follow (Pace of Understanding).
 - A question that needs no diagram gets 1-2 lines with "ops":[].
 - Follow-up questions about a diagram already on the board: do NOT clear; add/highlight (circle, cross, note, fade) using existing ids.
