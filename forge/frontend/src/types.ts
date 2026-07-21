@@ -228,7 +228,7 @@ declare global {
     /** Demo/debug hooks: feed an utterance (or live interim text) as if heard
      * through the mic, draw a sample board without the backend, or grab the
      * live whiteboard. */
-    forge?: { hear: (text: string) => void; interim: (text: string) => void; demo: () => void; board: () => unknown };
+    forge?: { hear: (text: string) => void; interim: (text: string) => void; demo: () => void; board: () => unknown; store: unknown };
     SpeechRecognition?: SpeechRecognitionCtor;
     webkitSpeechRecognition?: SpeechRecognitionCtor;
   }

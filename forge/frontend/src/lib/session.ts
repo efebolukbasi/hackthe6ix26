@@ -180,6 +180,7 @@ export class ForgeSession {
       interim: (text: string) => this.showInterim(text),
       demo: () => this.demoBoard(),
       board: () => this.wb,
+      store: useStore,
     };
     speechSynthesis.onvoiceschanged = () => { this.cachedVoice = null; };
   }
