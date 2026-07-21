@@ -26,7 +26,7 @@ export default function PreJoin() {
   return (
     <div id="prejoin">
       <div className="prejoin-card">
-        <div className="logo">forge<span>·</span></div>
+        <div className="logo"><span>✦</span>FORGE</div>
         <div className="preview-wrap">
           <video id="preview" ref={videoRef} autoPlay playsInline muted />
           <div className="preview-tag">You</div>
