@@ -148,11 +148,17 @@ shared deployment token needed. To enable the "Sign in with GitHub" button:
 3. Set the app's **Client ID** as `GITHUB_OAUTH_CLIENT_ID` in the backend
    environment. No client secret is required.
 
-Each participant clicks *Sign in with GitHub*, enters the short code at
+A participant clicks *Sign in with GitHub*, enters the short code at
 github.com/login/device, and picks a repository from their list. The repo is
 cloned and all issue/PR operations run with the account that loaded it; tokens
 live only in backend memory and are never sent to browsers. Without a client
 ID, the picker falls back to pasting a personal access token.
+
+**One GitHub account per meeting**: whoever signs in first holds the meeting's
+sign-in — everyone else's picker shows who has it, and sign-in reopens when
+they sign out (or leave the room for over a minute). Repo browsing is strictly
+private to the signed-in participant, but the repo they pick is shared:
+everyone in the call can ask Forge about it.
 
 Optionally, a fine-grained PAT in `GITHUB_TOKEN` still works as a
 deployment-wide fallback credential (grant **Contents: Read-only** and

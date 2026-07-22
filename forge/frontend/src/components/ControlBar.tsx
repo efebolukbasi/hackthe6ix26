@@ -1,6 +1,5 @@
 import { useEffect, useState } from "react";
 import { session } from "../lib/session";
-import { ACCESS_TOKEN } from "../config";
 import { useStore } from "../state/store";
 
 export default function ControlBar() {
@@ -22,8 +21,9 @@ export default function ControlBar() {
     return () => clearInterval(t);
   }, []);
 
+  // The current URL IS the invite: it carries the #token fragment when the
+  // deployment uses one, and is simply the app URL when it doesn't.
   const shareInvite = async () => {
-    if (!ACCESS_TOKEN) return;
     const url = window.location.href;
     try {
       if (navigator.share) await navigator.share({ title: "Join my Forge meeting", url });
@@ -60,9 +60,8 @@ export default function ControlBar() {
         <button
           className={"ctl" + (inviteCopied ? " copied" : "")}
           id="btn-share"
-          title={ACCESS_TOKEN ? (inviteCopied ? "Invite link copied" : "Share invite link") : "Open the invite URL with its token to share"}
+          title={inviteCopied ? "Invite link copied" : "Share invite link"}
           aria-label="Share invite link"
-          disabled={!ACCESS_TOKEN}
           onClick={() => void shareInvite()}
         >
           {inviteCopied ? (

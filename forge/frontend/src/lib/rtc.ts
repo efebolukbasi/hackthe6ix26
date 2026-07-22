@@ -2,7 +2,7 @@
 // audio/video then flows browser↔browser as a full P2P mesh via STUN (one
 // RTCPeerConnection per remote peer) — and (b) "cast" events that keep Forge
 // state (utterances, steps, hand) in sync across all participants.
-import { ACCESS_TOKEN, API } from "../config";
+import { ACCESS_TOKEN, API, SESSION_ID } from "../config";
 import { useStore } from "../state/store";
 import type { ForgeTask, WhiteboardOp } from "../types";
 
@@ -104,7 +104,9 @@ export class RoomLink {
     this.ws = ws;
     ws.onopen = () => {
       this.reconnectDelay = 1000;
-      ws.send(JSON.stringify({ t: "join", name: this.myName }));
+      // sid ties room presence to this browser's GitHub sign-in, so the
+      // meeting's one-account lock frees up when its holder leaves for good.
+      ws.send(JSON.stringify({ t: "join", name: this.myName, sid: SESSION_ID }));
     };
     ws.onmessage = (e) => void this.handle(JSON.parse(String(e.data)) as ServerMsg);
     // Dropped connection (backend restart, proxy idle timeout, flaky wifi):

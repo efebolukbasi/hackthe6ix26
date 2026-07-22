@@ -5,14 +5,17 @@
 import { WebSocketServer, WebSocket } from "ws";
 import { timingSafeEqual } from "node:crypto";
 import type { Server } from "node:http";
+import * as github from "./github.ts";
 
 interface Member {
   id: number;
   name: string;
+  /** the browser session id, linking room presence to GitHub sign-ins */
+  sid?: string;
   ws: WebSocket;
 }
 
-interface JoinMsg { t: "join"; name?: string }
+interface JoinMsg { t: "join"; name?: string; sid?: string }
 interface SignalMsg { t: "signal"; to: number; data: unknown }
 interface CastMsg { t: "cast"; event: unknown }
 type ClientMsg = JoinMsg | SignalMsg | CastMsg;
@@ -40,7 +43,18 @@ function tokenMatches(actual: string | null, expected: string): boolean {
 export function attachRoom(server: Server): void {
   const wss = new WebSocketServer({ noServer: true });
   const members = new Map<number, Member>();
+  // When each session was last seen leaving — a sign-in whose session left
+  // the room long ago must not hold the meeting's GitHub lock forever.
+  const lastLeft = new Map<string, number>();
   let nextId = 1;
+
+  github.setPresenceCheck((sid) => {
+    for (const m of members.values()) if (m.sid === sid) return true;
+    const left = lastLeft.get(sid);
+    // Unknown sessions (never joined the room, e.g. API clients) count as
+    // present; a session that left gets a 60s grace for page refreshes.
+    return left === undefined ? true : Date.now() - left < 60_000;
+  });
 
   server.on("upgrade", (req, socket, head) => {
     if (!req.url?.startsWith("/ws")) return socket.destroy();
@@ -86,8 +100,10 @@ export function attachRoom(server: Server): void {
 
       if (msg.t === "join" && !me) {
         if (members.size >= MAX_HUMANS) { send(ws, { t: "full" }); ws.close(); return; }
-        me = { id: nextId++, name: String(msg.name || "Guest").slice(0, 24), ws };
+        const sid = typeof msg.sid === "string" && /^[\w-]{8,64}$/.test(msg.sid) ? msg.sid : undefined;
+        me = { id: nextId++, name: String(msg.name || "Guest").slice(0, 24), sid, ws };
         members.set(me.id, me);
+        if (sid) lastLeft.delete(sid);
         send(ws, { t: "welcome", id: me.id, peers: [...members.values()].filter((m) => m.id !== me!.id).map((m) => ({ id: m.id, name: m.name })) });
         broadcast({ t: "peer-joined", id: me.id, name: me.name }, me.id);
         console.log(`room: ${me.name}#${me.id} joined (${members.size}/${MAX_HUMANS})`);
@@ -106,6 +122,8 @@ export function attachRoom(server: Server): void {
     ws.on("close", () => {
       if (!me) return;
       members.delete(me.id);
+      // Only stamp the departure if no other tab of the same session remains.
+      if (me.sid && ![...members.values()].some((m) => m.sid === me!.sid)) lastLeft.set(me.sid, Date.now());
       broadcast({ t: "peer-left", id: me.id });
       console.log(`room: ${me.name}#${me.id} left (${members.size}/${MAX_HUMANS})`);
     });

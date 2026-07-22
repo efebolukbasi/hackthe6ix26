@@ -58,6 +58,45 @@ export function sessionAuth(sessionId: string | undefined): SessionAuth | null {
   return (sessionId && sessionAuths.get(sessionId)) || null;
 }
 
+// ---------- one sign-in per meeting ----------
+// A meeting has ONE GitHub connection: whoever signs in first holds it, and
+// nobody else can sign in until they sign out (or leave the room for good).
+// This keeps a single account behind the active repo instead of participants
+// silently re-pointing Forge at each other's accounts.
+
+/** Injected by the room so a departed session's sign-in doesn't hold the
+ * meeting lock forever. Absent room = everyone counts as present. */
+let presenceCheck: (sid: string) => boolean = () => true;
+export function setPresenceCheck(fn: (sid: string) => boolean): void {
+  presenceCheck = fn;
+}
+
+/** Who currently holds the meeting's GitHub sign-in (or is mid-login),
+ * ignoring `excludeSid`. Sign-ins whose session left the room are evicted. */
+function lockHolder(excludeSid?: string): { login?: string } | null {
+  for (const [sid, auth] of [...sessionAuths]) {
+    if (sid === excludeSid) continue;
+    if (presenceCheck(sid)) return { login: auth.login };
+    sessionAuths.delete(sid); // signed in, but long gone — free the seat
+  }
+  for (const [sid, pending] of [...pendingLogins]) {
+    if (sid === excludeSid) continue;
+    if (pending.error || Date.now() >= pending.expiresAt) continue;
+    if (presenceCheck(sid)) return {}; // mid-device-flow, no login yet
+    pendingLogins.delete(sid);
+  }
+  return null;
+}
+
+function lockedError(holder: { login?: string }): Error {
+  return Object.assign(
+    new Error(holder.login
+      ? `${holder.login} is already signed in — one GitHub account per meeting`
+      : "another participant is signing in right now"),
+    { status: 409 }
+  );
+}
+
 /** Bind all GitHub operations on the active repo to this participant. */
 export function setActiveGrant(grant: SessionAuth | null): void {
   activeGrant = grant;
@@ -85,6 +124,8 @@ export async function startDeviceLogin(sessionId: string): Promise<{ userCode: s
   if (!clientId) {
     throw Object.assign(new Error("GitHub sign-in isn't configured — set GITHUB_OAUTH_CLIENT_ID in the backend environment"), { status: 400 });
   }
+  const holder = lockHolder(sessionId);
+  if (holder) throw lockedError(holder);
   const res = await fetch("https://github.com/login/device/code", {
     method: "POST",
     headers: { Accept: "application/json", "Content-Type": "application/json" },
@@ -132,6 +173,13 @@ async function pollDeviceLogin(
       continue; // transient network blip — keep polling
     }
     if (data.access_token) {
+      // Someone else completed a sign-in while this code sat unauthorized —
+      // one account per meeting, first one wins.
+      if (lockHolder(sessionId)) {
+        pending.error = "someone else signed in first — one GitHub account per meeting";
+        pendingLogins.delete(sessionId);
+        return;
+      }
       try {
         const user = await api<{ login: string }>("/user", data.access_token);
         sessionAuths.set(sessionId, { token: data.access_token, login: user.login });
@@ -155,6 +203,8 @@ async function pollDeviceLogin(
 
 /** Fallback sign-in: validate a pasted personal access token for this session. */
 export async function connectWithToken(sessionId: string, token: string): Promise<string> {
+  const holder = lockHolder(sessionId);
+  if (holder) throw lockedError(holder);
   const trimmed = token.trim();
   if (!trimmed) throw Object.assign(new Error("empty token"), { status: 400 });
   let user: { login: string };
@@ -214,6 +264,9 @@ export interface GithubStatus {
   authAvailable?: boolean;
   /** A device-flow login is awaiting the user at github.com/login/device. */
   pending?: { userCode: string; verificationUri: string };
+  /** Another participant holds the meeting's single sign-in (empty string
+   * while their device-flow login is still completing). */
+  lockedBy?: string;
   /** Safe diagnostic for the repo picker. Never includes a token. */
   error?: string;
 }
@@ -229,6 +282,8 @@ export async function status(sessionId?: string): Promise<GithubStatus> {
   if (pending && !pending.error && Date.now() < pending.expiresAt) {
     return { connected: false, authAvailable, pending: { userCode: pending.userCode, verificationUri: pending.verificationUri } };
   }
+  const holder = lockHolder(sessionId);
+  if (holder) return { connected: false, authAvailable, lockedBy: holder.login ?? "", error: pending?.error };
   return { connected: false, authAvailable, error: pending?.error };
 }
 

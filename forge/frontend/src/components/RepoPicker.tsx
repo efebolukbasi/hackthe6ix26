@@ -16,6 +16,8 @@ interface GhStatus {
   via?: "oauth";
   authAvailable?: boolean;
   pending?: { userCode: string; verificationUri: string };
+  /** someone else holds the meeting's single sign-in ("" while they finish) */
+  lockedBy?: string;
   error?: string;
   /** Client-side: API is refusing us (bad/missing invite token) — no sign-in
    * affordance will work, so show only the explanation. */
@@ -68,6 +70,14 @@ export default function RepoPicker() {
     const t = setInterval(() => void refresh(), 3000);
     return () => clearInterval(t);
   }, [pendingCode]);
+
+  // Open + not connected (e.g. someone else holds the meeting's sign-in):
+  // keep the state fresh so the picker unlocks the moment they sign out.
+  useEffect(() => {
+    if (!open || gh?.connected) return;
+    const t = setInterval(() => void refresh(), 5000);
+    return () => clearInterval(t);
+  }, [open, gh?.connected]);
 
   const login = async () => {
     setNote("");
@@ -177,7 +187,14 @@ export default function RepoPicker() {
             </div>
           )}
           {gh?.blocked && <div className="repo-hint">{gh.error}</div>}
-          {!gh?.connected && !gh?.pending && !gh?.blocked && (
+          {!gh?.connected && !gh?.pending && !gh?.blocked && gh?.lockedBy !== undefined && (
+            <div className="repo-hint">
+              {gh.lockedBy
+                ? <><strong>{gh.lockedBy}</strong> has GitHub connected for this meeting — they pick the repository, and everyone can ask Forge about it.</>
+                : "Another participant is signing in to GitHub right now."}
+            </div>
+          )}
+          {!gh?.connected && !gh?.pending && !gh?.blocked && gh?.lockedBy === undefined && (
             <div className="repo-auth">
               {gh?.authAvailable ? (
                 <button className="repo-login" onClick={() => void login()}>Sign in with GitHub</button>
