@@ -61,6 +61,10 @@ Open http://localhost:5180 in **Chrome**, allow mic/cam, Join.
   (or "Hey Archie, …", or a trailing "… what do you think, Forge?") — or type in
   the chat panel → it answers, and if a diagram helps, it takes the stage and
   sketches while it talks. Casual mentions of "forge" mid-sentence don't wake it.
+  Common mishears ("forged", trailing "force") are accepted too.
+- **Hold Space to talk to Forge directly** — everything said while held is a
+  direct question, no trigger word needed. The keybind is shown in the bottom
+  bar; deterministic in loud demo rooms.
 - Ask follow-ups ("what if the auth server goes down?") → it annotates the
   **existing** board: crosses out boxes, fades dead paths, circles survivors.
 - Just talk amongst yourselves → it listens the whole time but never blurts out —
@@ -92,6 +96,11 @@ participant streams to every other, so keep it modest). Audio/video flows
 browser-to-browser (WebRTC full mesh, STUN only — true P2P); the backend's `/ws`
 endpoint handles signaling and keeps Forge state (transcript, whiteboard steps,
 raise-hand) in sync across everyone.
+
+Same-room demos: several open mics hear every sentence — duplicate captures are
+deduplicated automatically (whichever laptop finalizes first wins). Have ONE
+laptop play Forge's voice and drag Forge's tile volume to zero on the others,
+or N slightly-offset copies of the same voice fill the room.
 
 To invite someone outside your network:
 

@@ -64,6 +64,8 @@ export interface ForgeState {
   myName: string;
   /** connected human peers (P2P mesh call) */
   peers: RemotePeer[];
+  /** push-to-talk key is currently held */
+  pttActive: boolean;
   /** latest tool/progress trace; task rows own the visible rendering */
   thinkingTrace: string[];
   /** active/queued/recently-finished Forge tasks (answers and issues) */
@@ -105,6 +107,7 @@ export const useStore = create<ForgeState>()(() => ({
   prejoinHint: "use Chrome · allow camera & microphone",
   myName: "",
   peers: [],
+  pttActive: false,
   thinkingTrace: [],
   tasks: [],
   model: "haiku",

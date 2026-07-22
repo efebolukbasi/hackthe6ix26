@@ -743,6 +743,18 @@ button:active { transform: scale(0.96); }
   background: var(--surface); border: 1px solid var(--stroke-soft);
   padding: 6px 13px; border-radius: 999px; font-variant-numeric: tabular-nums;
 }
+
+/* push-to-talk keybind hint */
+.ptt-hint kbd {
+  font-family: inherit; font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em;
+  border: 1px solid var(--stroke); border-bottom-width: 2px; border-radius: 5px;
+  padding: 1px 6px; color: var(--text);
+}
+.ptt-hint.active {
+  color: var(--text); border-color: rgba(227, 198, 135, 0.55);
+  box-shadow: 0 0 0 1px rgba(227, 198, 135, 0.25), 0 0 14px rgba(227, 198, 135, 0.18);
+}
+.ptt-hint.active kbd { border-color: rgba(227, 198, 135, 0.7); }
 .bar-right { flex: 1; display: flex; align-items: center; justify-content: flex-end; gap: 10px; }
 .bar-center {
   display: flex; gap: 10px; align-items: center;

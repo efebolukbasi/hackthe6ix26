@@ -9,6 +9,7 @@ export default function ControlBar() {
   const ccOn = useStore((s) => s.ccOn);
   const pill = useStore((s) => s.pill);
   const peerCount = useStore((s) => s.peers.length);
+  const pttActive = useStore((s) => s.pttActive);
   const model = useStore((s) => s.model);
   const [clock, setClock] = useState("--:--");
   const [inviteCopied, setInviteCopied] = useState(false);
@@ -36,7 +37,13 @@ export default function ControlBar() {
 
   return (
     <footer id="bar">
-      <div className="bar-left"><span className="brand"><span className="brand-dot">✦</span>FORGE</span><span className="chip" id="clock">{clock}</span></div>
+      <div className="bar-left">
+        <span className="brand"><span className="brand-dot">✦</span>FORGE</span>
+        <span className="chip" id="clock">{clock}</span>
+        <span className={"chip ptt-hint" + (pttActive ? " active" : "")} title="Hold the space bar and speak — Forge treats it as a direct question, no trigger word needed">
+          <kbd>space</kbd> {pttActive ? "listening…" : "hold to ask Forge"}
+        </span>
+      </div>
       <div className="bar-center">
         <button className={"ctl" + (micOn ? "" : " off")} id="btn-mic" title="Toggle microphone" onClick={() => session.toggleMic()}>
           <svg viewBox="0 0 24 24"><path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2z" /></svg>

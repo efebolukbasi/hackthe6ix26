@@ -13,7 +13,7 @@ interface Repo {
 interface GhStatus {
   connected: boolean;
   user?: string;
-  via?: "oauth" | "env" | "gh";
+  via?: "oauth";
   authAvailable?: boolean;
   pending?: { userCode: string; verificationUri: string };
   error?: string;
@@ -215,11 +215,7 @@ export default function RepoPicker() {
                 ))}
               </div>
               <div className="repo-foot">
-                {gh.via === "oauth" ? (
-                  <button className="repo-alt" onClick={() => void logout()}>sign out {gh.user}</button>
-                ) : gh.authAvailable ? (
-                  <button className="repo-alt" onClick={() => void login()}>sign in with your own GitHub</button>
-                ) : null}
+                <button className="repo-alt" onClick={() => void logout()}>sign out {gh.user}</button>
               </div>
             </>
           )}

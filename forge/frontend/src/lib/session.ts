@@ -34,9 +34,14 @@ const normalizeSpeech = (s: string): string =>
 // vocative tag at the end ("what do you think, Forge?"). Casual mid-sentence
 // mentions ("the forge repo is big") must NOT trigger it.
 const LEAD_IN = "(?:hey|hi|ok|okay|so|well|listen)";
-const NAME = "(?:forge|archie)";
+// "Forge" as Chrome actually mishears it in a noisy room. Non-word variants
+// are safe anywhere; "force"/"forced" are real words, so they only count in
+// the vocative tag at the END ("what do you think, force?") where a real
+// sentence can't collide ("force push the branch" must never trigger).
+const NAME = "(?:forge[ds]?|fordge|forje|forg|4ge|archie)";
+const NAME_END = `(?:${NAME}|forced?)`;
 const ADDRESS_START = new RegExp(`^\\s*(?:${LEAD_IN}[\\s,]+)?${NAME}\\b[\\s,]*`, "i");
-const ADDRESS_END = new RegExp(`(?:,\\s*(?:right\\s*)?|\\bright\\s*,?\\s*)${NAME}[\\s?!.,]*$`, "i");
+const ADDRESS_END = new RegExp(`(?:,\\s*(?:right\\s*)?|\\bright\\s*,?\\s*)${NAME_END}[\\s?!.,]*$`, "i");
 
 const isAddressed = (text: string): boolean => ADDRESS_START.test(text) || ADDRESS_END.test(text);
 
@@ -51,7 +56,7 @@ const STOP = /\b(stop presenting|back to (the )?grid|that'?s enough|stop talking
 // Bare barge-in words ("stop", "wait", "hold on") count only as a WHOLE
 // utterance — "we should stop using X" must never cut Forge off — and only
 // while Forge is actually talking or working (see isStopCommand callers).
-const BARE_STOP = /^\s*(?:(?:hey|ok|okay)[\s,]+)?(?:forge[\s,]+)?(?:stop|wait|hold on|hang on|pause|quiet|shut up|enough)[\s!.,]*$/i;
+const BARE_STOP = new RegExp(`^\\s*(?:(?:hey|ok|okay)[\\s,]+)?(?:${NAME}[\\s,]+)?(?:stop|wait|hold on|hang on|pause|quiet|shut up|enough)[\\s!.,]*$`, "i");
 const CLEAR = /\b((clear|wipe) the board|start over|clean slate)\b/i;
 /** "cancel everything" also flushes the queued asks, not just the live run. */
 const CANCEL_ALL = /\b(cancel everything|stop everything|never ?mind|forget it|drop (it|everything))\b/i;
@@ -97,7 +102,7 @@ export const CHIPS = [
   "Redis vs Kafka for our events?",
 ];
 
-type UtteranceSource = "voice" | "typed";
+type UtteranceSource = "voice" | "typed" | "ptt";
 
 export class ForgeSession {
   wb: Whiteboard | null = null;
@@ -168,8 +173,21 @@ export class ForgeSession {
   private recentForgeLines: Array<{ text: string; expires: number }> = [];
   private ttsTailUntil = 0;
 
+  // Cross-device echo state: recently heard meeting speech, local finals AND
+  // peer casts. In one physical room several open mics hear the same
+  // sentence; whoever finalizes first casts it, and near-identical speech
+  // arriving later locally is the same utterance, not a new one.
+  private recentUtterances: Array<{ norm: string; at: number }> = [];
+
   // Resolves the "ready" pause early when someone invites Forge to speak.
   private readyRelease: (() => void) | null = null;
+
+  // Push-to-talk: while Space is held, speech is a direct ask to Forge — no
+  // trigger word needed. Deterministic in loud demo rooms.
+  private pttHeld = false;
+  /** Finals lag speech by a beat — honor the first final shortly after release. */
+  private pttUntil = 0;
+  private pttTempRecog = false;
 
   constructor() {
     // Demo/debug hooks: feed an utterance as if it were heard through the mic
@@ -327,6 +345,34 @@ export class ForgeSession {
 
   private inTtsTail(): boolean {
     return this.ttsSpeaking || Date.now() < this.ttsTailUntil;
+  }
+
+  // ---------- cross-device echo filter ----------
+
+  private noteUtterance(text: string): void {
+    const norm = normalizeSpeech(text);
+    if (norm) this.recentUtterances.push({ norm, at: Date.now() });
+  }
+
+  /** True when near-identical speech was already recorded (by this client or
+   * cast from a peer whose mic finalized it first) within the last seconds. */
+  private isCrossEcho(text: string): boolean {
+    const norm = normalizeSpeech(text);
+    if (!norm) return false;
+    const now = Date.now();
+    // 7s covers the worst mic-finalization skew between laptops hearing the
+    // same speech; a human deliberately repeating themselves takes longer.
+    this.recentUtterances = this.recentUtterances.filter((u) => now - u.at < 7000);
+    const tokens = new Set(norm.split(" "));
+    for (const u of this.recentUtterances) {
+      if (u.norm === norm) return true;
+      const other = new Set(u.norm.split(" "));
+      if (tokens.size < 3 && other.size < 3) continue; // too short to fuzzy-match
+      let overlap = 0;
+      for (const t of tokens) if (other.has(t)) overlap++;
+      if (overlap / new Set([...tokens, ...other]).size >= 0.75) return true;
+    }
+    return false;
   }
 
   private isSelfEcho(raw: string): boolean {
@@ -545,10 +591,14 @@ export class ForgeSession {
           // Recognition stays alive while Forge speaks so a participant can
           // barge in. During TTS — and the tail window right after, while
           // Chrome finalizes what it heard during playback — only explicit
-          // control speech is accepted (addressed asks and stop commands), to
-          // avoid treating Forge's own narration as meeting speech.
-          if (!this.inTtsTail() || isAddressed(text) || this.isStopCommand(text)) {
-            this.handleUtterance(text, "voice");
+          // control speech is accepted (addressed asks, stop commands, and
+          // push-to-talk speech), to avoid treating Forge's own narration as
+          // meeting speech.
+          const viaPtt = this.pttEngaged();
+          if (viaPtt || !this.inTtsTail() || isAddressed(text) || this.isStopCommand(text)) {
+            this.handleUtterance(text, viaPtt ? "ptt" : "voice");
+            // Only the first final after release rides the PTT grace window.
+            if (viaPtt && !this.pttHeld) this.pttUntil = 0;
           }
         } else {
           interim += res[0].transcript;
@@ -575,7 +625,7 @@ export class ForgeSession {
 
   private showInterim(text: string): void {
     if (!useStore.getState().ccOn) return;
-    if (!this.interimAddressed && !isAddressed(text)) return;
+    if (!this.interimAddressed && !isAddressed(text) && !this.pttEngaged()) return;
     this.interimAddressed = true;
     useStore.setState({ caption: { speaker: `${this.myName} → Forge`, text: `${text} …`, visible: true } });
     clearTimeout(this.capTimer); // don't let an old caption timer hide us
@@ -1025,7 +1075,13 @@ export class ForgeSession {
     // Forge hearing itself must never enter the meeting record as a human
     // utterance. Stop commands are exempt so "stop talking" always works,
     // even mid-echo.
-    if (source === "voice" && !this.isStopCommand(text) && this.isSelfEcho(text)) return;
+    if (source !== "typed" && !this.isStopCommand(text) && this.isSelfEcho(text)) return;
+    // Cross-device echo: a peer's mic finalized this same sentence first and
+    // cast it — processing our copy would double the transcript and the ask.
+    // Stop commands stay exempt (idempotent, safety-critical); push-to-talk
+    // is deliberate and must never be swallowed by a faster peer's capture.
+    if (source === "voice" && !this.isStopCommand(text) && this.isCrossEcho(text)) return;
+    if (source !== "typed") this.noteUtterance(text);
     this.transcript(this.myName, text);
     this.room?.cast({ k: "utter", who: this.myName, text });
 
@@ -1070,7 +1126,7 @@ export class ForgeSession {
       return;
     }
 
-    if (source === "typed" || isAddressed(text)) {
+    if (source !== "voice" || isAddressed(text)) {
       const question = source === "typed" ? text : stripAddress(text) || text;
       if (this.agentBusy || this.remoteAgentActive) {
         // Forge is mid-answer (ours or the peer's): don't kill it — queue the
@@ -1092,6 +1148,9 @@ export class ForgeSession {
   private onCast(ev: CastEvent): void {
     switch (ev.k) {
       case "utter":
+        // Remember peer-heard speech FIRST so our own mic's slower copy of
+        // the same sentence dedupes against it.
+        this.noteUtterance(ev.text);
         this.transcript(ev.who, ev.text);
         // Only the driver runs passive listen checks, so the hand raises once.
         if (this.room?.isDriver && !this.agentBusy && !this.remoteAgentActive) {
@@ -1352,6 +1411,57 @@ export class ForgeSession {
     }
   }
 
+  // ---------- push-to-talk ----------
+
+  private pttEngaged(): boolean {
+    return this.pttHeld || Date.now() < this.pttUntil;
+  }
+
+  private pttDown(): void {
+    if (this.pttHeld) return;
+    this.pttHeld = true;
+    useStore.setState({ pttActive: true });
+    // Muted mic: run recognition just for the hold's duration. (The audio
+    // track to peers stays disabled — Chrome's recognizer captures its own.)
+    if (!this.recogWanted) {
+      this.pttTempRecog = true;
+      try { this.recog?.start(); } catch { /* already started */ }
+    }
+    this.listeningChime();
+    this.caption(`${this.myName} → Forge`, "listening — ask away…", true);
+  }
+
+  private pttUp(): void {
+    if (!this.pttHeld) return;
+    this.pttHeld = false;
+    this.pttUntil = Date.now() + 2500;
+    useStore.setState({ pttActive: false });
+    setTimeout(() => {
+      if (this.pttTempRecog && !this.pttHeld && !this.recogWanted) {
+        this.pttTempRecog = false;
+        this.stopRecog();
+      }
+      // Nothing was said: fade the "listening" caption instead of pinning it.
+      if (!this.pttHeld && Date.now() >= this.pttUntil && !this.agentBusy && !this.interimAddressed) this.hideCaption();
+    }, 2600);
+  }
+
+  private onPttKey = (e: KeyboardEvent): void => {
+    if (e.code !== "Space") return;
+    if (useStore.getState().phase !== "room") return;
+    const target = e.target as HTMLElement | null;
+    if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable)) return;
+    e.preventDefault(); // never scroll the room or "click" a focused control
+    if (e.type === "keydown") {
+      if (!e.repeat) this.pttDown();
+    } else {
+      this.pttUp();
+    }
+  };
+
+  /** Window lost focus mid-hold — the keyup will never arrive. */
+  private onPttBlur = (): void => this.pttUp();
+
   // Secret demo shortcut: pressing "0" anywhere in the room (any participant)
   // makes Forge deliver its scripted hello to the whole call. Ignored while
   // typing in the chat panel or any other text field.
@@ -1369,6 +1479,9 @@ export class ForgeSession {
     this.myName = (name || "").trim() || "You";
     useStore.setState({ phase: "room", myName: this.myName });
     window.addEventListener("keydown", this.onDemoKey);
+    window.addEventListener("keydown", this.onPttKey);
+    window.addEventListener("keyup", this.onPttKey);
+    window.addEventListener("blur", this.onPttBlur);
 
     this.audioCtx = new AudioContext();
     this.startMeter();
@@ -1688,6 +1801,10 @@ export class ForgeSession {
 
   end(): void {
     window.removeEventListener("keydown", this.onDemoKey);
+    window.removeEventListener("keydown", this.onPttKey);
+    window.removeEventListener("keyup", this.onPttKey);
+    window.removeEventListener("blur", this.onPttBlur);
+    this.pttUp();
     this.room?.close();
     this.room = null;
     this.recogWanted = false;

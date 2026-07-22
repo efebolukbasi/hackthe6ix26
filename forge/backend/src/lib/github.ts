@@ -209,7 +209,7 @@ async function api<T>(path: string, token: string, init: RequestInit = {}): Prom
 export interface GithubStatus {
   connected: boolean;
   user?: string;
-  via?: "oauth" | "env" | "gh";
+  via?: "oauth";
   /** Whether "Sign in with GitHub" (device flow) is configured. */
   authAvailable?: boolean;
   /** A device-flow login is awaiting the user at github.com/login/device. */
@@ -218,8 +218,9 @@ export interface GithubStatus {
   error?: string;
 }
 
-/** This participant's GitHub connection: their own sign-in first, then any
- * pending device-flow login, then the deployment fallback credential. */
+/** This participant's own GitHub connection. Deliberately NEVER reports the
+ * deployment fallback credential as "connected": browsing repositories is
+ * strictly per-participant, so nobody sees an account they didn't sign into. */
 export async function status(sessionId?: string): Promise<GithubStatus> {
   const authAvailable = !!oauthClientId();
   const auth = sessionAuth(sessionId);
@@ -228,15 +229,7 @@ export async function status(sessionId?: string): Promise<GithubStatus> {
   if (pending && !pending.error && Date.now() < pending.expiresAt) {
     return { connected: false, authAvailable, pending: { userCode: pending.userCode, verificationUri: pending.verificationUri } };
   }
-  const loginError = pending?.error;
-  const token = await fallbackToken();
-  if (!token) return { connected: false, authAvailable, error: loginError };
-  try {
-    const user = await api<{ login: string }>("/user", token);
-    return { connected: true, user: user.login, via: process.env.GITHUB_TOKEN?.trim() ? "env" : "gh", authAvailable, error: loginError };
-  } catch (err) {
-    return { connected: false, authAvailable, error: loginError ?? (err instanceof Error ? err.message : String(err)).slice(0, 240) };
-  }
+  return { connected: false, authAvailable, error: pending?.error };
 }
 
 /** The owner/repository for the deployment itself, when one is known. */
@@ -260,10 +253,12 @@ export interface RepoInfo {
   description: string | null;
 }
 
-/** The calling participant's repos — their own sign-in, else the fallback. */
+/** STRICTLY the calling participant's own repos. Never the deployment
+ * fallback — that would show the deployment owner's repositories to any
+ * participant in the room. */
 export async function listRepos(sessionId?: string): Promise<RepoInfo[]> {
-  const token = sessionAuth(sessionId)?.token ?? (await fallbackToken());
-  if (!token) throw Object.assign(new Error("not connected to GitHub"), { status: 401 });
+  const token = sessionAuth(sessionId)?.token;
+  if (!token) throw Object.assign(new Error("sign in with GitHub to browse your repositories"), { status: 401 });
   const repos = await api<RepoInfo[]>("/user/repos?sort=pushed&per_page=100", token);
   return repos.map((r) => ({
     full_name: r.full_name,

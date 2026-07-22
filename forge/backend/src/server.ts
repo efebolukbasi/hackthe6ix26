@@ -213,6 +213,10 @@ app.post("/api/repo/load", async (req: Request, res: Response) => {
   const source = String((req.body as { url?: string } | undefined)?.url || "").trim();
   if (!source) return res.status(400).json({ error: "no url" });
   const auth = github.sessionAuth(sessionIdOf(req));
+  // Loading is per-participant too: the picker only lists your own repos, and
+  // the API enforces the same rule (the env-configured boot repo bypasses
+  // this by calling loadRepo directly).
+  if (!auth) return res.status(401).json({ error: "sign in with GitHub first, then pick one of your repositories" });
   try {
     const meta = await loadRepo(source, auth);
     console.log(`repo switched → ${meta.name} (${meta.fileCount} files)${auth ? ` · via @${auth.login}` : ""}`);
