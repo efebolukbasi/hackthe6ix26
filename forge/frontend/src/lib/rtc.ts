@@ -1,7 +1,7 @@
 // RoomLink: connects to the backend's /ws room for (a) WebRTC signaling —
-// audio/video then flows browser↔browser, peer-to-peer via STUN — and
-// (b) "cast" events that keep Forge state (utterances, steps, hand) in sync
-// across both participants.
+// audio/video then flows browser↔browser as a full P2P mesh via STUN (one
+// RTCPeerConnection per remote peer) — and (b) "cast" events that keep Forge
+// state (utterances, steps, hand) in sync across all participants.
 import { ACCESS_TOKEN, API } from "../config";
 import { useStore } from "../state/store";
 import type { ForgeTask, WhiteboardOp } from "../types";
@@ -34,7 +34,9 @@ export type CastEvent =
   // Task registry sync: owners upsert their tasks; a peer asks the owner to
   // cancel one via task-cancel (only the owner can actually stop the work).
   | { k: "task"; task: Omit<ForgeTask, "mine"> }
-  | { k: "task-cancel"; id: string };
+  | { k: "task-cancel"; id: string }
+  // Server-originated: the meeting's active repository changed.
+  | { k: "repo"; repo: { name?: string; fileCount?: number }; by?: string };
 
 interface ServerMsg {
   t: "welcome" | "peer-joined" | "peer-left" | "signal" | "cast" | "full";
@@ -53,18 +55,25 @@ interface SignalData {
 
 export interface RoomCallbacks {
   onCast: (ev: CastEvent) => void;
-  onPeerJoined: (name: string) => void;
+  /** isNew: they joined after us (vs. were already here when we arrived). */
+  onPeerJoined: (name: string, isNew: boolean) => void;
   onPeerLeft: (name: string) => void;
+}
+
+/** One remote human in the mesh: their signaling identity + media link. */
+interface PeerLink {
+  id: number;
+  name: string;
+  pc: RTCPeerConnection | null;
+  pendingIce: RTCIceCandidateInit[];
+  stream: MediaStream | null;
 }
 
 export class RoomLink {
   private ws: WebSocket | null = null;
-  private pc: RTCPeerConnection | null = null;
   private myId = 0;
-  private peerId: number | null = null;
-  private peerName = "Guest";
+  private peers = new Map<number, PeerLink>();
   private localStream: MediaStream | null = null;
-  private pendingIce: RTCIceCandidateInit[] = [];
   private cb: RoomCallbacks;
   private myName = "Guest";
   private closedByUs = false;
@@ -75,13 +84,11 @@ export class RoomLink {
     this.cb = cb;
   }
 
-  /** The driver (lowest id) runs passive listen checks so only one side auto-raises the hand. */
+  /** The driver (lowest id in the room) runs passive listen checks and late-
+   * joiner board syncs, so exactly one participant does each. */
   get isDriver(): boolean {
-    return this.peerId === null || this.myId < this.peerId;
-  }
-
-  get hasPeer(): boolean {
-    return this.peerId !== null;
+    for (const id of this.peers.keys()) if (id < this.myId) return false;
+    return true;
   }
 
   connect(name: string, stream: MediaStream | null): void {
@@ -104,8 +111,7 @@ export class RoomLink {
     // quietly reconnect and re-join so the meeting survives the hiccup.
     ws.onclose = () => {
       if (this.closedByUs || this.ws !== ws) return;
-      this.teardownPeer();
-      useStore.setState({ remoteName: null, remoteStream: null });
+      this.teardownAllPeers();
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = setTimeout(() => this.open(), this.reconnectDelay);
       this.reconnectDelay = Math.min(this.reconnectDelay * 2, 10_000);
@@ -119,7 +125,7 @@ export class RoomLink {
   close(): void {
     this.closedByUs = true;
     clearTimeout(this.reconnectTimer);
-    this.teardownPeer();
+    this.teardownAllPeers();
     try { this.ws?.close(); } catch { /* noop */ }
     this.ws = null;
   }
@@ -128,90 +134,113 @@ export class RoomLink {
     switch (msg.t) {
       case "welcome":
         this.myId = msg.id ?? 0;
-        if (msg.peers?.length) {
-          // I'm the newcomer; the existing member initiates the offer.
-          this.adoptPeer(msg.peers[0].id, msg.peers[0].name);
-          await this.setupPeer(false);
+        // I'm the newcomer: each existing member will send me an offer
+        // (their peer-joined fires); I just register them and wait.
+        for (const p of msg.peers ?? []) {
+          this.adoptPeer(p.id, p.name, false);
         }
         break;
-      case "peer-joined":
-        this.adoptPeer(msg.id ?? 0, msg.name ?? "Guest");
-        await this.setupPeer(true);
+      case "peer-joined": {
+        // Someone new arrived: I'm the established side, so I initiate.
+        const peer = this.adoptPeer(msg.id ?? 0, msg.name ?? "Guest", true);
+        await this.setupPeer(peer, true);
         break;
-      case "peer-left":
-        this.teardownPeer();
-        useStore.setState({ remoteName: null, remoteStream: null });
-        this.cb.onPeerLeft(this.peerName);
+      }
+      case "peer-left": {
+        const peer = this.peers.get(msg.id ?? -1);
+        if (!peer) break;
+        this.teardownPeer(peer);
+        this.peers.delete(peer.id);
+        this.pushPeersToStore();
+        this.cb.onPeerLeft(peer.name);
         break;
+      }
       case "signal":
-        if (msg.data) await this.onSignal(msg.data);
+        if (msg.data && msg.from != null) await this.onSignal(msg.from, msg.data);
         break;
       case "cast":
         if (msg.event) this.cb.onCast(msg.event);
         break;
       case "full":
-        useStore.setState({ prejoinHint: "Room is full — Forge calls are two humans max for now." });
+        useStore.setState({ prejoinHint: "Room is full — someone has to leave before you can join." });
         break;
     }
   }
 
-  private adoptPeer(id: number, name: string): void {
-    this.peerId = id;
-    this.peerName = name;
-    useStore.setState({ remoteName: name });
-    this.cb.onPeerJoined(name);
+  private adoptPeer(id: number, name: string, isNew: boolean): PeerLink {
+    const peer: PeerLink = { id, name, pc: null, pendingIce: [], stream: null };
+    this.peers.set(id, peer);
+    this.pushPeersToStore();
+    this.cb.onPeerJoined(name, isNew);
+    return peer;
   }
 
-  private async setupPeer(initiator: boolean): Promise<void> {
-    this.teardownPeerConnectionOnly();
+  private pushPeersToStore(): void {
+    useStore.setState({
+      peers: [...this.peers.values()].map((p) => ({ id: p.id, name: p.name, stream: p.stream })),
+    });
+  }
+
+  private async setupPeer(peer: PeerLink, initiator: boolean): Promise<void> {
+    try { peer.pc?.close(); } catch { /* noop */ }
+    peer.pendingIce = [];
     const pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
-    this.pc = pc;
+    peer.pc = pc;
     this.localStream?.getTracks().forEach((t) => pc.addTrack(t, this.localStream!));
     pc.ontrack = (e) => {
-      if (e.streams[0]) useStore.setState({ remoteStream: e.streams[0] });
+      if (e.streams[0]) {
+        peer.stream = e.streams[0];
+        this.pushPeersToStore();
+      }
     };
     pc.onicecandidate = (e) => {
-      if (e.candidate) this.signal({ ice: e.candidate.toJSON() });
+      if (e.candidate) this.signal(peer.id, { ice: e.candidate.toJSON() });
     };
     if (initiator) {
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
-      this.signal({ sdp: pc.localDescription ?? undefined });
+      this.signal(peer.id, { sdp: pc.localDescription ?? undefined });
     }
   }
 
-  private async onSignal(data: SignalData): Promise<void> {
-    if (!this.pc) await this.setupPeer(false);
-    const pc = this.pc!;
+  private async onSignal(from: number, data: SignalData): Promise<void> {
+    let peer = this.peers.get(from);
+    // Signal from someone we haven't registered (join/welcome race) — adopt
+    // them quietly so the call still forms.
+    if (!peer) peer = this.adoptPeer(from, "Guest", false);
+    if (!peer.pc) await this.setupPeer(peer, false);
+    const pc = peer.pc!;
     if (data.sdp) {
       await pc.setRemoteDescription(data.sdp);
-      for (const c of this.pendingIce) await pc.addIceCandidate(c);
-      this.pendingIce = [];
+      for (const c of peer.pendingIce) await pc.addIceCandidate(c);
+      peer.pendingIce = [];
       if (data.sdp.type === "offer") {
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
-        this.signal({ sdp: pc.localDescription ?? undefined });
+        this.signal(peer.id, { sdp: pc.localDescription ?? undefined });
       }
     } else if (data.ice) {
       if (pc.remoteDescription) await pc.addIceCandidate(data.ice);
-      else this.pendingIce.push(data.ice);
+      else peer.pendingIce.push(data.ice);
     }
   }
 
-  private signal(data: SignalData): void {
-    if (this.peerId !== null && this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({ t: "signal", to: this.peerId, data }));
+  private signal(to: number, data: SignalData): void {
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({ t: "signal", to, data }));
     }
   }
 
-  private teardownPeerConnectionOnly(): void {
-    try { this.pc?.close(); } catch { /* noop */ }
-    this.pc = null;
-    this.pendingIce = [];
+  private teardownPeer(peer: PeerLink): void {
+    try { peer.pc?.close(); } catch { /* noop */ }
+    peer.pc = null;
+    peer.pendingIce = [];
+    peer.stream = null;
   }
 
-  private teardownPeer(): void {
-    this.teardownPeerConnectionOnly();
-    this.peerId = null;
+  private teardownAllPeers(): void {
+    for (const peer of this.peers.values()) this.teardownPeer(peer);
+    this.peers.clear();
+    this.pushPeersToStore();
   }
 }

@@ -1,7 +1,10 @@
-// GitHub access for Forge. The deployment's GITHUB_TOKEN (or a local `gh`
-// CLI login) is the only credential used for repository browsing, cloning,
-// issue reading/creation, branch pushes, and pull requests. The browser never
-// sees the token; all mutation happens here.
+// GitHub access for Forge. Any meeting participant can sign in with their own
+// GitHub account (OAuth device flow, or a pasted personal access token); the
+// browser only ever holds an opaque session id — tokens live in backend
+// memory. The participant whose account loaded the active repo "lends" it to
+// the meeting: cloning, issue reading/creation, branch pushes and pull
+// requests all run with that grant. A deployment GITHUB_TOKEN (or local `gh`
+// CLI login) remains as a zero-config fallback.
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -13,7 +16,8 @@ const MAX_ISSUE_BODY = 20_000;
 
 let ghCliToken: { token: string | null; at: number } | null = null;
 
-export async function githubToken(): Promise<string | null> {
+/** Deployment-level credential: GITHUB_TOKEN env, else a local `gh` login. */
+export async function fallbackToken(): Promise<string | null> {
   const configured = process.env.GITHUB_TOKEN?.trim();
   if (configured) return configured;
   // Local-dev fallback: an authenticated `gh` CLI login means repo browsing
@@ -26,6 +30,149 @@ export async function githubToken(): Promise<string | null> {
     ghCliToken = { token: null, at: Date.now() };
   }
   return ghCliToken.token;
+}
+
+// ---------- per-participant sign-in ----------
+
+export interface SessionAuth {
+  token: string;
+  login: string;
+}
+
+interface PendingLogin {
+  userCode: string;
+  verificationUri: string;
+  expiresAt: number;
+  /** Terminal device-flow failure (denied, expired) — shown in the picker. */
+  error?: string;
+}
+
+const sessionAuths = new Map<string, SessionAuth>();
+const pendingLogins = new Map<string, PendingLogin>();
+
+// The credential behind the ACTIVE repo. Set when a signed-in participant
+// loads a repository; null means operations fall back to the deployment token.
+let activeGrant: SessionAuth | null = null;
+
+export function sessionAuth(sessionId: string | undefined): SessionAuth | null {
+  return (sessionId && sessionAuths.get(sessionId)) || null;
+}
+
+/** Bind all GitHub operations on the active repo to this participant. */
+export function setActiveGrant(grant: SessionAuth | null): void {
+  activeGrant = grant;
+}
+
+/** The token GitHub operations on the active repo run with. */
+export async function githubToken(): Promise<string | null> {
+  if (activeGrant) return activeGrant.token;
+  return fallbackToken();
+}
+
+export function oauthClientId(): string | null {
+  return process.env.GITHUB_OAUTH_CLIENT_ID?.trim() || null;
+}
+
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Start a GitHub OAuth device-flow login for a participant: returns the code
+ * they type at github.com/login/device, and polls GitHub in the background
+ * until the login completes (status() reports the result).
+ */
+export async function startDeviceLogin(sessionId: string): Promise<{ userCode: string; verificationUri: string }> {
+  const clientId = oauthClientId();
+  if (!clientId) {
+    throw Object.assign(new Error("GitHub sign-in isn't configured — set GITHUB_OAUTH_CLIENT_ID in the backend environment"), { status: 400 });
+  }
+  const res = await fetch("https://github.com/login/device/code", {
+    method: "POST",
+    headers: { Accept: "application/json", "Content-Type": "application/json" },
+    body: JSON.stringify({ client_id: clientId, scope: "repo" }),
+  });
+  if (!res.ok) {
+    throw Object.assign(new Error(`GitHub device login failed (${res.status})`), { status: 502 });
+  }
+  const data = (await res.json()) as {
+    device_code?: string; user_code?: string; verification_uri?: string; expires_in?: number; interval?: number; error?: string;
+  };
+  if (!data.device_code || !data.user_code) {
+    throw Object.assign(new Error(`GitHub device login failed: ${data.error || "no device code"}`), { status: 502 });
+  }
+  const pending: PendingLogin = {
+    userCode: data.user_code,
+    verificationUri: data.verification_uri || "https://github.com/login/device",
+    expiresAt: Date.now() + (data.expires_in ?? 900) * 1000,
+  };
+  pendingLogins.set(sessionId, pending);
+  void pollDeviceLogin(sessionId, clientId, data.device_code, Math.max(5, data.interval ?? 5), pending);
+  return { userCode: pending.userCode, verificationUri: pending.verificationUri };
+}
+
+async function pollDeviceLogin(
+  sessionId: string,
+  clientId: string,
+  deviceCode: string,
+  intervalSec: number,
+  pending: PendingLogin
+): Promise<void> {
+  // A re-triggered login replaces the map entry — the old loop must die.
+  while (pendingLogins.get(sessionId) === pending && Date.now() < pending.expiresAt) {
+    await sleep(intervalSec * 1000);
+    if (pendingLogins.get(sessionId) !== pending) return;
+    let data: { access_token?: string; error?: string; interval?: number };
+    try {
+      const res = await fetch("https://github.com/login/oauth/access_token", {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: JSON.stringify({ client_id: clientId, device_code: deviceCode, grant_type: "urn:ietf:params:oauth:grant-type:device_code" }),
+      });
+      data = (await res.json()) as typeof data;
+    } catch {
+      continue; // transient network blip — keep polling
+    }
+    if (data.access_token) {
+      try {
+        const user = await api<{ login: string }>("/user", data.access_token);
+        sessionAuths.set(sessionId, { token: data.access_token, login: user.login });
+      } catch {
+        pending.error = "GitHub authorized the login but the token didn't work — try again";
+      }
+      pendingLogins.delete(sessionId);
+      return;
+    }
+    if (data.error === "authorization_pending") continue;
+    if (data.error === "slow_down") { intervalSec += 5; continue; }
+    pending.error = data.error === "access_denied"
+      ? "GitHub sign-in was cancelled"
+      : `GitHub sign-in ${data.error === "expired_token" ? "code expired" : `failed (${data.error || "unknown error"})`} — try again`;
+    return;
+  }
+  if (pendingLogins.get(sessionId) === pending && !pending.error) {
+    pending.error = "GitHub sign-in code expired — try again";
+  }
+}
+
+/** Fallback sign-in: validate a pasted personal access token for this session. */
+export async function connectWithToken(sessionId: string, token: string): Promise<string> {
+  const trimmed = token.trim();
+  if (!trimmed) throw Object.assign(new Error("empty token"), { status: 400 });
+  let user: { login: string };
+  try {
+    user = await api<{ login: string }>("/user", trimmed);
+  } catch {
+    throw Object.assign(new Error("GitHub rejected that token"), { status: 401 });
+  }
+  sessionAuths.set(sessionId, { token: trimmed, login: user.login });
+  pendingLogins.delete(sessionId);
+  return user.login;
+}
+
+/** Forget this participant's sign-in. A repo they already loaded keeps its
+ * grant — revoking mid-meeting would break the room's active repo. */
+export function logout(sessionId: string): void {
+  sessionAuths.delete(sessionId);
+  pendingLogins.delete(sessionId);
 }
 
 /** owner/repo slug for the repo at `repoPath`, from its git origin remote. */
@@ -62,19 +209,33 @@ async function api<T>(path: string, token: string, init: RequestInit = {}): Prom
 export interface GithubStatus {
   connected: boolean;
   user?: string;
-  via?: "env" | "gh";
+  via?: "oauth" | "env" | "gh";
+  /** Whether "Sign in with GitHub" (device flow) is configured. */
+  authAvailable?: boolean;
+  /** A device-flow login is awaiting the user at github.com/login/device. */
+  pending?: { userCode: string; verificationUri: string };
   /** Safe diagnostic for the repo picker. Never includes a token. */
   error?: string;
 }
 
-export async function status(): Promise<GithubStatus> {
-  const token = await githubToken();
-  if (!token) return { connected: false };
+/** This participant's GitHub connection: their own sign-in first, then any
+ * pending device-flow login, then the deployment fallback credential. */
+export async function status(sessionId?: string): Promise<GithubStatus> {
+  const authAvailable = !!oauthClientId();
+  const auth = sessionAuth(sessionId);
+  if (auth) return { connected: true, user: auth.login, via: "oauth", authAvailable };
+  const pending = sessionId ? pendingLogins.get(sessionId) : undefined;
+  if (pending && !pending.error && Date.now() < pending.expiresAt) {
+    return { connected: false, authAvailable, pending: { userCode: pending.userCode, verificationUri: pending.verificationUri } };
+  }
+  const loginError = pending?.error;
+  const token = await fallbackToken();
+  if (!token) return { connected: false, authAvailable, error: loginError };
   try {
     const user = await api<{ login: string }>("/user", token);
-    return { connected: true, user: user.login, via: process.env.GITHUB_TOKEN?.trim() ? "env" : "gh" };
+    return { connected: true, user: user.login, via: process.env.GITHUB_TOKEN?.trim() ? "env" : "gh", authAvailable, error: loginError };
   } catch (err) {
-    return { connected: false, error: (err instanceof Error ? err.message : String(err)).slice(0, 240) };
+    return { connected: false, authAvailable, error: loginError ?? (err instanceof Error ? err.message : String(err)).slice(0, 240) };
   }
 }
 
@@ -99,8 +260,9 @@ export interface RepoInfo {
   description: string | null;
 }
 
-export async function listRepos(): Promise<RepoInfo[]> {
-  const token = await githubToken();
+/** The calling participant's repos — their own sign-in, else the fallback. */
+export async function listRepos(sessionId?: string): Promise<RepoInfo[]> {
+  const token = sessionAuth(sessionId)?.token ?? (await fallbackToken());
   if (!token) throw Object.assign(new Error("not connected to GitHub"), { status: 401 });
   const repos = await api<RepoInfo[]>("/user/repos?sort=pushed&per_page=100", token);
   return repos.map((r) => ({

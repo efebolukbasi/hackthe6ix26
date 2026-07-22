@@ -501,7 +501,7 @@ button:active { transform: scale(0.96); }
 }
 #stagewrap { flex: 1; display: flex; gap: 16px; padding: 18px 18px 0; min-height: 0; }
 
-#tiles { flex: 1; display: flex; align-items: center; justify-content: center; gap: 18px; min-width: 0; }
+#tiles { flex: 1; display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 18px; min-width: 0; align-content: center; }
 .tile {
   position: relative; overflow: hidden; border-radius: var(--r-lg);
   background: linear-gradient(170deg, #14110e, #0b0a08);
@@ -516,7 +516,7 @@ button:active { transform: scale(0.96); }
   border-color: rgba(239, 231, 216, 0.55);
   box-shadow: 0 0 0 1px rgba(239, 231, 216, 0.4), 0 0 40px rgba(239, 231, 216, 0.1), var(--shadow-1);
 }
-#cam, #peercam { width: 100%; height: 100%; object-fit: cover; }
+#cam, .tile-peer video { width: 100%; height: 100%; object-fit: cover; }
 #cam { transform: scaleX(-1); }
 .tile .avatar { display: none; position: absolute; inset: 0; align-items: center; justify-content: center; font-size: 0; }
 .tile.camoff #cam { visibility: hidden; }
@@ -859,6 +859,34 @@ button:active { transform: scale(0.96); }
 }
 .repo-list button:hover { background: var(--surface-2); }
 .repo-hint { font-size: 12px; color: var(--faint); padding: 6px 4px; line-height: 1.5; font-weight: 300; }
+.repo-hint a { color: var(--text); text-decoration: underline; }
+
+/* per-participant GitHub sign-in */
+.repo-auth { display: flex; flex-direction: column; gap: 4px; }
+.repo-login {
+  width: 100%; text-align: center;
+  background: var(--bone); color: #171310;
+  font-size: 12.5px; font-weight: 700; padding: 9px 13px; border-radius: 9px;
+}
+.repo-login:hover { transform: translateY(-1px); box-shadow: 0 6px 22px rgba(240, 237, 230, 0.2); }
+.repo-alt { background: none; text-align: left; color: var(--faint); font-size: 11.5px; padding: 5px 4px; }
+.repo-alt:hover { color: var(--text); }
+.repo-pat { display: flex; gap: 6px; }
+.repo-pat input { flex: 1; margin-bottom: 0; }
+.repo-pat button {
+  background: var(--surface); border: 1px solid var(--stroke); color: var(--text);
+  border-radius: 9px; padding: 8px 12px; font-size: 12px;
+}
+.repo-pat button:hover { background: var(--surface-2); }
+.repo-code {
+  width: 100%; text-align: center;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 20px; font-weight: 700; letter-spacing: 4px; color: var(--text);
+  background: var(--surface); border: 1px dashed var(--stroke); border-radius: 9px;
+  padding: 10px; margin: 4px 0;
+}
+.repo-code:hover { background: var(--surface-2); }
+.repo-foot { border-top: 1px solid var(--stroke); margin-top: 6px; padding-top: 4px; }
 
 /* ————— ended ————— */
 #ended {
@@ -886,9 +914,14 @@ button:active { transform: scale(0.96); }
 }
 .ended-card button:hover { transform: translateY(-2px); box-shadow: 0 12px 36px rgba(240, 237, 230, 0.18); }
 
-/* ————— P2P peer tile ————— */
+/* ————— P2P peer tiles: sizing steps with the head-count ————— */
 #tiles.trio .tile { width: min(31%, 470px); }
-#room.presenting #tiles.trio .tile { width: 100%; }
+#tiles.quad .tile { width: min(38%, 520px); }
+#tiles.hex .tile { width: min(30%, 440px); }
+#tiles.octo .tile { width: min(23%, 360px); }
+/* presenting: tiles stack in the side rail regardless of count */
+#room.presenting #tiles { overflow-y: auto; flex-wrap: nowrap; }
+#room.presenting #tiles .tile { width: 100%; }
 
 /* ————— listening / speaking orb states ————— */
 .orb-wrap.listening .orb {

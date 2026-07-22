@@ -1,7 +1,7 @@
-// Meeting room: WebSocket hub for (a) WebRTC signaling between the two human
-// peers — media itself flows browser-to-browser, P2P — and (b) Forge sync
-// events (utterances, whiteboard steps, hand state) so both sides share one
-// meeting. One global room, capped at two humans (hackathon scope).
+// Meeting room: WebSocket hub for (a) WebRTC signaling between the human
+// peers — media itself flows browser-to-browser, P2P mesh — and (b) Forge
+// sync events (utterances, whiteboard steps, hand state) so everyone shares
+// one meeting. One global room, human count capped by FORGE_MAX_HUMANS.
 import { WebSocketServer, WebSocket } from "ws";
 import { timingSafeEqual } from "node:crypto";
 import type { Server } from "node:http";
@@ -17,7 +17,18 @@ interface SignalMsg { t: "signal"; to: number; data: unknown }
 interface CastMsg { t: "cast"; event: unknown }
 type ClientMsg = JoinMsg | SignalMsg | CastMsg;
 
-const MAX_HUMANS = 2;
+// P2P mesh: every participant streams to every other, so keep this modest —
+// upload bandwidth scales linearly with the human count.
+const MAX_HUMANS = Math.max(2, Number(process.env.FORGE_MAX_HUMANS) || 6);
+
+// Server-originated room events (repo switches). Wired up by attachRoom;
+// a no-op until the room exists.
+let roomBroadcast: ((msg: unknown) => void) | null = null;
+
+/** Cast an event to every participant, as if from the server (from: 0). */
+export function castToRoom(event: unknown): void {
+  roomBroadcast?.({ t: "cast", from: 0, event });
+}
 
 function tokenMatches(actual: string | null, expected: string): boolean {
   if (!actual) return false;
@@ -50,6 +61,7 @@ export function attachRoom(server: Server): void {
   const broadcast = (msg: unknown, except?: number) => {
     for (const m of members.values()) if (m.id !== except) send(m.ws, msg);
   };
+  roomBroadcast = (msg) => broadcast(msg);
 
   // Heartbeat: Render/Cloudflare proxies drop idle sockets, and silently dead
   // connections would otherwise hold a seat in the two-human room forever.

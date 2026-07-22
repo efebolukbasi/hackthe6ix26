@@ -118,7 +118,7 @@ export class ForgeSession {
   private currentTtsFinish: (() => void) | null = null;
   private agentAbort: AbortController | null = null;
 
-  private health: Health = { ok: false, tts: false, llm: "?", repo: { name: "your repo" } };
+  private health: Health = { ok: false, tts: false, llm: "?", repo: null };
 
   private buffer: TranscriptLine[] = []; // passively heard utterances since last hand check
   private handReason = "";
@@ -1206,6 +1206,15 @@ export class ForgeSession {
         if (target?.mine) this.cancelTask(ev.id);
         break;
       }
+      case "repo":
+        // The meeting's active repo changed (any participant, via the picker).
+        this.health = { ...this.health, repo: ev.repo };
+        useStore.setState((s) => ({ health: { ...s.health, repo: ev.repo } }));
+        this.caption("Forge", ev.by
+          ? `${ev.by} connected ${ev.repo.name ?? "a repository"} — I've read it, ask away.`
+          : `Now reading ${ev.repo.name ?? "a new repository"} — ask away.`);
+        this.chime(0.4);
+        break;
     }
   }
 
@@ -1315,17 +1324,27 @@ export class ForgeSession {
   private async fetchHealth(): Promise<void> {
     try {
       const res = await apiFetch(`${API}/api/health`);
+      // 401 = deployment requires the invite token and this tab doesn't have
+      // it — say exactly that instead of a generic "unreachable".
+      if (res.status === 401) {
+        this.health = { ok: false, tts: false, llm: "?", repo: null };
+        useStore.setState({
+          health: this.health,
+          pill: { cls: "err", title: "missing invite token — open the full invite link (…#token=…)" },
+        });
+        return;
+      }
       this.health = (await res.json()) as Health;
       useStore.setState({
         health: this.health,
         ...(this.health.model === "haiku" || this.health.model === "sonnet" ? { model: this.health.model } : {}),
         pill: {
           cls: "ok",
-          title: `backend ok · brain: ${this.health.llm}/${this.health.model ?? "haiku"} · voice: ${this.health.tts ? "ElevenLabs" : "browser"} · repo: ${this.health.repo?.name}`,
+          title: `backend ok · brain: ${this.health.llm}/${this.health.model ?? "haiku"} · voice: ${this.health.tts ? "ElevenLabs" : "browser"} · repo: ${this.health.repo?.name ?? "not connected"}`,
         },
       });
     } catch {
-      this.health = { ok: false, tts: false, llm: "?", repo: { name: "your repo" } };
+      this.health = { ok: false, tts: false, llm: "?", repo: null };
       useStore.setState({
         health: this.health,
         pill: { cls: "err", title: "backend unreachable — start forge/backend (npm start)" },
@@ -1360,12 +1379,20 @@ export class ForgeSession {
     if (!this.recog) this.caption("Forge", "Voice input needs Chrome — use the chat panel to ask me things.", true);
 
     await this.fetchHealth();
+    // Uninitialized meeting: point people at the picker instead of leaving
+    // them to ask questions into a repo-less void.
+    if (this.health.ok && !this.health.repo) {
+      useStore.setState({ panelOpen: true });
+      this.caption("Forge", "No repository connected yet — sign in with GitHub in the panel and pick one.", true);
+    }
     this.room = new RoomLink({
       onCast: (ev) => this.onCast(ev),
-      onPeerJoined: (peer) => {
-        this.caption("Forge", `${peer} joined the call.`);
+      onPeerJoined: (peer, isNew) => {
+        this.caption("Forge", isNew ? `${peer} joined the call.` : `${peer} is in the call.`);
         this.chime(0.5);
-        this.syncBoardToPeer();
+        // Only the driver syncs board state to a late joiner — in a mesh,
+        // every member re-casting would stampede N identical syncs.
+        if (isNew && this.room?.isDriver) this.syncBoardToPeer();
       },
       onPeerLeft: (peer) => this.caption("Forge", `${peer} left the call.`),
     });

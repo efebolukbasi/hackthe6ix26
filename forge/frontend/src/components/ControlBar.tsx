@@ -8,7 +8,7 @@ export default function ControlBar() {
   const camOn = useStore((s) => s.camOn);
   const ccOn = useStore((s) => s.ccOn);
   const pill = useStore((s) => s.pill);
-  const remoteName = useStore((s) => s.remoteName);
+  const peerCount = useStore((s) => s.peers.length);
   const model = useStore((s) => s.model);
   const [clock, setClock] = useState("--:--");
   const [inviteCopied, setInviteCopied] = useState(false);
@@ -77,7 +77,7 @@ export default function ControlBar() {
           {model === "sonnet" ? "S" : "H"}
         </button>
         <span id="backend-pill" className={pill.cls} title={pill.title}>●</span>
-        <span className="chip">👥 {remoteName ? 3 : 2}</span>
+        <span className="chip">👥 {peerCount + 2}</span>
       </div>
     </footer>
   );

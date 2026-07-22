@@ -43,14 +43,17 @@ Open http://localhost:5180 in **Chrome**, allow mic/cam, Join.
 - **Voice**: with `ELEVENLABS_API_KEY` Forge speaks via ElevenLabs (flash model,
   cheap; identical lines are disk-cached so repeated demos cost ~0 credits).
   Without it, browser TTS.
-- **Repo intelligence**: on boot the backend indexes a repo and folds a digest
-  into the prompt — and the Anthropic API agent also gets **live read-only tools**
-  (read/grep/list) inside that repo, so "where do we handle X?" is verified
-  against the actual code and answered with a `file:line` **code card** drawn
-  on the board. The 📁 picker at the top of the side panel lists repositories
-  available to the backend's `GITHUB_TOKEN`; click one and Forge re-reads it
-  live (private repos included). `REPO_PATH`/`GITHUB_REPO` env still work for a
-  fixed default.
+- **Repo intelligence**: the meeting starts **without a repository**. Any
+  participant opens the 📁 picker in the side panel, signs in with their own
+  GitHub account (OAuth device flow — enter a short code at
+  github.com/login/device — or paste a personal access token), and picks a repo
+  from their list. Forge clones and indexes it live (private repos included),
+  folds a digest into the prompt, and the Anthropic API agent gets **live
+  read-only tools** (read/grep/list) inside it, so "where do we handle X?" is
+  verified against the actual code and answered with a `file:line` **code
+  card** drawn on the board. Issue creation and PRs run with the account that
+  loaded the repo. Set `REPO_PATH`/`GITHUB_REPO` env to pre-load a fixed repo
+  instead (the old behavior).
 
 ## Using it in a meeting
 
@@ -82,11 +85,13 @@ Forge understands these spoken commands in a meeting:
 - **"create a github issue about …"** — Ask Forge to file a new GitHub issue based on the conversation context.
 - **"work on issue 7"** (or any number) — Instruct Forge to implement a specific GitHub issue as a pull request.
 
-## Two-person calls (P2P)
+## Multi-person calls (P2P mesh)
 
-Forge calls now hold **two humans + Forge**. Audio/video flows browser-to-browser
-(WebRTC, STUN only — true P2P); the backend's `/ws` endpoint handles signaling and
-keeps Forge state (transcript, whiteboard steps, raise-hand) in sync on both sides.
+Forge calls hold **up to 6 humans + Forge** (`FORGE_MAX_HUMANS` to change; every
+participant streams to every other, so keep it modest). Audio/video flows
+browser-to-browser (WebRTC full mesh, STUN only — true P2P); the backend's `/ws`
+endpoint handles signaling and keeps Forge state (transcript, whiteboard steps,
+raise-hand) in sync across everyone.
 
 To invite someone outside your network:
 
@@ -124,11 +129,25 @@ WebSocket requests. Do not share the bare deployment URL.
 
 ### GitHub access
 
-Configure one fine-grained GitHub personal access token in Render as
-`GITHUB_TOKEN`. Set its resource owner and repository access to include the
-target repository, then grant **Contents: Read-only** and **Issues: Read and
-write**. Use the 📁 picker to browse repositories or speak a meeting request to
-create an issue. The token stays on the backend and is never sent to browsers.
+Participants connect their **own** GitHub accounts from the 📁 picker — no
+shared deployment token needed. To enable the "Sign in with GitHub" button:
+
+1. Create an OAuth App at <https://github.com/settings/developers> → **New
+   OAuth App**. Name and URLs can be anything (the callback URL is unused by
+   the device flow — put the deployment URL).
+2. On the app's settings page, check **Enable Device Flow** and save.
+3. Set the app's **Client ID** as `GITHUB_OAUTH_CLIENT_ID` in the backend
+   environment. No client secret is required.
+
+Each participant clicks *Sign in with GitHub*, enters the short code at
+github.com/login/device, and picks a repository from their list. The repo is
+cloned and all issue/PR operations run with the account that loaded it; tokens
+live only in backend memory and are never sent to browsers. Without a client
+ID, the picker falls back to pasting a personal access token.
+
+Optionally, a fine-grained PAT in `GITHUB_TOKEN` still works as a
+deployment-wide fallback credential (grant **Contents: Read-only** and
+**Issues: Read and write** on the target repos).
 
 After changing the variable, choose **Save and deploy** (or **Save, rebuild,
 and deploy**) in Render; **Save only** does not update the running service. On

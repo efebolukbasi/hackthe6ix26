@@ -13,7 +13,7 @@ import { buildDigest } from "./lib/repo.ts";
 import { respond, listen, setRepoContext, getRepoCwd, getRepoSlug, walkthrough, createIssueFlow, implementIssueFlow } from "./lib/agent.ts";
 import { synthesize, synthesizeStream, ttsEnabled } from "./lib/tts.ts";
 import { activeModelName, llmMode, setActiveModel } from "./lib/llm.ts";
-import { attachRoom } from "./lib/room.ts";
+import { attachRoom, castToRoom } from "./lib/room.ts";
 import * as github from "./lib/github.ts";
 import type { AgentRequestBody, RepoMeta, TranscriptLine, WalkthroughRequestBody } from "./lib/types.ts";
 
@@ -26,12 +26,11 @@ const GITHUB_URL_RE = /^https:\/\/github\.com\/([\w.-]+)\/([\w.-]+?)(\.git)?\/?$
 
 // A repo "source" is either a local path or a GitHub URL (shallow-cloned into
 // the cache; pulled on re-load). Returns the local path to index.
-async function ensureRepo(source: string): Promise<string> {
+async function ensureRepo(source: string, token: string | null): Promise<string> {
   const m = source.match(GITHUB_URL_RE);
   if (!m) return resolve(source);
   // Cache key includes the owner so acme/api and globex/api don't collide.
   const dir = join(REPO_CACHE, `${m[1]}__${m[2]}`);
-  const token = await github.githubToken();
   if (existsSync(join(dir, ".git"))) {
     // Pull through the tokenized URL so private repos refresh too (the stored
     // remote is intentionally token-free).
@@ -45,8 +44,9 @@ async function ensureRepo(source: string): Promise<string> {
   return dir;
 }
 
-// src/server.ts -> src -> backend -> forge -> repo root (three levels up).
-const REPO_SOURCE = process.env.REPO_PATH || process.env.GITHUB_REPO || join(__dirname, "..", "..", "..");
+// The meeting starts with NO repository unless one is explicitly configured —
+// participants sign in with GitHub and pick one from the dropdown instead.
+const REPO_SOURCE = process.env.REPO_PATH || process.env.GITHUB_REPO || "";
 
 const app = express();
 app.use(cors());
@@ -67,19 +67,33 @@ app.use("/api", (req, res, next) => {
   res.status(401).json({ error: "invalid Forge invite" });
 });
 
-let repoMeta: RepoMeta = { name: "(indexing…)", fileCount: 0 };
+// null until a participant (or the env config) connects a repository.
+let repoMeta: RepoMeta | null = null;
 // owner/repo of the active repository — known from the load URL, or derived
 // from the checkout's git origin. Used for issue creation and GitHub links.
 let repoSlug: string | null = null;
 
+/** Opaque per-browser session id — keys each participant's GitHub sign-in. */
+function sessionIdOf(req: Request): string | undefined {
+  const id = req.header("X-Forge-Session")?.trim();
+  return id && /^[\w-]{8,64}$/.test(id) ? id : undefined;
+}
+
 // Index a repo source and make it the active repo for the whole backend.
-async function loadRepo(source: string): Promise<RepoMeta> {
-  const path = await ensureRepo(source);
+// When a signed-in participant loads it, their account backs every GitHub
+// operation on it (clone, issues, pushes, PRs) from here on.
+async function loadRepo(source: string, auth: github.SessionAuth | null = null): Promise<RepoMeta> {
+  const token = auth?.token ?? (await github.fallbackToken());
+  const path = await ensureRepo(source, token);
   const m = source.match(GITHUB_URL_RE);
   repoSlug = m ? `${m[1]}/${m[2]}` : (await github.repoSlugFor(path)) || github.configuredRepoSlug();
   const { digest, meta } = await buildDigest(path);
+  // The digest names the repo after its directory — for GitHub loads that's
+  // the "owner__repo" cache dir; show the real slug instead.
+  if (repoSlug) meta.name = repoSlug;
   setRepoContext(digest, path, repoSlug);
   repoMeta = meta;
+  github.setActiveGrant(auth);
   return meta;
 }
 
@@ -100,14 +114,48 @@ app.post("/api/agent", (req: Request, res: Response) => respond(req.body as Agen
 
 app.post("/api/listen", async (req: Request, res: Response) => res.json(await listen(req.body as AgentRequestBody)));
 
-// GitHub access is configured once with GITHUB_TOKEN in the backend environment.
-app.get("/api/github/status", async (_req: Request, res: Response) => {
-  res.json(await github.status());
+// Per-participant GitHub connection: each browser session can sign in with
+// its own account (device flow or pasted token); the deployment GITHUB_TOKEN
+// remains a fallback for zero-config local dev.
+app.get("/api/github/status", async (req: Request, res: Response) => {
+  res.json(await github.status(sessionIdOf(req)));
+});
+
+// Start a device-flow sign-in: returns the code to type at github.com/login/device.
+app.post("/api/github/login", async (req: Request, res: Response) => {
+  const sid = sessionIdOf(req);
+  if (!sid) return res.status(400).json({ error: "missing session id" });
+  try {
+    res.json(await github.startDeviceLogin(sid));
+  } catch (err) {
+    const e = err as { status?: number; message?: string };
+    res.status(e.status || 502).json({ error: e.message || String(err) });
+  }
+});
+
+// Fallback sign-in: a pasted personal access token, validated then kept
+// server-side for this session only.
+app.post("/api/github/token", async (req: Request, res: Response) => {
+  const sid = sessionIdOf(req);
+  if (!sid) return res.status(400).json({ error: "missing session id" });
+  const token = String((req.body as { token?: string } | undefined)?.token || "");
+  try {
+    res.json({ ok: true, user: await github.connectWithToken(sid, token) });
+  } catch (err) {
+    const e = err as { status?: number; message?: string };
+    res.status(e.status || 502).json({ error: e.message || String(err) });
+  }
+});
+
+app.post("/api/github/logout", (req: Request, res: Response) => {
+  const sid = sessionIdOf(req);
+  if (sid) github.logout(sid);
+  res.json({ ok: true });
 });
 
 app.get("/api/github/repos", async (req: Request, res: Response) => {
   try {
-    res.json(await github.listRepos());
+    res.json(await github.listRepos(sessionIdOf(req)));
   } catch (err) {
     const e = err as { status?: number; message?: string };
     res.status(e.status || 502).json({ error: e.message || String(err) });
@@ -159,12 +207,16 @@ app.post("/api/github/issues/:number/implement", (req: Request, res: Response) =
 });
 
 // Point Forge at a different repo mid-meeting: local path or GitHub URL.
+// Loaded with (and bound to) the calling participant's sign-in when present;
+// the switch is cast to every participant in the room.
 app.post("/api/repo/load", async (req: Request, res: Response) => {
   const source = String((req.body as { url?: string } | undefined)?.url || "").trim();
   if (!source) return res.status(400).json({ error: "no url" });
+  const auth = github.sessionAuth(sessionIdOf(req));
   try {
-    const meta = await loadRepo(source);
-    console.log(`repo switched → ${meta.name} (${meta.fileCount} files)`);
+    const meta = await loadRepo(source, auth);
+    console.log(`repo switched → ${meta.name} (${meta.fileCount} files)${auth ? ` · via @${auth.login}` : ""}`);
+    castToRoom({ k: "repo", repo: meta, by: auth?.login });
     res.json({ ok: true, repo: meta });
   } catch (err) {
     res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
@@ -271,6 +323,10 @@ app.get("*", (req: Request, res: Response, next: () => void) => {
 const httpServer = app.listen(PORT, async () => {
   console.log(`forge backend → http://localhost:${PORT}`);
   console.log(`  llm: ${llmMode()}${ttsEnabled() ? ", elevenlabs: on" : ", elevenlabs: OFF (browser TTS fallback)"}`);
+  if (!REPO_SOURCE) {
+    console.log("  no repo configured — meeting starts unconnected; participants sign in with GitHub and pick one");
+    return;
+  }
   console.log(`  indexing repo: ${REPO_SOURCE}`);
   const meta = await loadRepo(REPO_SOURCE);
   console.log(`  repo indexed: ${meta.fileCount} files, ${meta.includedFiles} in digest (${meta.chars} chars)${repoSlug ? ` · github: ${repoSlug}` : ""}`);

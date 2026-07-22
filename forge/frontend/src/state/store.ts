@@ -32,6 +32,13 @@ export interface BackendPill {
   title: string;
 }
 
+/** A connected human peer in the P2P mesh call. */
+export interface RemotePeer {
+  id: number;
+  name: string;
+  stream: MediaStream | null;
+}
+
 export interface ForgeState {
   phase: Phase;
   stage: ForgeStage;
@@ -55,9 +62,8 @@ export interface ForgeState {
   prejoinHint: string;
   /** display name entered on the pre-join screen */
   myName: string;
-  /** connected human peer (P2P call), if any */
-  remoteName: string | null;
-  remoteStream: MediaStream | null;
+  /** connected human peers (P2P mesh call) */
+  peers: RemotePeer[];
   /** latest tool/progress trace; task rows own the visible rendering */
   thinkingTrace: string[];
   /** active/queued/recently-finished Forge tasks (answers and issues) */
@@ -88,7 +94,7 @@ export const useStore = create<ForgeState>()(() => ({
   orbSpeaking: false,
   youTalking: false,
   listeningActive: false,
-  health: { ok: false, tts: false, llm: "?", repo: { name: "your repo" } },
+  health: { ok: false, tts: false, llm: "?", repo: null },
   pill: { cls: "", title: "backend status" },
   ccOn: true,
   micOn: true,
@@ -98,8 +104,7 @@ export const useStore = create<ForgeState>()(() => ({
   streamReady: false,
   prejoinHint: "use Chrome · allow camera & microphone",
   myName: "",
-  remoteName: null,
-  remoteStream: null,
+  peers: [],
   thinkingTrace: [],
   tasks: [],
   model: "haiku",

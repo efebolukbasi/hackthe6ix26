@@ -24,9 +24,31 @@ function VolumeControl({ value, onChange, label }: { value: number; onChange: (v
   );
 }
 
+/** One remote participant's video tile (P2P mesh). All remote tiles share the
+ * single "peers" volume setting. */
+function PeerTile({ name, stream }: { name: string; stream: MediaStream | null }) {
+  const ref = useRef<HTMLVideoElement>(null);
+  const peerVolume = useStore((s) => s.peerVolume);
+
+  useEffect(() => {
+    if (ref.current && stream) ref.current.srcObject = stream;
+  }, [stream]);
+
+  useEffect(() => {
+    if (ref.current) ref.current.volume = peerVolume;
+  }, [peerVolume, stream]);
+
+  return (
+    <div className="tile tile-peer">
+      <video ref={ref} autoPlay playsInline />
+      <div className="nametag">{name}</div>
+      <VolumeControl value={peerVolume} onChange={(v) => session.setPeerVolume(v)} label={name} />
+    </div>
+  );
+}
+
 export default function Tiles() {
   const videoRef = useRef<HTMLVideoElement>(null);
-  const peerRef = useRef<HTMLVideoElement>(null);
   const streamReady = useStore((s) => s.streamReady);
   const youTalking = useStore((s) => s.youTalking);
   const camOff = useStore((s) => s.camOff);
@@ -34,24 +56,14 @@ export default function Tiles() {
   const stage = useStore((s) => s.stage);
   const handRaised = useStore((s) => s.handRaised);
   const agentStatus = useStore((s) => s.agentStatus);
-  const remoteName = useStore((s) => s.remoteName);
-  const remoteStream = useStore((s) => s.remoteStream);
+  const peers = useStore((s) => s.peers);
   const myName = useStore((s) => s.myName);
   const listeningActive = useStore((s) => s.listeningActive);
   const forgeVolume = useStore((s) => s.forgeVolume);
-  const peerVolume = useStore((s) => s.peerVolume);
 
   useEffect(() => {
     if (streamReady && videoRef.current) videoRef.current.srcObject = session.stream;
   }, [streamReady]);
-
-  useEffect(() => {
-    if (peerRef.current && remoteStream) peerRef.current.srcObject = remoteStream;
-  }, [remoteStream]);
-
-  useEffect(() => {
-    if (peerRef.current) peerRef.current.volume = peerVolume;
-  }, [peerVolume, remoteStream]);
 
   const working = stage === "working";
   const handVisible = handRaised || stage === "ready";
@@ -62,20 +74,20 @@ export default function Tiles() {
     orbSpeaking ? "speaking" : "",
   ].filter(Boolean).join(" ");
 
+  // Tile sizing scales with the head-count (humans + Forge's tile).
+  const total = peers.length + 2;
+  const sizeClass = total <= 2 ? "" : total === 3 ? "trio" : total === 4 ? "quad" : total <= 6 ? "hex" : "octo";
+
   return (
-    <div id="tiles" className={remoteName ? "trio" : ""}>
+    <div id="tiles" className={sizeClass}>
       <div className={"tile" + (youTalking ? " talking" : "") + (camOff ? " camoff" : "")} id="tile-you">
         <video id="cam" ref={videoRef} autoPlay playsInline muted />
         <div className="avatar">E</div>
         <div className="nametag">{myName || "You"} <span className="you-tag">(you)</span></div>
       </div>
-      {remoteName && (
-        <div className="tile" id="tile-peer">
-          <video id="peercam" ref={peerRef} autoPlay playsInline />
-          <div className="nametag">{remoteName}</div>
-          <VolumeControl value={peerVolume} onChange={(v) => session.setPeerVolume(v)} label={remoteName} />
-        </div>
-      )}
+      {peers.map((p) => (
+        <PeerTile key={p.id} name={p.name} stream={p.stream} />
+      ))}
       <div className="tile agent" id="tile-agent">
         <div className={orbClass}>
           <span className="halo h1" /><span className="halo h2" />

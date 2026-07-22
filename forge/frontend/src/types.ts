@@ -183,7 +183,8 @@ export interface Health {
   /** active brain model ("haiku" | "sonnet") */
   model?: string;
   tts: boolean;
-  repo?: { name?: string; [key: string]: unknown };
+  /** null until a participant connects a repository */
+  repo?: { name?: string; [key: string]: unknown } | null;
 }
 
 // ---------- Web Speech recognition (not in lib.dom) ----------
