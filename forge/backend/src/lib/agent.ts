@@ -1,6 +1,7 @@
 // The Forge brain: turns meeting context into streamed whiteboard steps.
 import type { Response } from "express";
 import { llmMode, streamText, type ExtraTools } from "./llm.ts";
+import { prewarm } from "./tts.ts";
 import { buildSystem, buildUser, buildIssueSystem, buildIssuePrompt, buildListenPrompt, buildWalkthroughSystem, buildWalkthroughUser } from "./prompt.ts";
 import * as github from "./github.ts";
 import { implementIssue, type PullRequestResult } from "./implement.ts";
@@ -276,7 +277,12 @@ export async function respond(
   const send = (obj: Record<string, unknown>) => {
     if (!res.writableEnded) res.write(JSON.stringify(obj) + "\n");
   };
-  const parser = makeLineParser((step) => send({ type: "step", ...step }));
+  // Steps are buffered client-side until "done" and gated behind the ready
+  // pause — prewarming here means the audio is already cached by playback.
+  const parser = makeLineParser((step) => {
+    prewarm(step.say);
+    send({ type: "step", ...step });
+  });
 
   try {
     // Built per call: the tool roster differs between the API and CLI brains,
@@ -317,7 +323,7 @@ export async function respond(
           if (chunks.length === 2) break;
         }
         if (chunk.trim() && chunks.length < 3) chunks.push(chunk.trim());
-        for (const c of chunks) send({ type: "step", say: c, ops: [] });
+        for (const c of chunks) { prewarm(c); send({ type: "step", say: c, ops: [] }); }
       } else {
         send({ type: "step", say: "Sorry — my thoughts got scrambled on that one. Ask me again?", ops: [] });
       }
@@ -359,7 +365,10 @@ export async function walkthrough(
   };
 
   const parser = makeLineParser(
-    (step) => send({ type: "step", ...step }),
+    (step) => {
+      prewarm(step.say);
+      send({ type: "step", ...step });
+    },
     (file, startLine, endLine) => send({ type: "focus", file, startLine, endLine })
   );
 

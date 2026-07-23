@@ -102,6 +102,39 @@ export const CHIPS = [
   "Redis vs Kafka for our events?",
 ];
 
+// Every fixed line Forge can speak, in one place: they're primed into the
+// audio cache at join so acks and fallbacks play instantly, forever.
+const ACK_INVITED = "Sure — give me a moment to pull this together.";
+const ACKS = [
+  "Got it — let me dig in.",
+  "On it — one moment.",
+  "Good question — let me check the repo.",
+];
+const LINE_EMPTY = "Hmm, I came up empty on that one — mind rephrasing?";
+const LINE_NO_BACKEND = "I can't reach my backend brain right now — is the server still running?";
+const LINE_DROPPED = "Dropped everything — back to you.";
+const LINE_BACK_TO_YOU = "Sure — back to you.";
+const LINE_BOARD_CLEAN = "Board's clean.";
+const LINE_ISSUE_START = "On it — I'll dig through the repo and file that issue. Give me a minute.";
+const PRIMED_LINES = [...ACKS, ACK_INVITED, LINE_BACK_TO_YOU, LINE_DROPPED, LINE_EMPTY, LINE_NO_BACKEND, LINE_BOARD_CLEAN, LINE_ISSUE_START];
+
+/** Split a line into chunks safely under Chrome's ~15s utterance cutoff
+ * (speechSynthesis silently stops long utterances partway). */
+function splitSpeakable(text: string): string[] {
+  const sentences = text.match(/[^.!?]+[.!?]+["']?\s*|\S[^.!?]*$/g) ?? [text];
+  const chunks: string[] = [];
+  let cur = "";
+  for (const s of sentences) {
+    if (cur && cur.length + s.length > 190) {
+      chunks.push(cur.trim());
+      cur = "";
+    }
+    cur += s;
+  }
+  if (cur.trim()) chunks.push(cur.trim());
+  return chunks.length ? chunks : [text];
+}
+
 type UtteranceSource = "voice" | "typed" | "ptt";
 
 export class ForgeSession {
@@ -115,11 +148,32 @@ export class ForgeSession {
   private cancelled = false;
   private audioCtx: AudioContext | null = null;
 
-  private currentAudio: HTMLAudioElement | null = null;
+  /** Monotonic barge-in epoch: every cancel bumps it, and any queued line or
+   * in-flight playback tier that captured an older value dies instantly and
+   * silently. This is THE cancellation signal for the voice-output stack. */
+  private speechEpoch = 0;
+  /** One reusable element for every streamed line. A fresh Audio per line
+   * leaks WebMediaPlayers until Chrome refuses to create more (~75) and Forge
+   * goes permanently mute for the rest of a long meeting. */
+  private sharedAudio: HTMLAudioElement | null = null;
+  /** Live volume control for the Web Audio (decoded clip) path. */
+  private webAudioGain: GainNode | null = null;
+  /** Stops the live Web Audio clip on barge-in. */
+  private webAudioStop: (() => void) | null = null;
+  /** Encoded mp3 clips keyed by raw line text — primed lines play with zero
+   * network round trips. Encoded, not decoded: ~24 entries stay ~2 MB. */
+  private ttsClipCache = new Map<string, ArrayBuffer>();
+  private primeQueue: string[] = [];
+  private primeInFlight = new Set<string>();
+  private primeActive = 0;
+  /** ElevenLabs circuit breaker: after two straight total failures, lines go
+   * directly to browser TTS (no per-line timeout tax) until it re-probes. */
+  private elevenFailures = 0;
+  private elevenDownUntil = 0;
   private currentTtsAbort: AbortController | null = null;
-  /** Settles the in-flight ElevenLabs playback promise on barge-in — a paused
-   * audio element never fires "ended", which would leave the speech chain
-   * (and the whole run's cleanup) hanging until the watchdog. */
+  /** Settles the in-flight playback promise on barge-in — a paused audio
+   * element never fires "ended", which would leave the speech chain (and the
+   * whole run's cleanup) hanging until a watchdog. */
   private currentTtsFinish: (() => void) | null = null;
   private agentAbort: AbortController | null = null;
 
@@ -395,7 +449,7 @@ export class ForgeSession {
     return false;
   }
 
-  // ---------- voice output: ElevenLabs first, browser TTS fallback ----------
+  // ---------- voice output: tiered delivery, epoch-based barge-in ----------
   private pickVoice(): SpeechSynthesisVoice | null {
     if (this.cachedVoice) return this.cachedVoice;
     const vs = speechSynthesis.getVoices();
@@ -408,10 +462,39 @@ export class ForgeSession {
     return this.cachedVoice;
   }
 
-  private browserSpeak(text: string): Promise<void> {
+  // Voice is delivered through tiers, most capable first, each with its own
+  // progress watchdog:
+  //   0  in-memory clip cache → Web Audio   (instant — primed lines)
+  //   1  ElevenLabs stream → MediaSource    (lowest latency to first word)
+  //   2  ElevenLabs buffered → Web Audio    (autoplay-proof, Safari-safe)
+  //   3  browser speechSynthesis            (always available)
+  // A tier that produced real audio (>0.6s) is never re-spoken by a lower
+  // tier — a mid-line failure skips the remainder rather than repeating it.
+
+  private browserSpeak(text: string, epoch = this.speechEpoch): Promise<void> {
+    // Chrome quirks live here: cancel() clears a wedged queue but a speak()
+    // right after is sometimes dropped (hence the beat of delay), and long
+    // utterances stall silently unless resume() is poked periodically.
+    speechSynthesis.cancel();
+    return (async () => {
+      await delay(60);
+      for (const chunk of splitSpeakable(text)) {
+        if (epoch !== this.speechEpoch) return;
+        await this.browserSpeakChunk(chunk);
+      }
+    })();
+  }
+
+  private browserSpeakChunk(text: string): Promise<void> {
     return new Promise((resolve) => {
       let settled = false;
-      const done = () => { if (!settled) { settled = true; resolve(); } };
+      const done = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(cap);
+        clearInterval(heartbeat);
+        resolve();
+      };
       const u = new SpeechSynthesisUtterance(text);
       const v = this.pickVoice();
       if (v) u.voice = v;
@@ -422,95 +505,301 @@ export class ForgeSession {
       u.volume = useStore.getState().forgeVolume;
       u.onend = done;
       u.onerror = done;
-      speechSynthesis.speak(u);
-      setTimeout(done, text.split(/\s+/).length * 480 + 3500); // some browsers drop onend
+      const heartbeat = setInterval(() => { try { speechSynthesis.resume(); } catch { /* noop */ } }, 4_000);
+      const cap = setTimeout(done, text.split(/\s+/).length * 480 + 3_500); // some browsers drop onend
+      try { speechSynthesis.speak(u); } catch { done(); }
     });
   }
 
-  private async elevenSpeak(text: string): Promise<void> {
-    if (!("MediaSource" in window)) { return this.browserSpeak(text); }
+  private ensureSharedAudio(): HTMLAudioElement {
+    if (!this.sharedAudio) {
+      this.sharedAudio = new Audio();
+      this.sharedAudio.preload = "auto";
+    }
+    return this.sharedAudio;
+  }
+
+  /** Fully detach the element so Chrome releases its WebMediaPlayer now. */
+  private releaseSharedAudio(): void {
+    const a = this.sharedAudio;
+    if (!a) return;
+    try { a.pause(); } catch { /* noop */ }
+    a.removeAttribute("src");
+    try { a.load(); } catch { /* noop */ }
+  }
+
+  private ensureGain(): GainNode | null {
+    const ac = this.audioCtx;
+    if (!ac) return null;
+    if (!this.webAudioGain) {
+      this.webAudioGain = ac.createGain();
+      this.webAudioGain.connect(ac.destination);
+    }
+    this.webAudioGain.gain.value = useStore.getState().forgeVolume;
+    return this.webAudioGain;
+  }
+
+  private async resumeAudioCtx(): Promise<void> {
+    const ac = this.audioCtx;
+    if (!ac || ac.state !== "suspended") return;
+    // resume() can hang forever without a user gesture — don't let it block
+    // the line; the caller checks state and falls through to another tier.
+    try { await Promise.race([ac.resume(), delay(800)]); } catch { /* still suspended */ }
+  }
+
+  private storeClip(text: string, buf: ArrayBuffer): void {
+    this.ttsClipCache.delete(text);
+    this.ttsClipCache.set(text, buf);
+    while (this.ttsClipCache.size > 24) {
+      const oldest = this.ttsClipCache.keys().next().value;
+      if (oldest === undefined) break;
+      this.ttsClipCache.delete(oldest);
+    }
+  }
+
+  /** Fetch the full mp3 for a line (the server's cache makes repeats cheap). */
+  private async fetchClip(text: string, timeoutMs = 6_500): Promise<ArrayBuffer> {
+    const hit = this.ttsClipCache.get(text);
+    if (hit) return hit;
+    const ctrl = new AbortController();
+    this.currentTtsAbort = ctrl;
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    try {
+      const res = await apiFetch(`${API}/api/tts`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text }), signal: ctrl.signal,
+      });
+      if (!res.ok) throw new Error(`tts ${res.status}`);
+      const buf = await res.arrayBuffer();
+      this.storeClip(text, buf);
+      return buf;
+    } finally {
+      clearTimeout(timer);
+      if (this.currentTtsAbort === ctrl) this.currentTtsAbort = null;
+    }
+  }
+
+  // ----- priming: warm lines end-to-end (server synth + local clip cache) so
+  // playback later starts with zero round trips. Fire-and-forget, two at a
+  // time so a burst of steps can't hog ElevenLabs concurrency slots.
+
+  private primeTts(texts: string[]): void {
+    if (!this.health.tts) return;
+    for (const raw of texts) {
+      const text = (raw || "").trim();
+      if (!text || this.ttsClipCache.has(text) || this.primeInFlight.has(text)) continue;
+      if (this.primeQueue.length >= 24) break;
+      this.primeInFlight.add(text);
+      this.primeQueue.push(text);
+    }
+    this.drainPrime();
+  }
+
+  private drainPrime(): void {
+    while (this.primeActive < 2 && this.primeQueue.length) {
+      const text = this.primeQueue.shift()!;
+      this.primeActive++;
+      void this.primeOne(text).finally(() => {
+        this.primeActive--;
+        this.primeInFlight.delete(text);
+        this.drainPrime();
+      });
+    }
+  }
+
+  private async primeOne(text: string): Promise<void> {
+    try {
+      const res = await apiFetch(`${API}/api/tts`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+      });
+      if (res.ok) this.storeClip(text, await res.arrayBuffer());
+    } catch { /* best-effort — the live path has its own fallbacks */ }
+  }
+
+  // ----- tier 0/2: decoded clip through Web Audio (autoplay-proof; volume
+  // follows the live gain node). Resolves with what actually played — never
+  // rejects.
+
+  private async playDecoded(encoded: ArrayBuffer, epoch: number): Promise<{ ok: boolean; audibleMs: number }> {
+    const ac = this.audioCtx;
+    const gain = this.ensureGain();
+    if (!ac || !gain) return { ok: false, audibleMs: 0 };
+    await this.resumeAudioCtx();
+    if (epoch !== this.speechEpoch) return { ok: true, audibleMs: 0 };
+    if (ac.state !== "running") return { ok: false, audibleMs: 0 };
+    let clip: AudioBuffer;
+    try {
+      // decodeAudioData detaches its input — hand it a copy so the clip
+      // cache can replay this line later.
+      clip = await ac.decodeAudioData(encoded.slice(0));
+    } catch {
+      return { ok: false, audibleMs: 0 };
+    }
+    if (epoch !== this.speechEpoch) return { ok: true, audibleMs: 0 };
+    return new Promise((resolve) => {
+      const src = ac.createBufferSource();
+      src.buffer = clip;
+      src.connect(gain);
+      const startedAt = Date.now();
+      let settled = false;
+      const settle = (ok: boolean) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(cap);
+        if (this.webAudioStop === stop) this.webAudioStop = null;
+        if (this.currentTtsFinish === stop) this.currentTtsFinish = null;
+        try { src.disconnect(); } catch { /* noop */ }
+        resolve({ ok, audibleMs: Math.min(Date.now() - startedAt, clip.duration * 1000) });
+      };
+      const stop = () => {
+        try { src.stop(); } catch { /* not started yet */ }
+        settle(true);
+      };
+      this.webAudioStop = stop;
+      this.currentTtsFinish = stop;
+      src.onended = () => settle(true);
+      const cap = setTimeout(() => settle(true), clip.duration * 1000 + 2_500);
+      try { src.start(); } catch { settle(false); }
+    });
+  }
+
+  // ----- tier 1: ElevenLabs streamed through MediaSource. A 400ms progress
+  // watchdog replaces the old 15s blanket timeout: silence is detected in
+  // under 4s and handed to the next tier instead of being skipped, and a
+  // finished-but-unnoticed line is reaped in 3s, not 15.
+
+  private playElevenStream(text: string): Promise<{ ok: boolean; audibleMs: number }> {
+    if (!("MediaSource" in window) || !MediaSource.isTypeSupported("audio/mpeg")) {
+      return Promise.resolve({ ok: false, audibleMs: 0 });
+    }
+    const a = this.ensureSharedAudio();
+    a.volume = useStore.getState().forgeVolume;
     const ms = new MediaSource();
     const url = URL.createObjectURL(ms);
-    const a = new Audio(url);
-    a.volume = useStore.getState().forgeVolume;
-    this.currentAudio = a;
-    const abortCtrl = new AbortController();
-    this.currentTtsAbort = abortCtrl;
-    return new Promise<void>((resolve, reject) => {
+    const ctrl = new AbortController();
+    this.currentTtsAbort = ctrl;
+    const words = text.split(/\s+/).length;
+
+    return new Promise((resolve) => {
       let settled = false;
-      // Single-voice invariant: however this line ends — naturally, watchdog,
-      // stream failure — the audio element must STOP before the next line (or
-      // the browser-TTS fallback) starts, or two voices overlap as gibberish.
-      const stopAudio = () => { try { a.pause(); } catch { /* noop */ } };
-      const finish = () => {
+      let netDone = false;
+      let netFailed = false;
+      let sb: SourceBuffer | null = null;
+      const pending: ArrayBuffer[] = [];
+      let appending = false;
+      const startedAt = Date.now();
+      let lastTime = 0;
+      let lastProgressAt = startedAt;
+
+      const settle = (ok: boolean) => {
         if (settled) return;
         settled = true;
-        clearTimeout(watchdog);
-        stopAudio();
-        resolve();
+        clearInterval(watchdog);
+        const audibleMs = Math.round(a.currentTime * 1000); // read BEFORE detach resets it
+        a.removeEventListener("ended", onEnded);
+        a.removeEventListener("error", onError);
+        this.releaseSharedAudio();
+        URL.revokeObjectURL(url);
+        ctrl.abort(); // the server keeps synthesizing into its cache regardless
+        if (this.currentTtsAbort === ctrl) this.currentTtsAbort = null;
+        if (this.currentTtsFinish === finishNow) this.currentTtsFinish = null;
+        resolve({ ok, audibleMs });
       };
-      this.currentTtsFinish = finish;
-      const fail = (err: unknown) => {
+      const finishNow = () => settle(true); // barge-in: the line is over, no fallback
+      this.currentTtsFinish = finishNow;
+      const onEnded = () => settle(true);
+      const onError = () => settle(a.currentTime > 0.6);
+      a.addEventListener("ended", onEnded);
+      a.addEventListener("error", onError);
+
+      const endStreamIfDrained = () => {
+        if (settled || !netDone || !sb || sb.updating || pending.length) return;
+        try { if (ms.readyState === "open") ms.endOfStream(); } catch { /* already closed */ }
+      };
+      const drain = () => {
+        if (settled || !sb || appending || sb.updating || !pending.length) { endStreamIfDrained(); return; }
+        appending = true;
+        try { sb.appendBuffer(pending.shift()!); } catch { appending = false; settle(a.currentTime > 0.6); }
+      };
+
+      ms.addEventListener("sourceopen", () => {
         if (settled) return;
-        settled = true;
-        clearTimeout(watchdog);
-        stopAudio();
-        if (abortCtrl.signal.aborted) resolve();
-        else reject(err instanceof Error ? err : new Error(String(err)));
-      };
-      // Every Forge line on every client sits behind the speech chain — if this
-      // promise never settles (blocked autoplay, stalled stream), that client
-      // goes permanently silent while the other participant keeps hearing
-      // Forge fine. The watchdog guarantees the chain always moves on.
-      const watchdog = setTimeout(finish, Math.max(15_000, text.split(/\s+/).length * 700 + 8_000));
-      ms.addEventListener("sourceopen", async () => {
-        let sb: SourceBuffer;
-        try { sb = ms.addSourceBuffer("audio/mpeg"); } catch { finish(); return; }
-        const queue: ArrayBuffer[] = [];
-        let appending = false;
-        const drain = () => {
-          if (appending || !queue.length) return;
-          if (sb.updating) { sb.addEventListener("updateend", drain, { once: true }); return; }
-          appending = true;
-          sb.appendBuffer(queue.shift()!);
-        };
-        sb.addEventListener("updateend", () => { appending = false; drain(); });
+        let buf: SourceBuffer;
+        try { buf = ms.addSourceBuffer("audio/mpeg"); } catch { settle(false); return; }
+        sb = buf;
+        buf.addEventListener("updateend", () => { appending = false; drain(); });
+        // A blocked play() would mean nobody ever hears this line — the
+        // watchdog notices zero progress and hands it down a tier fast.
+        void a.play().catch(() => { if (a.currentTime < 0.3) settle(false); });
+        drain();
+      }, { once: true });
+
+      // The fetch starts immediately — not gated on sourceopen — so the first
+      // audio bytes are usually waiting by the time the SourceBuffer exists.
+      void (async () => {
         try {
           const res = await apiFetch(`${API}/api/tts/stream`, {
             method: "POST", headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ text }), signal: abortCtrl.signal,
+            body: JSON.stringify({ text }), signal: ctrl.signal,
           });
-          if (!res.ok) throw new Error(`tts/stream ${res.status}`);
-          const reader = res.body!.getReader();
-          // A blocked play() means nobody would ever hear this line — fail
-          // fast so the caller falls back to browser TTS instead of silence.
-          a.play().catch((err) => fail(err));
+          if (!res.ok || !res.body) throw new Error(`tts/stream ${res.status}`);
+          const reader = res.body.getReader();
           for (;;) {
             const { done, value } = await reader.read();
             if (done) break;
-            queue.push(value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength));
-            drain();
+            if (settled) { void reader.cancel().catch(() => { /* noop */ }); return; }
+            if (value?.length) {
+              pending.push(value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength));
+              drain();
+            }
           }
-          // Wait for buffer to drain then end stream
-          await new Promise<void>(r => {
-            const check = () => { if (settled || (!sb.updating && !queue.length)) r(); else setTimeout(check, 50); };
-            check();
-          });
-          if (!settled && ms.readyState === "open") ms.endOfStream();
-        } catch (err) {
-          fail(err);
-          return;
+          netDone = true;
+          endStreamIfDrained();
+        } catch {
+          netFailed = true; // the watchdog decides — fall back only if nothing audible yet
         }
-        a.addEventListener("ended", finish, { once: true });
-        a.addEventListener("error", finish, { once: true });
-      });
-      a.addEventListener("error", finish, { once: true });
-    }).finally(() => {
-      URL.revokeObjectURL(url);
-      this.currentAudio = null;
-      this.currentTtsAbort = null;
-      this.currentTtsFinish = null;
+      })();
+
+      a.src = url;
+
+      const watchdog = setInterval(() => {
+        if (settled) return;
+        const now = Date.now();
+        const t = a.currentTime;
+        if (t - lastTime > 0.01) { lastTime = t; lastProgressAt = now; }
+        const started = t > 0.05;
+        if (!started && netFailed) { settle(false); return; } // dead stream, nothing heard yet
+        if (!started && now - startedAt > 3_800) { settle(false); return; } // autoplay / MSE wedge
+        if (started && a.ended) { settle(true); return; } // missed "ended" event
+        if (started && netFailed && now - lastProgressAt > 2_000) { settle(t > 0.6); return; } // stream broke — played what arrived
+        if (started && now - lastProgressAt > (netDone ? 3_000 : 8_000)) { settle(t > 0.6); return; }
+        if (now - startedAt > 12_000 + words * 600) { settle(t > 0.6); return; } // absolute cap
+      }, 400);
     });
+  }
+
+  /** ElevenLabs playback: clip cache, then MSE stream, then buffered Web
+   * Audio. "delivered" also covers a barge-in or a mid-line failure after
+   * real audio played — those must NOT be re-spoken by the browser tier. */
+  private async playEleven(text: string, epoch: number): Promise<"delivered" | "failed" | "cancelled"> {
+    const cached = this.ttsClipCache.get(text);
+    if (cached) {
+      const r = await this.playDecoded(cached, epoch);
+      if (epoch !== this.speechEpoch) return "cancelled";
+      if (r.ok || r.audibleMs > 600) return "delivered";
+    }
+    const s = await this.playElevenStream(text);
+    if (epoch !== this.speechEpoch) return "cancelled";
+    if (s.ok || s.audibleMs > 600) return "delivered";
+    try {
+      const buf = await this.fetchClip(text);
+      if (epoch !== this.speechEpoch) return "cancelled";
+      const r = await this.playDecoded(buf, epoch);
+      if (epoch !== this.speechEpoch) return "cancelled";
+      if (r.ok || r.audibleMs > 600) return "delivered";
+    } catch { /* fetch failed or timed out — the browser tier takes it */ }
+    return "failed";
   }
 
   // All speech goes through a chain so concurrent callers (ack line, agent
@@ -518,13 +807,18 @@ export class ForgeSession {
   private speechChain: Promise<void> = Promise.resolve();
 
   private speak(text: string): Promise<void> {
-    const run = this.speechChain.then(() => this.speakNow(text));
+    // The epoch is captured at enqueue time: a barge-in that lands before
+    // this line's turn kills it without a sound.
+    const epoch = this.speechEpoch;
+    const run = this.speechChain.then(() => this.speakNow(text, epoch));
     this.speechChain = run.catch(() => {});
     return run;
   }
 
-  /** Pronunciation + cleanup applied ONLY to the audio path — captions and
-   * the transcript keep the real spelling. */
+  /** Pronunciation + cleanup for the BROWSER voice and the self-echo filter —
+   * captions and the transcript keep the real spelling. Mirrors
+   * pronounceForTts() in backend/src/lib/tts.ts (which owns the ElevenLabs
+   * path) — keep the two in sync so prewarmed cache keys match. */
   private ttsText(text: string): string {
     return text
       .replace(/\bEfe\b/gi, "F-e")
@@ -540,7 +834,8 @@ export class ForgeSession {
       .trim();
   }
 
-  private async speakNow(text: string): Promise<void> {
+  private async speakNow(text: string, epoch: number): Promise<void> {
+    if (epoch !== this.speechEpoch) return; // barged-in while queued
     if (this.cancelled && this.agentBusy) return; // skip queued lines after a barge-in
     const spoken = this.ttsText(text);
     this.noteForgeLine(text); // remember it BEFORE the mic can hear it
@@ -548,22 +843,41 @@ export class ForgeSession {
     this.ttsSpeaking = true;
     useStore.setState({ orbSpeaking: true, listeningActive: false });
     try {
-      if (!this.health.tts || this.cancelled) throw new Error("tts off");
-      await this.elevenSpeak(spoken);
-    } catch {
-      if (!this.cancelled) await this.browserSpeak(spoken);
+      let outcome: "delivered" | "failed" | "cancelled" = "failed";
+      if (this.health.tts && Date.now() >= this.elevenDownUntil) {
+        // The server applies its own pronunciation pass — send the raw line
+        // so cache keys match the audio the agent prewarmed.
+        outcome = await this.playEleven(text, epoch);
+        if (outcome === "delivered") {
+          this.elevenFailures = 0;
+        } else if (outcome === "failed") {
+          this.elevenFailures++;
+          if (this.elevenFailures >= 2) this.elevenDownUntil = Date.now() + 45_000;
+        }
+      }
+      if (outcome === "failed" && epoch === this.speechEpoch) {
+        await this.browserSpeak(spoken, epoch);
+      }
+    } finally {
+      // ALWAYS runs — a playback bug can cost one line, never the whole
+      // meeting (orbSpeaking/ttsSpeaking stuck true = Forge deaf and mute).
+      this.ttsSpeaking = false;
+      this.ttsTailUntil = Date.now() + 2_000;
+      useStore.setState({ orbSpeaking: false });
+      setTimeout(() => this.startRecog(), 300);
     }
-    this.ttsSpeaking = false;
-    this.ttsTailUntil = Date.now() + 2_000;
-    useStore.setState({ orbSpeaking: false });
-    setTimeout(() => this.startRecog(), 300);
   }
 
   private cancelSpeech(): void {
+    // New epoch first: every queued line and in-flight tier dies now.
+    this.speechEpoch++;
     speechSynthesis.cancel();
     this.currentTtsAbort?.abort();
-    if (this.currentAudio) { try { this.currentAudio.pause(); } catch { /* noop */ } this.currentAudio = null; }
-    this.currentTtsFinish?.(); // settle the playback promise NOW, not at the watchdog
+    this.currentTtsAbort = null;
+    this.webAudioStop?.(); // stops the Web Audio clip and settles its promise
+    this.currentTtsFinish?.(); // settle the playback promise NOW, not at a watchdog
+    this.currentTtsFinish = null;
+    this.releaseSharedAudio();
   }
 
   // ---------- speech recognition ----------
@@ -703,13 +1017,8 @@ export class ForgeSession {
   // ---------- the agent ----------
   /** The ack line every run opens with — receipt is never in doubt. */
   private ackFor(invited: boolean): string {
-    if (invited) return "Sure — give me a moment to pull this together.";
-    const acks = [
-      "Got it — let me dig in.",
-      "On it — one moment.",
-      "Good question — let me check the repo.",
-    ];
-    return acks[Math.floor(Math.random() * acks.length)];
+    if (invited) return ACK_INVITED;
+    return ACKS[Math.floor(Math.random() * ACKS.length)];
   }
 
   /** Hold a prepared answer until the team gives Forge the floor — but never
@@ -779,32 +1088,49 @@ export class ForgeSession {
       const dec = new TextDecoder();
       let buf = "";
       const preparedSteps: AgentStep[] = [];
-      outer: for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buf += dec.decode(value, { stream: true });
-        const lines = buf.split("\n");
-        buf = lines.pop() ?? "";
-        for (const line of lines) {
-          if (!line.trim()) continue;
-          let msg: StreamMsg;
-          try { msg = JSON.parse(line) as StreamMsg; } catch { continue; }
-          if (msg.type === "tool") {
-            const t = msg as { type: "tool"; name: string; input: string };
-            this.traceLine(`\uD83D\uDD0D ${t.name}: ${t.input.slice(0, 80)}`);
-          } else if (msg.type === "step") {
-            // A parsed step is not a finished answer \u2014 steps are buffered and
-            // played after "done", so the stage stays "working" until then.
-            preparedSteps.push(msg);
-          } else if (msg.type === "done") {
-            break outer;
-          } else if (msg.type === "error") {
-            // The backend follows an error event with a spoken fallback step.
-            // Keep reading instead of discarding that useful recovery message.
-            continue;
-          }
-          if (this.cancelled) { try { void reader.cancel(); } catch { /* noop */ } break outer; }
+      // Stall guard: a wedged backend stream used to spin "working\u2026" forever
+      // until someone clicked cancel. If nothing arrives for 90s, cut it
+      // loose \u2014 the catch path speaks and the task resolves on its own.
+      let lastEventAt = Date.now();
+      const stallGuard = setInterval(() => {
+        if (Date.now() - lastEventAt > 90_000) {
+          this.traceLine("\u26A0 backend stream went quiet \u2014 cutting it loose");
+          this.agentAbort?.abort();
         }
+      }, 5_000);
+      try {
+        outer: for (;;) {
+          const { done, value } = await reader.read();
+          lastEventAt = Date.now();
+          if (done) break;
+          buf += dec.decode(value, { stream: true });
+          const lines = buf.split("\n");
+          buf = lines.pop() ?? "";
+          for (const line of lines) {
+            if (!line.trim()) continue;
+            let msg: StreamMsg;
+            try { msg = JSON.parse(line) as StreamMsg; } catch { continue; }
+            if (msg.type === "tool") {
+              const t = msg as { type: "tool"; name: string; input: string };
+              this.traceLine(`\uD83D\uDD0D ${t.name}: ${t.input.slice(0, 80)}`);
+            } else if (msg.type === "step") {
+              // A parsed step is not a finished answer \u2014 steps are buffered and
+              // played after "done", so the stage stays "working" until then.
+              // Prime its audio now: by playback it's already local + decoded.
+              preparedSteps.push(msg);
+              this.primeTts([msg.say]);
+            } else if (msg.type === "done") {
+              break outer;
+            } else if (msg.type === "error") {
+              // The backend follows an error event with a spoken fallback step.
+              // Keep reading instead of discarding that useful recovery message.
+              continue;
+            }
+            if (this.cancelled) { try { void reader.cancel(); } catch { /* noop */ } break outer; }
+          }
+        }
+      } finally {
+        clearInterval(stallGuard);
       }
 
       // Play whatever arrived — even if the stream died before its "done"
@@ -830,18 +1156,16 @@ export class ForgeSession {
           await this.playStep(step, true);
         }
       } else if (!this.cancelled) {
-        const line = "Hmm, I came up empty on that one — mind rephrasing?";
-        this.caption("Forge", line, true);
-        this.transcript("Forge", line);
-        await this.speak(line);
+        this.caption("Forge", LINE_EMPTY, true);
+        this.transcript("Forge", LINE_EMPTY);
+        await this.speak(LINE_EMPTY);
       }
     } catch {
       this.setTask(this.activeTaskId, { status: this.cancelled ? "cancelled" : "error" });
       if (!this.cancelled) {
-        const line = "I can't reach my backend brain right now — is the server still running?";
-        this.caption("Forge", line, true);
-        this.transcript("Forge", line);
-        await this.speak(line);
+        this.caption("Forge", LINE_NO_BACKEND, true);
+        this.transcript("Forge", LINE_NO_BACKEND);
+        await this.speak(LINE_NO_BACKEND);
       }
     } finally {
       this.setTask(this.activeTaskId, { status: this.cancelled ? "cancelled" : "done" });
@@ -936,21 +1260,39 @@ export class ForgeSession {
   // reporting progress through the task registry and speaking only their
   // start and outcome.
 
-  /** Read a streamed NDJSON response, invoking onMsg per parsed line. */
-  private async readNdjson(res: Response, onMsg: (msg: Record<string, unknown>) => void): Promise<void> {
+  /** Read a streamed NDJSON response, invoking onMsg per parsed line. When
+   * stallMs is set and the stream goes silent that long, it's cancelled —
+   * the caller's "no result" error path resolves the task instead of it
+   * spinning forever until someone clicks cancel. */
+  private async readNdjson(
+    res: Response,
+    onMsg: (msg: Record<string, unknown>) => void,
+    stallMs?: number
+  ): Promise<void> {
     const reader = res.body!.getReader();
     const dec = new TextDecoder();
     let buf = "";
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buf += dec.decode(value, { stream: true });
-      const lines = buf.split("\n");
-      buf = lines.pop() ?? "";
-      for (const line of lines) {
-        if (!line.trim()) continue;
-        try { onMsg(JSON.parse(line) as Record<string, unknown>); } catch { /* junk line */ }
+    let lastByteAt = Date.now();
+    const guard = stallMs
+      ? setInterval(() => {
+          if (Date.now() - lastByteAt > stallMs) void reader.cancel().catch(() => { /* noop */ });
+        }, 5_000)
+      : undefined;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        lastByteAt = Date.now();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        const lines = buf.split("\n");
+        buf = lines.pop() ?? "";
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try { onMsg(JSON.parse(line) as Record<string, unknown>); } catch { /* junk line */ }
+        }
       }
+    } finally {
+      clearInterval(guard);
     }
   }
 
@@ -985,7 +1327,7 @@ export class ForgeSession {
     const context = useStore.getState().transcript
       .filter((line) => line.who !== "Forge" && line.text !== command)
       .slice(-12);
-    void this.speakLine("On it — I'll dig through the repo and file that issue. Give me a minute.");
+    void this.speakLine(LINE_ISSUE_START);
     try {
       const res = await apiFetch(`${API}/api/github/issues`, {
         method: "POST",
@@ -1001,7 +1343,7 @@ export class ForgeSession {
         else if (msg.type === "tool") this.taskTrace(task.id, `🔍 ${msg.name}: ${String(msg.input ?? "").slice(0, 80)}`);
         else if (msg.type === "issue") issue = msg as typeof issue;
         else if (msg.type === "error") errorMsg = String(msg.message ?? "issue creation failed");
-      });
+      }, 180_000);
       if (!issue) throw new Error(errorMsg ?? "issue creation failed");
       const done: { html_url?: string; number?: number; title?: string; duplicate?: boolean } = issue;
       this.lastIssueNumber = done.number ?? this.lastIssueNumber;
@@ -1051,7 +1393,7 @@ export class ForgeSession {
         else if (msg.type === "tool") this.taskTrace(task.id, `🛠 ${msg.name}: ${String(msg.input ?? "").slice(0, 80)}`);
         else if (msg.type === "pr") pr = msg as typeof pr;
         else if (msg.type === "error") errorMsg = String(msg.message ?? "implementation failed");
-      });
+      }, 300_000);
       if (!pr) throw new Error(errorMsg ?? "implementation failed");
       const done: { html_url?: string; number?: number; branch?: string; created?: boolean } = pr;
       this.setTask(task.id, { status: "done", label: `PR #${done.number} for issue ${number}` });
@@ -1087,8 +1429,8 @@ export class ForgeSession {
 
     if (CANCEL_ALL.test(text)) {
       this.cancelAgent(true);
-      this.caption("Forge", "Dropped everything — back to you.");
-      void this.speak("Dropped everything — back to you.");
+      this.caption("Forge", LINE_DROPPED);
+      void this.speak(LINE_DROPPED);
       return;
     }
     if (this.isStopCommand(text)) {
@@ -1096,7 +1438,7 @@ export class ForgeSession {
       // and start after a beat (cancelAgent drains the queue).
       const wasActive = this.agentBusy || this.remoteAgentActive || this.ttsSpeaking;
       this.cancelAgent();
-      if (!wasActive) { this.caption("Forge", "Sure — back to you."); void this.speak("Sure — back to you."); }
+      if (!wasActive) { this.caption("Forge", LINE_BACK_TO_YOU); void this.speak(LINE_BACK_TO_YOU); }
       return;
     }
     if (CLEAR.test(text)) {
@@ -1105,8 +1447,8 @@ export class ForgeSession {
       this.boardOps = [];
       this.boardMoves = [];
       this.room?.cast({ k: "board-clear" });
-      this.caption("Forge", "Board's clean.");
-      void this.speak("Board's clean.");
+      this.caption("Forge", LINE_BOARD_CLEAN);
+      void this.speak(LINE_BOARD_CLEAN);
       return;
     }
     // "work on issue 3" — runs in the background; never holds the floor.
@@ -1492,6 +1834,9 @@ export class ForgeSession {
     if (!this.recog) this.caption("Forge", "Voice input needs Chrome — use the chat panel to ask me things.", true);
 
     await this.fetchHealth();
+    // Warm every fixed line Forge can say (acks, fallbacks, barge-in
+    // replies): after this they play instantly, from memory, forever.
+    this.primeTts(PRIMED_LINES);
     // Uninitialized meeting: point people at the picker instead of leaving
     // them to ask questions into a repo-less void.
     if (this.health.ok && !this.health.repo) {
@@ -1577,7 +1922,8 @@ export class ForgeSession {
     const vol = Math.min(1, Math.max(0, v));
     useStore.setState({ forgeVolume: vol });
     try { localStorage.setItem("forge-volume", String(vol)); } catch { /* private mode */ }
-    if (this.currentAudio) this.currentAudio.volume = vol;
+    if (this.sharedAudio) this.sharedAudio.volume = vol;
+    if (this.webAudioGain) this.webAudioGain.gain.value = vol;
   }
 
   /** Remote peer's volume — Tiles applies it to the peer video element. */
@@ -1810,6 +2156,7 @@ export class ForgeSession {
     this.recogWanted = false;
     this.stopRecog();
     this.cancelSpeech();
+    this.primeQueue.length = 0; // no point warming audio for an ended meeting
     this.agentAbort?.abort();
     this.walkthroughAbort?.abort();
     this.stream?.getTracks().forEach((t) => t.stop());

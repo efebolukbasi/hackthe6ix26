@@ -11,7 +11,7 @@ import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
 import { buildDigest } from "./lib/repo.ts";
 import { respond, listen, setRepoContext, getRepoCwd, getRepoSlug, walkthrough, createIssueFlow, implementIssueFlow } from "./lib/agent.ts";
-import { synthesize, synthesizeStream, ttsEnabled } from "./lib/tts.ts";
+import { openTts, synthesize, ttsEnabled, type TtsError } from "./lib/tts.ts";
 import { activeModelName, llmMode, setActiveModel } from "./lib/llm.ts";
 import { attachRoom, castToRoom } from "./lib/room.ts";
 import * as github from "./lib/github.ts";
@@ -232,20 +232,29 @@ app.post("/api/tts/stream", async (req: Request, res: Response) => {
   const text = String(body?.text || "").slice(0, 900);
   if (!text) return res.status(400).json({ error: "no text" });
   try {
-    const upstream = await synthesizeStream(text);
-    res.set("Content-Type", "audio/mpeg");
-    const reader = upstream.body!.getReader();
-    const pump = async (): Promise<void> => {
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) { res.end(); return; }
-        res.write(Buffer.from(value));
+    const { cached, job } = openTts(text);
+    if (cached) {
+      res.set("Content-Type", "audio/mpeg").send(cached);
+      return;
+    }
+    // Headers wait for the first audio byte: an upstream failure before any
+    // output becomes a real error status the client reacts to instantly,
+    // instead of an empty 200 it would stall on.
+    let closed = false;
+    res.on("close", () => { closed = true; });
+    try {
+      for await (const chunk of job!.stream()) {
+        if (closed || res.writableEnded) return; // client gone — job lives on for peers + cache
+        if (!res.headersSent) res.writeHead(200, { "Content-Type": "audio/mpeg", "Cache-Control": "no-store" });
+        res.write(chunk);
       }
-    };
-    res.on("close", () => reader.cancel());
-    await pump();
+      res.end();
+    } catch (err) {
+      if (res.headersSent) { res.end(); return; } // truncated audio — the client's stall guard recovers
+      throw err;
+    }
   } catch (err) {
-    const status = (err as { status?: number }).status || 502;
+    const status = (err as TtsError).status || 502;
     res.status(status).json({ error: err instanceof Error ? err.message : String(err) });
   }
 });
