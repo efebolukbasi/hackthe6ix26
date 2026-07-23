@@ -237,6 +237,66 @@ type ThinkingBlock = { type: "thinking"; thinking: string; signature?: string };
 type RedactedThinkingBlock = { type: "redacted_thinking"; data: string };
 type ContentBlock = TextBlock | ToolUseBlock | ThinkingBlock | RedactedThinkingBlock;
 
+type ChatMessage = { role: "user" | "assistant"; content: unknown };
+
+// ---------- prompt caching ----------
+// Caching is a prefix match over tools → system → messages, so both API loops
+// place exactly two breakpoints per request (the API allows four):
+//   1. on the system block — this also caches the tool definitions, which
+//      render BEFORE system in the prefix. The system prompt embeds the repo
+//      digest (up to 150K chars), the dominant token block of every call; it
+//      is byte-identical across calls, so this entry is shared by every turn
+//      of every question for the whole meeting.
+//   2. on the final content block of the final message — the moving
+//      conversation breakpoint. Each tool-loop turn then re-reads all prior
+//      turns at ~0.1x instead of reprocessing them at full price.
+// Markers are applied to shallow COPIES at request-build time; the live
+// conversation arrays stay marker-free, so the count is always exactly two
+// and stale markers can never accumulate past the limit. Prefixes under the
+// model's cacheable minimum (4096 tokens on Haiku 4.5) are silently left
+// uncached by the API — no error, no write premium — which makes it safe to
+// mark every call, including the tiny listen-classifier prompts.
+// NOTE: this only pays off while the system builders in prompt.ts stay
+// deterministic — a timestamp or random id in the system prompt would break
+// the prefix match on every call.
+const EPHEMERAL = { cache_control: { type: "ephemeral" } } as const;
+
+/** System prompt as a cacheable block (the breakpoint covers tools too). */
+function cachedSystem(text: string): unknown {
+  return [{ type: "text", text, ...EPHEMERAL }];
+}
+
+/** Copy of `messages` with the moving breakpoint on the newest block. User
+ * messages are always built as block arrays (never bare strings) so there is
+ * always a block to mark, from the very first turn. */
+function withConversationCache(messages: ChatMessage[]): ChatMessage[] {
+  const last = messages[messages.length - 1];
+  if (!last || !Array.isArray(last.content) || last.content.length === 0) return messages;
+  const blocks = last.content.slice();
+  blocks[blocks.length - 1] = { ...(blocks[blocks.length - 1] as Record<string, unknown>), ...EPHEMERAL };
+  return [...messages.slice(0, -1), { ...last, content: blocks }];
+}
+
+/** Token accounting streamed back per turn (message_start / message_delta). */
+interface TurnUsage {
+  input: number;
+  output: number;
+  cacheWrite: number;
+  cacheRead: number;
+}
+
+function addUsage(total: TurnUsage, turn: TurnUsage): void {
+  total.input += turn.input;
+  total.output += turn.output;
+  total.cacheWrite += turn.cacheWrite;
+  total.cacheRead += turn.cacheRead;
+}
+
+/** One line per brain call so cache savings stay visible in the server log. */
+function logUsage(label: string, turns: number, u: TurnUsage): void {
+  console.log(`  llm ${label}: ${turns} turn(s) · in ${u.input} · cache read ${u.cacheRead} · cache write ${u.cacheWrite} · out ${u.output}`);
+}
+
 /** One streamed assistant turn: text deltas go to onDelta as they arrive;
  * tool_use blocks are assembled from input_json_delta events. */
 async function apiTurn(
@@ -244,7 +304,7 @@ async function apiTurn(
   onDelta: (chunk: string) => void,
   onTool: ((name: string, input: string) => void) | undefined,
   signal: AbortSignal | undefined
-): Promise<{ blocks: ContentBlock[]; stopReason: string }> {
+): Promise<{ blocks: ContentBlock[]; stopReason: string; usage: TurnUsage }> {
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     signal,
@@ -260,6 +320,7 @@ async function apiTurn(
   const blocks = new Map<number, ContentBlock>();
   const partialJson = new Map<number, string>();
   let stopReason = "";
+  const usage: TurnUsage = { input: 0, output: 0, cacheWrite: 0, cacheRead: 0 };
   let buf = "";
   const reader = res.body!.getReader();
   const dec = new TextDecoder();
@@ -312,8 +373,14 @@ async function apiTurn(
             try { block.input = raw ? (JSON.parse(raw) as Record<string, unknown>) : {}; } catch { block.input = {}; }
             onTool?.(block.name, JSON.stringify(block.input));
           }
-        } else if (ev.type === "message_delta" && ev.delta?.stop_reason) {
-          stopReason = String(ev.delta.stop_reason);
+        } else if (ev.type === "message_delta") {
+          if (ev.delta?.stop_reason) stopReason = String(ev.delta.stop_reason);
+          if (ev.usage?.output_tokens != null) usage.output = Number(ev.usage.output_tokens) || 0;
+        } else if (ev.type === "message_start" && ev.message?.usage) {
+          const u = ev.message.usage;
+          usage.input = Number(u.input_tokens) || 0;
+          usage.cacheWrite = Number(u.cache_creation_input_tokens) || 0;
+          usage.cacheRead = Number(u.cache_read_input_tokens) || 0;
         }
       } catch {
         /* keep-alive lines etc. */
@@ -321,7 +388,7 @@ async function apiTurn(
     }
   }
   const ordered = [...blocks.entries()].sort((a, b) => a[0] - b[0]).map(([, block]) => block);
-  return { blocks: ordered, stopReason };
+  return { blocks: ordered, stopReason, usage };
 }
 
 async function apiStream({ system, prompt, maxTokens, onDelta, onTool, signal, tools, cwd, extraTools, maxTurns, model }: ApiStreamOptions): Promise<string> {
@@ -332,42 +399,51 @@ async function apiStream({ system, prompt, maxTokens, onDelta, onTool, signal, t
   ];
   const toolsOn = toolDefs.length > 0;
   const repoToolNames = new Set(REPO_TOOL_DEFS.map((d) => d.name));
-  const messages: unknown[] = [{ role: "user", content: prompt }];
+  const messages: ChatMessage[] = [{ role: "user", content: [{ type: "text", text: prompt }] }];
+  const systemBlocks = cachedSystem(system);
+  const spent: TurnUsage = { input: 0, output: 0, cacheWrite: 0, cacheRead: 0 };
+  let turns = 0;
   let full = "";
-  // Tool loop: run tools locally and hand results back until the model
-  // answers with text. The final turn disables tool use so exploration can't
-  // eat the whole budget and leave the meeting without a spoken answer.
-  for (let turn = 0; turn < maxTurns; turn++) {
-    const lastTurn = turn === maxTurns - 1;
-    const { blocks, stopReason } = await apiTurn(
-      {
-        ...modelParams(model),
-        max_tokens: maxTokens,
-        stream: true,
-        system,
-        messages,
-        ...(toolsOn ? { tools: toolDefs } : {}),
-        ...(toolsOn && lastTurn ? { tool_choice: { type: "none" } } : {}),
-      },
-      (t) => { full += t; onDelta(t); },
-      onTool,
-      signal
-    );
-    const toolUses = blocks.filter((b): b is ToolUseBlock => b.type === "tool_use");
-    if (!toolsOn || stopReason !== "tool_use" || toolUses.length === 0) return full;
-    messages.push({ role: "assistant", content: blocks });
-    const results = await Promise.all(
-      toolUses.map(async (t) => {
-        let content: string;
-        if (repoToolsOn && repoToolNames.has(t.name)) content = runRepoTool(cwd!, t.name, t.input);
-        else if (extraTools) content = await extraTools.run(t.name, t.input).catch((err) => `error: ${err instanceof Error ? err.message : String(err)}`);
-        else content = `error: unknown tool ${t.name}`;
-        return { type: "tool_result", tool_use_id: t.id, content };
-      })
-    );
-    messages.push({ role: "user", content: results });
+  try {
+    // Tool loop: run tools locally and hand results back until the model
+    // answers with text. The final turn disables tool use so exploration can't
+    // eat the whole budget and leave the meeting without a spoken answer.
+    for (let turn = 0; turn < maxTurns; turn++) {
+      const lastTurn = turn === maxTurns - 1;
+      const { blocks, stopReason, usage } = await apiTurn(
+        {
+          ...modelParams(model),
+          max_tokens: maxTokens,
+          stream: true,
+          system: systemBlocks,
+          messages: withConversationCache(messages),
+          ...(toolsOn ? { tools: toolDefs } : {}),
+          ...(toolsOn && lastTurn ? { tool_choice: { type: "none" } } : {}),
+        },
+        (t) => { full += t; onDelta(t); },
+        onTool,
+        signal
+      );
+      turns++;
+      addUsage(spent, usage);
+      const toolUses = blocks.filter((b): b is ToolUseBlock => b.type === "tool_use");
+      if (!toolsOn || stopReason !== "tool_use" || toolUses.length === 0) return full;
+      messages.push({ role: "assistant", content: blocks });
+      const results = await Promise.all(
+        toolUses.map(async (t) => {
+          let content: string;
+          if (repoToolsOn && repoToolNames.has(t.name)) content = runRepoTool(cwd!, t.name, t.input);
+          else if (extraTools) content = await extraTools.run(t.name, t.input).catch((err) => `error: ${err instanceof Error ? err.message : String(err)}`);
+          else content = `error: unknown tool ${t.name}`;
+          return { type: "tool_result", tool_use_id: t.id, content };
+        })
+      );
+      messages.push({ role: "user", content: results });
+    }
+    return full;
+  } finally {
+    logUsage(model, turns, spent);
   }
-  return full;
 }
 
 // ---------- controlled coding agent (issue → worktree edits) ----------
@@ -537,39 +613,50 @@ export async function runCodingAgent(request: CodingAgentRequest): Promise<strin
 }
 
 async function apiCodingAgent(request: CodingAgentRequest): Promise<string> {
-  const messages: Array<{ role: "user" | "assistant"; content: unknown }> = [
-    { role: "user", content: codingPrompt(request.issue) },
+  const messages: ChatMessage[] = [
+    { role: "user", content: [{ type: "text", text: codingPrompt(request.issue) }] },
   ];
+  // Built once: byte-identical system across all 24 turns is what lets the
+  // conversation breakpoint extend the same cache entry turn after turn.
+  const system = cachedSystem(codingSystem(request.repoDigest));
+  const spent: TurnUsage = { input: 0, output: 0, cacheWrite: 0, cacheRead: 0 };
+  let turns = 0;
   const MAX_TURNS = 24;
-  for (let turn = 0; turn < MAX_TURNS; turn++) {
-    const { blocks, stopReason } = await apiTurn(
-      {
-        ...modelParams(activeModel),
-        max_tokens: 4000,
-        stream: true,
-        system: codingSystem(request.repoDigest),
-        messages,
-        tools: CODE_TOOLS,
-        ...(turn === MAX_TURNS - 1 ? { tool_choice: { type: "none" } } : {}),
-      },
-      () => {},
-      request.onTool,
-      request.signal
-    );
-    const calls = blocks.filter((b): b is ToolUseBlock => b.type === "tool_use");
-    if (stopReason !== "tool_use" || !calls.length) {
-      const text = blocks.filter((b): b is TextBlock => b.type === "text").map((b) => b.text).join("\n").trim();
-      return text || "Implemented the issue in the isolated worktree.";
-    }
-    messages.push({ role: "assistant", content: blocks });
-    const results = await Promise.all(calls.map(async (call) => {
-      try {
-        return { type: "tool_result", tool_use_id: call.id, content: await executeCodingTool(request.cwd, call.name, call.input || {}) };
-      } catch (err) {
-        return { type: "tool_result", tool_use_id: call.id, is_error: true, content: err instanceof Error ? err.message : String(err) };
+  try {
+    for (let turn = 0; turn < MAX_TURNS; turn++) {
+      const { blocks, stopReason, usage } = await apiTurn(
+        {
+          ...modelParams(activeModel),
+          max_tokens: 4000,
+          stream: true,
+          system,
+          messages: withConversationCache(messages),
+          tools: CODE_TOOLS,
+          ...(turn === MAX_TURNS - 1 ? { tool_choice: { type: "none" } } : {}),
+        },
+        () => {},
+        request.onTool,
+        request.signal
+      );
+      turns++;
+      addUsage(spent, usage);
+      const calls = blocks.filter((b): b is ToolUseBlock => b.type === "tool_use");
+      if (stopReason !== "tool_use" || !calls.length) {
+        const text = blocks.filter((b): b is TextBlock => b.type === "text").map((b) => b.text).join("\n").trim();
+        return text || "Implemented the issue in the isolated worktree.";
       }
-    }));
-    messages.push({ role: "user", content: results });
+      messages.push({ role: "assistant", content: blocks });
+      const results = await Promise.all(calls.map(async (call) => {
+        try {
+          return { type: "tool_result", tool_use_id: call.id, content: await executeCodingTool(request.cwd, call.name, call.input || {}) };
+        } catch (err) {
+          return { type: "tool_result", tool_use_id: call.id, is_error: true, content: err instanceof Error ? err.message : String(err) };
+        }
+      }));
+      messages.push({ role: "user", content: results });
+    }
+    throw new Error("coding agent exceeded its tool-turn limit");
+  } finally {
+    logUsage("coding", turns, spent);
   }
-  throw new Error("coding agent exceeded its tool-turn limit");
 }
